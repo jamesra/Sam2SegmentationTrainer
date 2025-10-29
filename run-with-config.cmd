@@ -1,11 +1,13 @@
 @echo off
 echo Starting SAM2 Docker container with configuration volume mounts...
 
-REM Build the image first if it doesn't exist
-docker build -t sam2-local-2 -f Servers/SegmentationServer/Dockerfile .
-
 REM Remove existing container if it exists
 docker rm -f sam2-dev2 2>nul
+
+REM Build the image first if it doesn't exist
+cd ../..
+docker build -t sam2-local-2 -f Servers/SegmentationServer/Dockerfile .
+cd Servers/SegmentationServer
 
 mkdir C:\Temp\.X11-unix
 
@@ -15,11 +17,13 @@ docker run -it ^
   -e DISPLAY ^
   -p 8080:80 ^
   -p 50051:50051 ^
+  -p 5678:5678 ^
   --name sam2-dev2 ^
   --gpus all ^
   sam2-local-2
 
 echo Container started. Access the web interface at http://localhost:8080
 echo gRPC service available on port 50051
+echo Debug port available on port 5678
 
 
