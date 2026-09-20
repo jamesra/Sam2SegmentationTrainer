@@ -1,0 +1,39 @@
+# Template -> copy to $NORNIR_DOCKER_USER_ROOT/Run/sam2-dev/compose.net-mounts.override.yaml
+# (not committed). Reuses Nornir path-B dirs; do not duplicate .cred files.
+#
+# Enables the in-container network-share mount manifest (CIFS/SMB3 + NFSv4) for cursor-dev.
+# This grants CAP_SYS_ADMIN (required for the mount() syscall inside the container) and binds
+# the manifest + secrets dirs read-only. Both binds are fixed regardless of how many shares the
+# manifest lists, so adding/removing a share is a data change (edit nas-mounts.tsv), never a
+# compose/Dockerfile edit. After mounts succeed, cursor-dev-entry.sh drops CAP_SYS_ADMIN when
+# setpriv/capsh are available.
+#
+# Prerequisites:
+#   - cifs / nfsv4 kernel drivers loaded on the WSL2 host (shared kernel).
+#   - NORNIR_NET_MOUNTS_DIR_HOST  -> dir containing nas-mounts.tsv
+#     (default D:\Docker\Run\nornir-dev\net-mounts)
+#   - NORNIR_NET_CREDS_DIR_HOST   -> dir containing per-share *.cred files
+#     (default D:\Docker\Run\nornir-dev\secrets\net-creds)
+#   - Put those vars in docker/.env (Compose substitution) as well as Run\sam2-dev\.env.
+#
+# SECURITY: CAP_SYS_ADMIN is a real privilege increase for the mount phase only (then dropped).
+# The default cursor-dev service (without this file) stays unprivileged.
+
+services:
+  cursor-dev:
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - "apparmor:unconfined"
+    environment:
+      NORNIR_NET_MOUNTS: "1"
+    volumes:
+      - type: bind
+        source: ${NORNIR_NET_MOUNTS_DIR_HOST}
+        target: /etc/nornir-net-mounts
+        read_only: true
+      - type: bind
+        source: ${NORNIR_NET_CREDS_DIR_HOST}
+        target: /run/secrets/net-creds
+        read_only: true

@@ -1,0 +1,27 @@
+# Machine-local Compose / build env (bridge copies of D:\Docker\Run\...)
+.env
+docker/.env
+build.env
+.build.*.env
+
+# Training artifacts (use SAM2_OUTPUT_ROOT / D:\Docker\mounted-configs\sam2-trainer)
+outputs/
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini

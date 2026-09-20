@@ -1,0 +1,17 @@
+[project]
+name = "sam2-segmentation-trainer"
+version = "0.1.0"
+description = "Fine-tune Meta SAM2 on TEM/SEM electron microscopy data"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "albumentations",
+    "scipy",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sam2_segmentation_trainer*"]

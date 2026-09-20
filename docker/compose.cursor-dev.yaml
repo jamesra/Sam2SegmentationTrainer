@@ -1,0 +1,60 @@
+# SAM2 trainer cursor-dev: sam2-trainer:dev, repo at /workspace, NAS at /storage4 (path B CIFS).
+#
+# Copy docker/example.cursor-dev.run.env to docker/.env (or hardlink D:\Docker\Run\sam2-dev\.env)
+# so ${NORNIR_NET_MOUNTS_DIR_HOST} and ${SAM2_OUTPUT_HOST} substitute.
+#
+# Path B (required for training data): also pass
+#   -f $NORNIR_DOCKER_USER_ROOT/Run/sam2-dev/compose.net-mounts.override.yaml
+# (template: docker/example.compose.net-mounts.override.yaml). That override reuses
+# Nornir's net-mounts TSV and .cred dirs; do not copy secrets into this repo.
+#
+# From repository root:
+#   docker compose -f docker/compose.cursor-dev.yaml build cursor-dev
+#   docker/run-cursor-dev.ps1
+
+name: sam2-trainer
+
+services:
+  cursor-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        SAM2_GIT_SHA: ${SAM2_GIT_SHA:-2b90b9f5ceec907a1c18123530e92e794ad901a4}
+    image: sam2-trainer:dev
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    gpus: all
+    shm_size: "64gb"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    command:
+      - /bin/bash
+      - /usr/local/bin/cursor-dev-entry.sh
+      - bash
+    environment:
+      SAM2_DATA_ROOT: ${SAM2_DATA_ROOT:-/storage4}
+      SAM2_OUTPUT_ROOT: /outputs
+      SAM2_CHECKPOINT_URL: ${SAM2_CHECKPOINT_URL:-https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt}
+    volumes:
+      - type: bind
+        source: ${SAM2_WORKSPACE_HOST:-..}
+        target: /workspace
+      - type: bind
+        source: ${SAM2_OUTPUT_HOST:-D:/Docker/mounted-configs/sam2-trainer}
+        target: /outputs
+      - type: bind
+        source: ./cursor-dev-entry.sh
+        target: /usr/local/bin/cursor-dev-entry.sh
+        read_only: true
+      - type: bind
+        source: ./mount-network-shares.sh
+        target: /usr/local/bin/mount-network-shares.sh
+        read_only: true
+      - type: bind
+        source: ./drop-sys-admin-after-mounts.sh
+        target: /usr/local/bin/drop-sys-admin-after-mounts.sh
+        read_only: true

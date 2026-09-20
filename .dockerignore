@@ -1,0 +1,12 @@
+.git
+.venv
+venv
+__pycache__
+*.egg-info
+outputs
+checkpoints
+docker/.env
+.env
+*.md
+.cursor
+.devcontainer
