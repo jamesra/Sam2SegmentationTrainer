@@ -47,6 +47,13 @@ services:
       # In-container TensorBoard port (compose publishes host 8060:6006).
       SAM2_TENSORBOARD_PORT: "6006"
       SAM2_TENSORBOARD_HOST_PORT: "8060"
+      # Publish training progress to the shared dashboard broker (nornir-docker/compose.dashboard.yaml).
+      # host.docker.internal reaches the host-published Mosquitto port from the container.
+      NORNIR_MQTT_HOST: ${NORNIR_MQTT_HOST:-host.docker.internal}
+      NORNIR_MQTT_PORT: ${NORNIR_MQTT_PORT:-1883}
+      NORNIR_MQTT_ENABLE: ${NORNIR_MQTT_ENABLE:-1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - type: bind
         source: ${SAM2_WORKSPACE_HOST:-..}
@@ -68,4 +75,9 @@ services:
       - type: bind
         source: ./drop-sys-admin-after-mounts.sh
         target: /usr/local/bin/drop-sys-admin-after-mounts.sh
+        read_only: true
+      # nornir_shared MQTT helpers. Missing checkout: entry script warns and training stays on the console.
+      - type: bind
+        source: ${NORNIR_SHARED_HOST:-../../nornir/nornir-shared}
+        target: /opt/nornir-shared
         read_only: true

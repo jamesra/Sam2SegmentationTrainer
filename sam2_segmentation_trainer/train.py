@@ -37,6 +37,7 @@ from sam2_segmentation_trainer.data.dataset import EMSegDataset, collate_em
 from sam2_segmentation_trainer.data.manifest import index_volumes
 from sam2_segmentation_trainer.data.splits import load_split, make_location_split, save_split
 from sam2_segmentation_trainer.metrics import iou_dice_pr
+from sam2_segmentation_trainer.mqtt_progress import TrainingProgress
 from sam2_segmentation_trainer.model import (
     build_em_sam2,
     combined_loss,
@@ -226,6 +227,7 @@ def run_throughput_benchmark(
     val_steps: int,
     warmup_train: int = 10,
     warmup_val: int = 3,
+    progress: TrainingProgress | None = None,
 ) -> dict[str, float]:
     # Wall-clock includes DataLoader wait; that is the tqdm s/it the full run will see.
     model.train()
@@ -250,7 +252,7 @@ def run_throughput_benchmark(
         drop_last=True,
     )
 
-    def train_one(batch, step_i: int) -> None:
+    def train_one(batch, step_i: int) -> float:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         points = batch["point"].to(device, non_blocking=True)
@@ -263,7 +265,7 @@ def run_throughput_benchmark(
             pred, iou_preds = predict_masks(
                 model, images, points, labels, image_size=image_size
             )
-            loss, _stats = combined_loss(
+            loss, stats = combined_loss(
                 pred,
                 masks,
                 iou_preds,
@@ -284,6 +286,7 @@ def run_throughput_benchmark(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+        return float(stats["loss"])
 
     train_iter = iter(train_dl)
     try:
@@ -292,12 +295,22 @@ def run_throughput_benchmark(
             _sync_device(device)
 
         train_times: list[float] = []
+        log_every = int(cfg.training.log_every_n_steps)
         for j in range(train_steps):
             i = warmup_train + j
             t0 = time.perf_counter()
-            train_one(next(train_iter), i)
+            step_loss = train_one(next(train_iter), i)
             _sync_device(device)
             train_times.append(time.perf_counter() - t0)
+            if progress is not None:
+                progress.report_step(
+                    step=j,
+                    batches_per_epoch=train_steps,
+                    global_step=j,
+                    log_every=log_every,
+                    loss=step_loss,
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                )
     except Exception as exc:
         if not _is_oom(exc):
             raise
@@ -384,10 +397,14 @@ def run_throughput_benchmark(
     print(f"  val   {_summarize_times(val_times)}")
     print(f"  estimated train epoch: {format_duration(projected['train_epoch_s'])}")
     print(f"  estimated val pass:    {format_duration(projected['val_pass_s'])}")
-    print(
+    estimate = (
         f"  estimated {num_epochs}-epoch run: "
         f"{format_duration(projected['full_run_s'])} (no early stopping)"
     )
+    if progress is not None:
+        progress.transcript(estimate)
+    else:
+        print(estimate)
     return projected
 
 
@@ -533,6 +550,23 @@ def _write_run_inputs(
 
 
 def train_from_cfg(cfg: DictConfig) -> Path:
+    """Fine-tune SAM2 and publish progress when the Nornir MQTT helpers are installed."""
+    progress = TrainingProgress()
+    try:
+        return _run_training(cfg, progress)
+    except BaseException as exc:
+        if progress.status == "completed":
+            if isinstance(exc, KeyboardInterrupt):
+                progress.mark_stopped()
+                progress.transcript("training interrupted")
+            else:
+                progress.mark_failed(f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        progress.close()
+
+
+def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     set_seed(int(cfg.training.seed))
     data_dir, out_dir, ckpt_root, checkpoint = _resolve_paths(cfg)
     run_name = _resolve_run_name(cfg, ckpt_root, out_dir)
@@ -541,6 +575,7 @@ def train_from_cfg(cfg: DictConfig) -> Path:
     legacy = legacy_run_dir(run_name, out_root=out_dir)
     run_existed = run_dir.is_dir()
     run_dir.mkdir(parents=True, exist_ok=True)
+    progress.start(run_name=run_name, volumepath=str(data_dir))
     migrated = migrate_run_artifacts(legacy, run_dir)
     if migrated:
         print(f"migrated from {legacy} -> {run_dir}: {', '.join(migrated)}")
@@ -669,6 +704,7 @@ def train_from_cfg(cfg: DictConfig) -> Path:
             scheduler=scheduler,
             train_steps=max(1, int(cfg.training.get("benchmark_steps", 50))),
             val_steps=max(1, int(cfg.training.get("benchmark_val_steps", 20))),
+            progress=progress,
         )
         print(f"Run directory: {run_dir} (benchmark only; no last.pt written)")
         return run_dir
@@ -770,12 +806,17 @@ def train_from_cfg(cfg: DictConfig) -> Path:
         )
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        progress.report_epoch(epoch, num_epochs)
         pbar = tqdm(
             train_dl,
             desc=f"epoch {epoch}",
             leave=False,
             initial=step0,
             total=batches_per_epoch,
+            ncols=100,
+            mininterval=1.0,
+            dynamic_ncols=False,
+            bar_format="{desc} {percentage:5.1f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
         interrupted = False
         for rel_i, batch in enumerate(pbar):
@@ -818,7 +859,7 @@ def train_from_cfg(cfg: DictConfig) -> Path:
                 opt_step += 1
                 if opt_step % save_every == 0:
                     save_now(epoch, step + 1)
-                    print(f"  saved last.pt (epoch {epoch} step {step + 1})")
+                    pbar.write(f"  saved last.pt (epoch {epoch} step {step + 1})")
             if global_step % int(cfg.training.log_every_n_steps) == 0:
                 writer.add_scalar("train/loss", stats["loss"], global_step)
                 writer.add_scalar("train/loss_focal", stats["loss_focal"], global_step)
@@ -826,10 +867,21 @@ def train_from_cfg(cfg: DictConfig) -> Path:
                 writer.add_scalar("train/loss_iou", stats["loss_iou"], global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 pbar.set_postfix(loss=f"{stats['loss']:.4f}")
+                progress.report_step(
+                    step=step,
+                    batches_per_epoch=batches_per_epoch,
+                    global_step=global_step,
+                    log_every=int(cfg.training.log_every_n_steps),
+                    loss=float(stats["loss"]),
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                )
             global_step += 1
             if stop.stop:
                 save_now(epoch, step + 1)
-                print(f"stop requested; saved last.pt at epoch {epoch} step {step + 1}")
+                progress.mark_stopped()
+                progress.transcript(
+                    f"stop requested; saved last.pt at epoch {epoch} step {step + 1}"
+                )
                 interrupted = True
                 break
 
@@ -839,6 +891,7 @@ def train_from_cfg(cfg: DictConfig) -> Path:
             return run_dir
 
         if epoch % int(cfg.training.val_every_n_epochs) == 0:
+            progress.stage("validate", "start")
             val_iou = run_validation(
                 model,
                 val_dl,
@@ -846,19 +899,22 @@ def train_from_cfg(cfg: DictConfig) -> Path:
                 image_size,
                 float(cfg.data.mask_threshold),
             )
+            progress.stage("validate", "end")
             writer.add_scalar("val/iou", val_iou, epoch)
-            print(f"epoch {epoch} val IoU {val_iou:.4f}")
+            progress.transcript(f"epoch {epoch} val IoU {val_iou:.4f}")
             if val_iou > best_val_iou:
                 best_val_iou = val_iou
                 epochs_without_improve = 0
                 atomic_torch_save(model.state_dict(), run_dir / "best_model.pt")
-                print(f"  saved best_model.pt (IoU {best_val_iou:.4f})")
+                progress.transcript(f"  saved best_model.pt (IoU {best_val_iou:.4f})")
             else:
                 epochs_without_improve += 1
                 if patience > 0 and epochs_without_improve >= patience:
                     save_now(epoch + 1, 0)
-                    print(f"early stopping at epoch {epoch}")
+                    progress.transcript(f"early stopping at epoch {epoch}")
                     break
+            progress.stage("train", "start")
+            progress.report_epoch(epoch, num_epochs)
 
         if epoch % int(cfg.training.save_every_n_epochs) == 0:
             atomic_torch_save(
@@ -867,12 +923,17 @@ def train_from_cfg(cfg: DictConfig) -> Path:
         save_now(epoch + 1, 0)
         start_step = 0
         if stop.stop:
-            print("stop requested after epoch save")
+            progress.mark_stopped()
+            progress.transcript("stop requested after epoch save")
             break
 
     writer.close()
-    print(f"Training complete. Best val IoU: {best_val_iou:.4f}")
-    print(f"Run directory: {run_dir}")
+    if progress.status == "stopped":
+        print(f"Run directory: {run_dir}")
+    else:
+        progress.transcript(
+            f"Training complete. Best val IoU: {best_val_iou:.4f}. Run directory: {run_dir}"
+        )
     return run_dir
 
 

@@ -42,6 +42,28 @@ install_editables() {
   pip install --no-cache-dir --no-deps -e /workspace
 }
 
+# Telemetry only. --no-deps avoids nornir_shared's numpy/matplotlib pins on the CUDA torch stack.
+install_nornir_mqtt() {
+  local src="/opt/nornir-shared"
+  if [[ ! -f "${src}/pyproject.toml" ]]; then
+    echo "cursor-dev-entry: /opt/nornir-shared not mounted; training progress stays on the console" >&2
+    return 0
+  fi
+  if ! pip install --no-cache-dir 'paho-mqtt>=2.1.0'; then
+    echo "cursor-dev-entry: paho-mqtt install failed; training progress stays on the console" >&2
+    return 0
+  fi
+  if ! pip install --no-cache-dir --no-deps "${src}"; then
+    echo "cursor-dev-entry: nornir_shared install failed; training progress stays on the console" >&2
+    return 0
+  fi
+  if ! python -c "import paho.mqtt.client; from nornir_shared.mqtt_telemetry import publish_run_meta" >/dev/null 2>&1; then
+    echo "cursor-dev-entry: nornir_shared MQTT import failed; training progress stays on the console" >&2
+    return 0
+  fi
+  echo "cursor-dev-entry: nornir_shared MQTT telemetry available (dashboard via NORNIR_MQTT_HOST)"
+}
+
 ensure_checkpoint() {
   local dest="${SAM2_OUTPUT_ROOT:-/outputs}/checkpoints"
   local file="${dest}/${SAM2_CHECKPOINT_NAME}"
@@ -95,6 +117,7 @@ ensure_tensorboard() {
 
 if [[ "${SAM2_CURSOR_DEV_SETUP_ONLY:-}" == "1" ]]; then
   install_editables
+  install_nornir_mqtt
   ensure_tensorboard
   if [[ $# -gt 0 ]]; then
     exec "$@"
@@ -104,6 +127,7 @@ fi
 
 apply_network_shares
 install_editables
+install_nornir_mqtt
 ensure_checkpoint
 ensure_tensorboard
 
