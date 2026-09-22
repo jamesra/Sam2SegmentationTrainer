@@ -6,8 +6,23 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "albumentations",
+    "hydra-core",
+    "omegaconf",
+    "opencv-python-headless",
+    "pillow",
+    "pycocotools",
+    "scikit-image",
     "scipy",
+    "tensorboard",
+    "tqdm",
 ]
+
+[project.scripts]
+sam2-em-validate = "sam2_segmentation_trainer.validate:main"
+sam2-em-train = "sam2_segmentation_trainer.train:main"
+sam2-em-eval = "sam2_segmentation_trainer.evaluate:main"
+sam2-em-infer = "sam2_segmentation_trainer.infer:main"
+sam2-em-export-serve = "sam2_segmentation_trainer.export_serve:main"
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -15,3 +30,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["sam2_segmentation_trainer*"]
+
+[tool.setuptools.package-data]
+sam2_segmentation_trainer = ["config/*.yaml"]

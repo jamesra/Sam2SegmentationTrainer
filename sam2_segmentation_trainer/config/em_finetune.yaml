@@ -1,0 +1,66 @@
+# @package _global_
+
+training:
+  # auto -> next sam2_em_vN under the checkpoint runs folder. Pass training.run_name=sam2_em_v1 to resume that run.
+  run_name: auto
+  run_name_prefix: sam2_em
+  output_dir: null
+  # Large checkpoints (last.pt / best_model) — default /storage4/Sam2Trainer via env.
+  checkpoint_dir: null
+  num_epochs: 15
+  batch_size: 4
+  num_workers: 4
+  seed: 42
+  mixed_precision: true
+  gradient_accumulation_steps: 4
+  gradient_clip: 1.0
+  log_every_n_steps: 50
+  val_every_n_epochs: 1
+  save_every_n_epochs: 3
+  save_every_n_steps: 200
+  resume: true
+  early_stopping_patience: 5
+
+optimizer:
+  type: AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+lr_schedule:
+  type: cosine_with_warmup
+  warmup_epochs: 1
+  min_lr: 1.0e-6
+
+differential_lr:
+  encoder_lr_factor: 0.1
+
+loss:
+  focal_weight: 20.0
+  dice_weight: 1.0
+  iou_weight: 1.0
+
+data:
+  root: null
+  volumes: [RC1, RC2, RPC1, RPC2]
+  image_size: 1024
+  mask_threshold: 0.5
+  train_split: 0.9
+  split_name: location_v1
+  even_per_volume: true
+
+model:
+  checkpoint: null
+  config: configs/sam2.1/sam2.1_hiera_l.yaml
+  freeze_mode: none
+  activation_checkpointing: true
+
+eval:
+  grid_every: 10
+  max_grids: 40
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .

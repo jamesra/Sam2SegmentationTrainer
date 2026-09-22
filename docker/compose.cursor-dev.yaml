@@ -27,6 +27,9 @@ services:
     tty: true
     gpus: all
     shm_size: "64gb"
+    # Host 8060 -> TensorBoard --port 6006 inside the container.
+    ports:
+      - "8060:6006"
     ulimits:
       nofile:
         soft: 65536
@@ -36,13 +39,21 @@ services:
       - /usr/local/bin/cursor-dev-entry.sh
       - bash
     environment:
-      SAM2_DATA_ROOT: ${SAM2_DATA_ROOT:-/storage4}
+      SAM2_DATA_ROOT: ${SAM2_DATA_ROOT:-/data-local}
       SAM2_OUTPUT_ROOT: /outputs
+      # Run checkpoints + TB events on CIFS (not the Windows /outputs bind).
+      SAM2_CHECKPOINT_ROOT: ${SAM2_CHECKPOINT_ROOT:-/storage4/Sam2Trainer}
       SAM2_CHECKPOINT_URL: ${SAM2_CHECKPOINT_URL:-https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt}
+      # In-container TensorBoard port (compose publishes host 8060:6006).
+      SAM2_TENSORBOARD_PORT: "6006"
+      SAM2_TENSORBOARD_HOST_PORT: "8060"
     volumes:
       - type: bind
         source: ${SAM2_WORKSPACE_HOST:-..}
         target: /workspace
+      - type: bind
+        source: ${SAM2_LOCAL_DATA_HOST}
+        target: /data-local
       - type: bind
         source: ${SAM2_OUTPUT_HOST:-D:/Docker/mounted-configs/sam2-trainer}
         target: /outputs

@@ -64,4 +64,8 @@ RUN chmod +x /usr/local/bin/mount-network-shares.sh \
         /usr/local/bin/cursor-dev-entry.sh
 
 WORKDIR /workspace
+
+# TensorBoard listens on 6006 in-container; compose publishes host 8060:6006.
+EXPOSE 6006
+
 CMD ["/bin/bash"]

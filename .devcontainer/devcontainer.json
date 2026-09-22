@@ -7,6 +7,13 @@
   "service": "cursor-dev",
   "workspaceFolder": "/workspace",
   "overrideCommand": false,
+  "forwardPorts": [6006],
+  "portsAttributes": {
+    "6006": {
+      "label": "TensorBoard",
+      "onAutoForward": "notify"
+    }
+  },
   "postAttachCommand": "SAM2_CURSOR_DEV_SETUP_ONLY=1 /usr/local/bin/cursor-dev-entry.sh",
   "customizations": {
     "vscode": {

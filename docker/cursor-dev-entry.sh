@@ -55,8 +55,47 @@ ensure_checkpoint() {
   mv "${file}.partial" "${file}"
 }
 
+# Training writes SummaryWriter events to $SAM2_CHECKPOINT_ROOT/runs/<run_name>/tb/
+# (CIFS). Prefer that over the Windows /outputs bind for large last.pt writes.
+ensure_tensorboard() {
+  local out_root="${SAM2_OUTPUT_ROOT:-/outputs}"
+  local ckpt_root="${SAM2_CHECKPOINT_ROOT:-/storage4/Sam2Trainer}"
+  local logdir="${ckpt_root}/runs"
+  local port="${SAM2_TENSORBOARD_PORT:-6006}"
+  local host_port="${SAM2_TENSORBOARD_HOST_PORT:-8060}"
+  local pidfile="${out_root}/tensorboard.pid"
+  local logfile="${out_root}/tensorboard.log"
+  local pid=""
+
+  mkdir -p "${logdir}"
+
+  if [[ -f "${pidfile}" ]]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      echo "cursor-dev-entry: tensorboard already running pid=${pid} logdir=${logdir} :${port} (http://localhost:${host_port})"
+      return 0
+    fi
+    rm -f "${pidfile}"
+  fi
+
+  if ! command -v tensorboard >/dev/null 2>&1; then
+    echo "cursor-dev-entry: tensorboard not on PATH; skip" >&2
+    return 0
+  fi
+
+  nohup tensorboard \
+    --logdir "${logdir}" \
+    --bind_all \
+    --port "${port}" \
+    --reload_interval 30 \
+    >"${logfile}" 2>&1 &
+  echo $! >"${pidfile}"
+  echo "cursor-dev-entry: tensorboard started pid=$(cat "${pidfile}") logdir=${logdir} :${port} -> http://localhost:${host_port}"
+}
+
 if [[ "${SAM2_CURSOR_DEV_SETUP_ONLY:-}" == "1" ]]; then
   install_editables
+  ensure_tensorboard
   if [[ $# -gt 0 ]]; then
     exec "$@"
   fi
@@ -66,6 +105,7 @@ fi
 apply_network_shares
 install_editables
 ensure_checkpoint
+ensure_tensorboard
 
 if [[ $# -eq 0 ]]; then
   set -- bash
