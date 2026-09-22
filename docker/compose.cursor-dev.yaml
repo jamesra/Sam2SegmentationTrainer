@@ -76,7 +76,7 @@ services:
         source: ./drop-sys-admin-after-mounts.sh
         target: /usr/local/bin/drop-sys-admin-after-mounts.sh
         read_only: true
-      # nornir_shared MQTT helpers. Missing checkout: entry script warns and training stays on the console.
+      # nornir_shared MQTT helpers, read-only. Entry script warns and continues if import fails.
       - type: bind
         source: ${NORNIR_SHARED_HOST:-../../nornir/nornir-shared}
         target: /opt/nornir-shared

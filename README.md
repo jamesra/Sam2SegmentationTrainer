@@ -1,6 +1,6 @@
 # SAM2 Segmentation Trainer
 
-GPU Dev Container for fine-tuning Meta SAM2 on TEM/SEM data. The trainer package is bind-mounted at `/workspace` and installed editable. Training data is the NAS share already used by Nornir (`/storage4` via in-container CIFS). Nornir Python packages are **not** installed.
+GPU Dev Container for fine-tuning Meta SAM2 on TEM/SEM data. The trainer package is bind-mounted at `/workspace` and installed editable. Training data is the NAS share already used by Nornir (`/storage4` via in-container CIFS). The container installs `nornir_shared` for MQTT telemetry only; training code does not use the rest of Nornir.
 
 ## Prerequisites
 
@@ -112,6 +112,13 @@ sam2-em-train -benchmark --benchmark-steps 80 --benchmark-val-steps 30
 # TensorBoard starts with the container (cursor-dev-entry.sh) on :6006.
 # Compose maps host 8060 -> 6006. Events under /storage4/Sam2Trainer/runs/<run>/tb/.
 # Open http://localhost:8060  (no need to start tensorboard by hand)
+
+# Live progress is also published to the Nornir build dashboard when its Mosquitto
+# broker is up (nornir-docker/start-dashboard.ps1). The container uses
+# NORNIR_MQTT_HOST=host.docker.internal and NORNIR_MQTT_PORT=1883. Open
+# http://127.0.0.1:8087. Each run_name (sam2_em_vN) is one dashboard row:
+# epoch and step bars, loss and learning rate on the step bar, val IoU in the log.
+# Ctrl+C is status stopped. NORNIR_MQTT_ENABLE=0 leaves progress on the console.
 
 sam2-em-eval --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --out /outputs/eval
 sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --point 512,400 --out /outputs/pred.png

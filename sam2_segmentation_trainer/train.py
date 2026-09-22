@@ -892,14 +892,16 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
 
         if epoch % int(cfg.training.val_every_n_epochs) == 0:
             progress.stage("validate", "start")
-            val_iou = run_validation(
-                model,
-                val_dl,
-                device,
-                image_size,
-                float(cfg.data.mask_threshold),
-            )
-            progress.stage("validate", "end")
+            try:
+                val_iou = run_validation(
+                    model,
+                    val_dl,
+                    device,
+                    image_size,
+                    float(cfg.data.mask_threshold),
+                )
+            finally:
+                progress.stage("validate", "end")
             writer.add_scalar("val/iou", val_iou, epoch)
             progress.transcript(f"epoch {epoch} val IoU {val_iou:.4f}")
             if val_iou > best_val_iou:
