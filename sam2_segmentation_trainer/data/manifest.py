@@ -21,6 +21,8 @@ class CropExample:
     json_path: Path
     mask_path: Path
     split_key: str
+    width: int | None = None
+    height: int | None = None
 
     @property
     def image_ext(self) -> str:
@@ -34,13 +36,49 @@ def list_filenames(folder: Path) -> set[str]:
     return {entry.name for entry in folder.iterdir() if entry.is_file()}
 
 
-def annotation_ids_in_json(json_path: Path) -> set[int] | None:
-    """Return annotation ids in a sidecar JSON, or None if unreadable."""
+def sidecar_ids_and_size(json_path: Path) -> tuple[set[int] | None, tuple[int, int] | None]:
+    """Return annotation ids and ``image.width`` / ``image.height``, or None if unreadable."""
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return {int(ann.get("id", -1)) for ann in (payload.get("annotations") or [])}
+        return None, None
+    ids = {int(ann.get("id", -1)) for ann in (payload.get("annotations") or [])}
+    image = payload.get("image")
+    if isinstance(image, list):
+        image = image[0] if image else None
+    size: tuple[int, int] | None = None
+    if isinstance(image, dict) and "width" in image and "height" in image:
+        try:
+            size = (int(image["width"]), int(image["height"]))
+        except (TypeError, ValueError):
+            size = None
+    return ids, size
+
+
+def annotation_ids_in_json(json_path: Path) -> set[int] | None:
+    """Return annotation ids in a sidecar JSON, or None if unreadable."""
+    ids, _size = sidecar_ids_and_size(json_path)
+    return ids
+
+
+def take_model_sized(
+    examples: Sequence[CropExample], image_size: int
+) -> tuple[list[CropExample], list[CropExample]]:
+    """Split examples by sidecar size. Rejected entries are one per tile."""
+    kept: list[CropExample] = []
+    rejected: list[CropExample] = []
+    seen: set[tuple[str, str]] = set()
+    expected = int(image_size)
+    for ex in examples:
+        if ex.width == expected and ex.height == expected:
+            kept.append(ex)
+            continue
+        key = (ex.volume, ex.image_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        rejected.append(ex)
+    return kept, rejected
 
 
 def index_volumes(
@@ -101,11 +139,14 @@ def _index_manifest(
             z = int(rec.get("z", 0))
             rec_volume = str(rec.get("volume") or volume)
             present_ids: set[int] | None = None
+            tile_size: tuple[int, int] | None = None
             if skip_missing:
-                present_ids = annotation_ids_in_json(json_path)
+                present_ids, tile_size = sidecar_ids_and_size(json_path)
                 if present_ids is None:
                     skipped_missing_ann += sum(1 for _ in location_ids)
                     continue
+            width = None if tile_size is None else tile_size[0]
+            height = None if tile_size is None else tile_size[1]
             for loc_id in location_ids:
                 loc_i = int(loc_id)
                 if present_ids is not None and loc_i not in present_ids:
@@ -122,6 +163,8 @@ def _index_manifest(
                         json_path=json_path,
                         mask_path=crops / "masks" / f"{image_key}_{loc_i}.png",
                         split_key=f"{rec_volume}:{loc_i}",
+                        width=width,
+                        height=height,
                     )
                 )
     return examples, skipped_missing_ann

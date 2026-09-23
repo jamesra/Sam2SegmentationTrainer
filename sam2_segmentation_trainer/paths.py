@@ -54,6 +54,28 @@ def legacy_run_dir(run_name: str, *, out_root: Path | None = None) -> Path:
     return base / "runs" / str(run_name)
 
 
+def latest_resumable_run(roots: list[Path]) -> str | None:
+    """Name of the run whose last.pt was written most recently."""
+    newest_name: str | None = None
+    newest_mtime = -1.0
+    for root in roots:
+        runs = root / "runs"
+        if not runs.is_dir():
+            continue
+        for child in runs.iterdir():
+            last = child / "last.pt"
+            if not last.is_file():
+                continue
+            try:
+                mtime = last.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                newest_name = child.name
+    return newest_name
+
+
 def next_run_name(prefix: str, roots: list[Path]) -> str:
     """Next `prefix_vN` from existing run directories under each root's `runs/` folder."""
     pattern = re.compile(rf"^{re.escape(prefix)}_v(\d+)$")

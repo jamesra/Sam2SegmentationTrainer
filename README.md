@@ -77,7 +77,7 @@ Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/stora
 - `masks/` — optional raster `{imageKey}_{locationId}.png` (used when present; otherwise RLE in the JSON)
 - `overlays/` — viewing only, not used for training
 
-One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. New runs draw the same number of train and val samples from each volume.
+One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Within each volume, 90% go to train and 10% to val.
 
 This is **not** Pascal VOC (`JPEGImages` / `Annotations` / `ImageSets`). Do not reshape the NAS.
 
@@ -94,10 +94,9 @@ sam2-em-validate --json-report /outputs/validate.json
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 
 # Fine-tune sam2.1_hiera_large (prompt encoder frozen).
-# A new launch picks the next run folder (sam2_em_v2, v3, ...) and writes
-# /storage4/Sam2Trainer/runs/<name>/ with split.json and inputs.json.
-# Train/val counts are equal across RC1, RC2, RPC1, and RPC2.
-# Resume an older run by name: sam2-em-train training.run_name=sam2_em_v1
+# Restart continues the run with the newest last.pt (for example sam2_em_rpc1).
+# -refresh starts the next sam2_em_vN from pretrained weights.
+# Each volume keeps every usable sample, split 90/10 inside that volume.
 sam2-em-train data.root=/data-local
 # Overrides: sam2-em-train training.num_epochs=8 training.batch_size=2
 

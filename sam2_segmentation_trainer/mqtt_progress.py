@@ -8,14 +8,107 @@ so a missing broker never aborts training.
 from __future__ import annotations
 
 import os
+import statistics
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 PIPELINE = "sam2-em-train"
 _RUN_ID_ENV = "NORNIR_RUN_ID"
 _LOAD_PUBLISHERS = object()
+
+
+def format_batch_samples(
+    meta: Sequence[Mapping[str, Any]],
+    *,
+    max_samples: int = 8,
+) -> str:
+    """Compact ``volume/image_key#location_id`` list for warning transcripts."""
+    parts: list[str] = []
+    for item in meta[:max_samples]:
+        volume = item.get("volume", "?")
+        image_key = item.get("image_key", "?")
+        location_id = item.get("location_id", "?")
+        parts.append(f"{volume}/{image_key}#{location_id}")
+    text = ", ".join(parts) if parts else "(no meta)"
+    extra = len(meta) - max_samples
+    if extra > 0:
+        text = f"{text} (+{extra} more)"
+    return text
+
+
+@dataclass
+class StepAnomalyMonitor:
+    """Warn on training steps that are much slower or higher-loss than recent medians.
+
+    History is updated after the check so the current outlier does not inflate the
+    median used for that step. Warmup steps only fill history.
+    """
+
+    warmup: int = 30
+    window: int = 100
+    slow_factor: float = 2.5
+    slow_seconds: float = 3.0
+    high_loss_factor: float = 5.0
+    high_loss_absolute: float = 3.0
+    _times: deque[float] = field(default_factory=deque, init=False, repr=False)
+    _losses: deque[float] = field(default_factory=deque, init=False, repr=False)
+    _seen: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._times = deque(maxlen=max(1, int(self.window)))
+        self._losses = deque(maxlen=max(1, int(self.window)))
+
+    def observe(
+        self,
+        *,
+        progress: TrainingProgress,
+        epoch: int,
+        step: int,
+        duration_s: float,
+        loss: float,
+        meta: Sequence[Mapping[str, Any]],
+    ) -> list[str]:
+        """Compare against history, emit MQTT warnings, then record this step.
+
+        Returns the warning messages that were published (empty when none).
+        """
+        self._seen += 1
+        messages: list[str] = []
+        samples = format_batch_samples(meta)
+        ready = self._seen > int(self.warmup) and len(self._times) >= 10
+
+        if ready:
+            med_t = float(statistics.median(self._times))
+            threshold_t = max(float(self.slow_seconds), med_t * float(self.slow_factor))
+            if float(duration_s) >= threshold_t:
+                msg = (
+                    f"slow batch epoch={epoch} step={step} "
+                    f"took={float(duration_s):.2f}s (median={med_t:.2f}s) "
+                    f"loss={float(loss):.4f} samples={samples}"
+                )
+                progress.warn(msg)
+                messages.append(msg)
+
+            med_l = float(statistics.median(self._losses))
+            threshold_l = max(
+                float(self.high_loss_absolute),
+                med_l * float(self.high_loss_factor),
+            )
+            if float(loss) >= threshold_l:
+                msg = (
+                    f"high loss epoch={epoch} step={step} "
+                    f"loss={float(loss):.4f} (median={med_l:.4f}) "
+                    f"took={float(duration_s):.2f}s samples={samples}"
+                )
+                progress.warn(msg)
+                messages.append(msg)
+
+        self._times.append(float(duration_s))
+        self._losses.append(float(loss))
+        return messages
 
 
 @dataclass
@@ -147,6 +240,15 @@ class TrainingProgress:
     def transcript(self, message: str) -> None:
         """Info log on the dashboard transcript. Prints when MQTT logging is unavailable."""
         self._info(message)
+
+    def warn(self, message: str) -> None:
+        """Warning on the dashboard transcript (LogErr when MQTT is available)."""
+        text = message if message.startswith("WARN") else f"WARN {message}"
+        self._error(text)
+
+    def log_error(self, message: str) -> None:
+        """Error on the dashboard transcript. Does not fail the run."""
+        self._error(message)
 
     def mark_stopped(self) -> None:
         """Record a user interrupt. Does not override a failure already recorded."""

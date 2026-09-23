@@ -17,7 +17,7 @@ class TrainCfgTests(unittest.TestCase):
         self.assertEqual(int(cfg.training.save_every_n_steps), 200)
         self.assertIsNone(cfg.training.checkpoint_dir)
         self.assertEqual(str(cfg.training.run_name), "auto")
-        self.assertTrue(bool(cfg.data.even_per_volume))
+        self.assertFalse(bool(cfg.data.even_per_volume))
 
     def test_next_run_name_increments(self) -> None:
         from tempfile import TemporaryDirectory
@@ -31,6 +31,24 @@ class TrainCfgTests(unittest.TestCase):
             (root / "runs" / "other").mkdir()
             self.assertEqual(next_run_name("sam2_em", [root]), "sam2_em_v4")
             self.assertEqual(next_run_name("sam2_em", [root / "missing"]), "sam2_em_v1")
+
+    def test_latest_resumable_run_uses_newest_checkpoint(self) -> None:
+        import os
+        from tempfile import TemporaryDirectory
+
+        from sam2_segmentation_trainer.paths import latest_resumable_run
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "runs" / "sam2_em_v1"
+            newer = root / "runs" / "sam2_em_rpc1"
+            older.mkdir(parents=True)
+            newer.mkdir()
+            (older / "last.pt").write_bytes(b"old")
+            (newer / "last.pt").write_bytes(b"new")
+            os.utime(older / "last.pt", (1_000, 1_000))
+            os.utime(newer / "last.pt", (2_000, 2_000))
+            self.assertEqual(latest_resumable_run([root]), "sam2_em_rpc1")
 
     def test_refresh_flag_disables_resume(self) -> None:
         from sam2_segmentation_trainer.train import parse_train_args

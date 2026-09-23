@@ -82,9 +82,9 @@ class EMSegDataset(Dataset):
         self.split = split
         self.image_size = image_size
         if split == "train":
-            self.transform = build_train_transform(image_size)
+            self.transform = build_train_transform()
         else:
-            self.transform = build_val_transform(image_size)
+            self.transform = build_val_transform()
 
     def __len__(self) -> int:
         return len(self.examples)

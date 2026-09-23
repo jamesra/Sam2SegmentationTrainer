@@ -34,10 +34,10 @@ from sam2_segmentation_trainer.checkpoint import (
     remaining_epoch_indices,
 )
 from sam2_segmentation_trainer.data.dataset import EMSegDataset, collate_em
-from sam2_segmentation_trainer.data.manifest import index_volumes
+from sam2_segmentation_trainer.data.manifest import index_volumes, take_model_sized
 from sam2_segmentation_trainer.data.splits import load_split, make_location_split, save_split
 from sam2_segmentation_trainer.metrics import iou_dice_pr
-from sam2_segmentation_trainer.mqtt_progress import TrainingProgress
+from sam2_segmentation_trainer.mqtt_progress import StepAnomalyMonitor, TrainingProgress
 from sam2_segmentation_trainer.model import (
     build_em_sam2,
     combined_loss,
@@ -49,6 +49,7 @@ from sam2_segmentation_trainer.model import (
 from sam2_segmentation_trainer.paths import (
     checkpoint_root,
     data_root,
+    latest_resumable_run,
     legacy_run_dir,
     next_run_name,
     output_root,
@@ -250,6 +251,8 @@ def run_throughput_benchmark(
         batch_size=batch_size,
         num_workers=num_workers,
         drop_last=True,
+        prefetch_factor=int(cfg.training.prefetch_factor),
+        persistent_workers=bool(cfg.training.persistent_workers),
     )
 
     def train_one(batch, step_i: int) -> float:
@@ -415,8 +418,15 @@ def _make_loader(
     batch_size: int,
     num_workers: int,
     drop_last: bool,
+    prefetch_factor: int,
+    persistent_workers: bool,
 ) -> DataLoader:
     subset = Subset(dataset, indices) if indices is not None else dataset
+    # DataLoader rejects these kwargs when the loading process is the main process.
+    worker_kwargs: dict = {}
+    if num_workers > 0:
+        worker_kwargs["prefetch_factor"] = int(prefetch_factor)
+        worker_kwargs["persistent_workers"] = bool(persistent_workers)
     return DataLoader(
         subset,
         batch_size=batch_size,
@@ -425,6 +435,7 @@ def _make_loader(
         pin_memory=True,
         drop_last=drop_last,
         collate_fn=collate_em,
+        **worker_kwargs,
     )
 
 
@@ -493,8 +504,14 @@ def _resolve_run_name(cfg: DictConfig, ckpt_root: Path, out_dir: Path) -> str:
     name = "" if raw is None else str(raw).strip()
     if name and name not in ("auto", "None"):
         return name
+    roots = [ckpt_root, out_dir]
+    if bool(cfg.training.get("resume", True)):
+        latest = latest_resumable_run(roots)
+        if latest:
+            print(f"resuming latest run {latest}")
+            return latest
     prefix = str(cfg.training.get("run_name_prefix", "sam2_em"))
-    return next_run_name(prefix, [ckpt_root, out_dir])
+    return next_run_name(prefix, roots)
 
 
 def _counts_by_volume(examples) -> dict[str, int]:
@@ -583,11 +600,28 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     OmegaConf.save(cfg, run_dir / "config.yaml")
 
     volumes = list(cfg.data.volumes)
+    image_size = int(cfg.data.image_size)
     examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
+    examples, rejected_tiles = take_model_sized(examples, image_size)
+    for ex in rejected_tiles:
+        recorded = (
+            "missing"
+            if ex.width is None or ex.height is None
+            else f"{ex.width}x{ex.height}"
+        )
+        progress.log_error(
+            f"skip tile {ex.volume}/{ex.image_key} size {recorded}, "
+            f"expected {image_size}x{image_size}"
+        )
+    if rejected_tiles:
+        print(
+            f"skipped {len(rejected_tiles)} tiles whose size metadata is not "
+            f"{image_size}x{image_size}"
+        )
     if not examples:
         raise RuntimeError(f"no usable AnnotationCrops examples under {data_dir} {volumes}")
 
-    even = bool(cfg.data.get("even_per_volume", True))
+    even = bool(cfg.data.get("even_per_volume", False))
     run_split = run_dir / "split.json"
     legacy_split = out_dir / "splits" / f"{cfg.data.split_name}.json"
     if run_split.is_file():
@@ -644,9 +678,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         pretrained=checkpoint,
     )
 
-    image_size = int(cfg.data.image_size)
     batch_size = int(cfg.training.batch_size)
     num_workers = int(cfg.training.num_workers)
+    prefetch_factor = int(cfg.training.prefetch_factor)
+    persistent_workers = bool(cfg.training.persistent_workers)
     seed = int(cfg.training.seed)
     freeze_mode = str(cfg.model.freeze_mode)
     train_ds = EMSegDataset(train_ex, split="train", image_size=image_size)
@@ -784,6 +819,18 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         )
 
     num_epochs = int(cfg.training.num_epochs)
+    anomaly = StepAnomalyMonitor(
+        warmup=int(OmegaConf.select(cfg, "training.warn_anomaly_warmup", default=30)),
+        window=int(OmegaConf.select(cfg, "training.warn_anomaly_window", default=100)),
+        slow_factor=float(OmegaConf.select(cfg, "training.warn_slow_factor", default=2.5)),
+        slow_seconds=float(OmegaConf.select(cfg, "training.warn_slow_seconds", default=3.0)),
+        high_loss_factor=float(
+            OmegaConf.select(cfg, "training.warn_high_loss_factor", default=5.0)
+        ),
+        high_loss_absolute=float(
+            OmegaConf.select(cfg, "training.warn_high_loss_absolute", default=3.0)
+        ),
+    )
     for epoch in range(start_epoch, num_epochs):
         step0 = start_step if epoch == start_epoch else 0
         indices = remaining_epoch_indices(
@@ -803,6 +850,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             batch_size=batch_size,
             num_workers=num_workers,
             drop_last=True,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -819,6 +868,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             bar_format="{desc} {percentage:5.1f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
         interrupted = False
+        t_prev = time.perf_counter()
         for rel_i, batch in enumerate(pbar):
             step = step0 + rel_i
             images = batch["image"].to(device, non_blocking=True)
@@ -860,6 +910,17 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 if opt_step % save_every == 0:
                     save_now(epoch, step + 1)
                     pbar.write(f"  saved last.pt (epoch {epoch} step {step + 1})")
+            step_loss = float(stats["loss"])
+            t_done = time.perf_counter()
+            anomaly.observe(
+                progress=progress,
+                epoch=epoch,
+                step=step,
+                duration_s=t_done - t_prev,
+                loss=step_loss,
+                meta=batch.get("meta") or [],
+            )
+            t_prev = t_done
             if global_step % int(cfg.training.log_every_n_steps) == 0:
                 writer.add_scalar("train/loss", stats["loss"], global_step)
                 writer.add_scalar("train/loss_focal", stats["loss_focal"], global_step)
@@ -872,7 +933,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     batches_per_epoch=batches_per_epoch,
                     global_step=global_step,
                     log_every=int(cfg.training.log_every_n_steps),
-                    loss=float(stats["loss"]),
+                    loss=step_loss,
                     lr=float(optimizer.param_groups[0]["lr"]),
                 )
             global_step += 1

@@ -6,7 +6,8 @@ import albumentations as A
 import numpy as np
 
 
-def build_train_transform(image_size: int = 1024) -> A.Compose:
+def build_train_transform() -> A.Compose:
+    """Geometry and intensity only. Tiles are already the model size, so this does not resample."""
     # GaussNoise API is std_range as a fraction of 255 (replaces var_limit).
     return A.Compose(
         [
@@ -20,13 +21,12 @@ def build_train_transform(image_size: int = 1024) -> A.Compose:
             A.RandomGamma(gamma_limit=(80, 120), p=0.3),
             A.Blur(blur_limit=(3, 7), p=0.3),
             A.ElasticTransform(alpha=30, sigma=5, p=0.2),
-            A.Resize(image_size, image_size),
         ]
     )
 
 
-def build_val_transform(image_size: int = 1024) -> A.Compose:
-    return A.Compose([A.Resize(image_size, image_size)])
+def build_val_transform() -> A.Compose:
+    return A.Compose([])
 
 
 def to_rgb_uint8(gray: np.ndarray) -> np.ndarray:

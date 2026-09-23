@@ -10,9 +10,11 @@ from unittest.mock import Mock, patch
 
 from sam2_segmentation_trainer.mqtt_progress import (
     PIPELINE,
+    StepAnomalyMonitor,
     TrainingProgress,
     _Publishers,
     _load_publishers,
+    format_batch_samples,
 )
 
 
@@ -103,6 +105,104 @@ class MqttProgressTests(unittest.TestCase):
         progress.close()
         meta.assert_called_once()
 
+    def test_error_uses_log_err_without_warn_prefix(self) -> None:
+        log_err = Mock()
+        progress = TrainingProgress(
+            publishers=_Publishers(
+                early=Mock(),
+                meta=Mock(),
+                event=Mock(),
+                log=Mock(),
+                log_err=log_err,
+            )
+        )
+        progress.log_error("skip tile RC1/img size 512x1024, expected 1024x1024")
+        log_err.assert_called_once_with(
+            "skip tile RC1/img size 512x1024, expected 1024x1024"
+        )
+        self.assertEqual(progress.status, "completed")
+
+    def test_warn_uses_log_err_with_prefix(self) -> None:
+        log_err = Mock()
+        publishers = _Publishers(
+            early=Mock(),
+            meta=Mock(),
+            event=Mock(),
+            log=Mock(),
+            log_err=log_err,
+        )
+        progress = TrainingProgress(publishers=publishers)
+        progress.warn("slow batch step=10 took=4.2s")
+        log_err.assert_called_once_with("WARN slow batch step=10 took=4.2s")
+        progress.warn("WARN already prefixed")
+        self.assertEqual(log_err.call_args.args[0], "WARN already prefixed")
+
+    def test_format_batch_samples(self) -> None:
+        text = format_batch_samples(
+            [
+                {"volume": "RC1", "image_key": "img_a", "location_id": 1},
+                {"volume": "RC2", "image_key": "img_b", "location_id": 2},
+            ]
+        )
+        self.assertEqual(text, "RC1/img_a#1, RC2/img_b#2")
+
+    def test_anomaly_monitor_warns_on_slow_and_high_loss(self) -> None:
+        log_err = Mock()
+        progress = TrainingProgress(
+            publishers=_Publishers(
+                early=Mock(),
+                meta=Mock(),
+                event=Mock(),
+                log=Mock(),
+                log_err=log_err,
+            )
+        )
+        monitor = StepAnomalyMonitor(
+            warmup=5,
+            window=20,
+            slow_factor=2.0,
+            slow_seconds=2.0,
+            high_loss_factor=5.0,
+            high_loss_absolute=2.0,
+        )
+        meta = [{"volume": "RC1", "image_key": "k", "location_id": 42}]
+        for i in range(15):
+            msgs = monitor.observe(
+                progress=progress,
+                epoch=0,
+                step=i,
+                duration_s=1.2,
+                loss=0.2,
+                meta=meta,
+            )
+            self.assertEqual(msgs, [])
+
+        slow = monitor.observe(
+            progress=progress,
+            epoch=0,
+            step=6270,
+            duration_s=4.0,
+            loss=0.25,
+            meta=meta,
+        )
+        self.assertEqual(len(slow), 1)
+        self.assertIn("slow batch", slow[0])
+        self.assertIn("RC1/k#42", slow[0])
+
+        high = monitor.observe(
+            progress=progress,
+            epoch=0,
+            step=6271,
+            duration_s=1.3,
+            loss=7.23,
+            meta=meta,
+        )
+        self.assertEqual(len(high), 1)
+        self.assertIn("high loss", high[0])
+        self.assertIn("7.2300", high[0])
+        self.assertGreaterEqual(log_err.call_count, 2)
+        self.assertTrue(all(c.args[0].startswith("WARN ") for c in log_err.call_args_list))
+
     def test_missing_nornir_does_not_raise(self) -> None:
         with patch(
             "sam2_segmentation_trainer.mqtt_progress._load_publishers",
@@ -130,10 +230,12 @@ class MqttProgressTests(unittest.TestCase):
                 lr=1e-4,
             )
             progress.transcript("epoch 0 val IoU 0.5000")
+            progress.warn("slow batch took=5.0s")
             progress.close()
         text = stdout.getvalue()
         self.assertIn("loss=1.2500", text)
         self.assertIn("epoch 0 val IoU 0.5000", text)
+        self.assertIn("WARN slow batch took=5.0s", text)
         self.assertEqual(text.count("loss="), 1)
         self.assertEqual(os.environ["NORNIR_RUN_ID"], "sam2_em_v1")
 
