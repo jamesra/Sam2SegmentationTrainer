@@ -39,7 +39,7 @@ services:
       - /usr/local/bin/cursor-dev-entry.sh
       - bash
     environment:
-      SAM2_DATA_ROOT: ${SAM2_DATA_ROOT:-/data-local}
+      SAM2_DATA_ROOT: ${SAM2_DATA_ROOT:-/data-local/current}
       SAM2_OUTPUT_ROOT: /outputs
       # Run checkpoints + TB events on CIFS (not the Windows /outputs bind).
       SAM2_CHECKPOINT_ROOT: ${SAM2_CHECKPOINT_ROOT:-/storage4/Sam2Trainer}
@@ -80,4 +80,54 @@ services:
       - type: bind
         source: ${NORNIR_SHARED_HOST:-../../nornir/nornir-shared}
         target: /opt/nornir-shared
+        read_only: true
+
+  annotation-gallery:
+    build:
+      context: ../annotation-gallery
+      dockerfile: Dockerfile
+    image: nornir-annotation-gallery:latest
+    restart: unless-stopped
+    user: "${SAM2_DATA_UID:-1000}:${SAM2_DATA_GID:-1000}"
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      GALLERY_HOST: "0.0.0.0"
+      GALLERY_HTTP_PORT: "80"
+      GALLERY_HTTPS_PORT: "443"
+      GALLERY_VOLUME_DIR: ${SAM2_DATA_ROOT:-/data-local/current}
+      GALLERY_IDENTITY_MODE: "${GALLERY_IDENTITY_MODE:-stub}"
+      GALLERY_STUB_ROLE: "${GALLERY_STUB_ROLE:-review}"
+      GALLERY_STUB_GRANTS: "${GALLERY_STUB_GRANTS:-}"
+      GALLERY_SESSION_SECRET: "${GALLERY_SESSION_SECRET:-dev-only-not-secret}"
+      GALLERY_VIKING_URL: "${GALLERY_VIKING_URL:-viking://open?volumeName={volume}&location={id}}"
+      GALLERY_ODATA_TEMPLATE: "${GALLERY_ODATA_TEMPLATE:-https://websvc.codepharm.net/{volume}/OData}"
+      NORNIR_BUILDMANAGER_DIR: /opt/nornir-buildmanager
+      GALLERY_OIDC_AUTHORITY: "${GALLERY_OIDC_AUTHORITY:-https://identity.codepharm.net:5001}"
+      GALLERY_IDENTITY_API: "${GALLERY_IDENTITY_API:-https://identity.codepharm.net:6001}"
+      GALLERY_OIDC_CLIENT_ID: "${GALLERY_OIDC_CLIENT_ID:-}"
+      GALLERY_OIDC_CLIENT_SECRET: "${GALLERY_OIDC_CLIENT_SECRET:-}"
+      GALLERY_OIDC_REDIRECT_URI: "${GALLERY_OIDC_REDIRECT_URI:-https://127.0.0.1:8443/callback}"
+      GALLERY_READ_PERMISSION: "${GALLERY_READ_PERMISSION:-Read}"
+      GALLERY_REVIEW_PERMISSION: "${GALLERY_REVIEW_PERMISSION:-Review}"
+      SSL_CERT_PATH: /certs/fullchain.pem
+      SSL_KEY_PATH: /certs/privkey.pem
+    ports:
+      - "8080:80"
+      - "127.0.0.1:8443:443"
+    volumes:
+      - type: bind
+        source: ${SAM2_LOCAL_DATA_HOST}
+        target: /data-local
+      # Directory, not the PEM files: a missing cert must not stop HTTP.
+      # Drop fullchain.pem and privkey.pem here (SSL_CERT_PATH / SSL_KEY_PATH).
+      - type: bind
+        source: ${SAM2_CERTS_HOST:-D:/Docker/mounted-configs/sam2-trainer}
+        target: /certs
+        read_only: true
+      # Rasterizer for one-location mask refresh. Missing mount returns an error
+      # and does not change mask files. The gallery image does not install Nornir.
+      - type: bind
+        source: ${NORNIR_BUILDMANAGER_HOST:-../../nornir/nornir-buildmanager}
+        target: /opt/nornir-buildmanager
         read_only: true

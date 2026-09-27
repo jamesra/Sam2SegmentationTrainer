@@ -17,7 +17,6 @@ from sam2_segmentation_trainer.data.augment import (
     to_rgb_uint8,
 )
 from sam2_segmentation_trainer.data.manifest import CropExample
-from sam2_segmentation_trainer.data.rle import decode_coco_rle
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -37,14 +36,10 @@ def _annotation_for_id(json_path: Path, location_id: int) -> dict[str, Any]:
 
 
 def load_binary_mask(example: CropExample) -> tuple[np.ndarray, dict[str, Any]]:
+    """Load the raster mask PNG. Missing files are not trained (no RLE fallback)."""
     ann = _annotation_for_id(example.json_path, example.location_id)
-    try:
-        raw = _load_gray_uint8(example.mask_path)
-        return (raw > 127).astype(np.uint8), ann
-    except FileNotFoundError:
-        pass
-    mask = decode_coco_rle(ann["segmentation"])
-    return (mask > 0).astype(np.uint8), ann
+    raw = _load_gray_uint8(example.mask_path)
+    return (raw > 127).astype(np.uint8), ann
 
 
 def mask_centroid_xy(mask: np.ndarray) -> tuple[float, float] | None:
@@ -90,7 +85,7 @@ class EMSegDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        # Indexing already drops missing locationIds; still skip rare races/corruption.
+        # Indexing already drops missing locationIds/masks; still skip rare races.
         n = len(self.examples)
         if n == 0:
             raise RuntimeError("EMSegDataset is empty")
@@ -99,7 +94,7 @@ class EMSegDataset(Dataset):
             example = self.examples[(int(idx) + offset) % n]
             try:
                 return self._item_from_example(example)
-            except KeyError as exc:
+            except (KeyError, FileNotFoundError) as exc:
                 last_err = exc
                 continue
         assert last_err is not None

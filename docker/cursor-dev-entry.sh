@@ -53,10 +53,17 @@ install_nornir_mqtt() {
     echo "cursor-dev-entry: paho-mqtt install failed; training progress stays on the console" >&2
     return 0
   fi
-  if ! pip install --no-cache-dir --no-deps "${src}"; then
+  # The bind is read-only. setuptools writes nornir_shared.egg-info and then
+  # utimes that directory, which fails on a read-only mount.
+  local build
+  build="$(mktemp -d /tmp/nornir-shared.XXXXXX)"
+  cp -a "${src}/." "${build}/"
+  if ! pip install --no-cache-dir --no-deps "${build}"; then
+    rm -rf "${build}"
     echo "cursor-dev-entry: nornir_shared install failed; training progress stays on the console" >&2
     return 0
   fi
+  rm -rf "${build}"
   if ! python -c "import paho.mqtt.client; from nornir_shared.mqtt_telemetry import publish_run_meta" >/dev/null 2>&1; then
     echo "cursor-dev-entry: nornir_shared MQTT import failed; training progress stays on the console" >&2
     return 0

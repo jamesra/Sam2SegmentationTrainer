@@ -59,7 +59,7 @@ CLI:
 
 | Variable | Typical value | Role |
 | --- | --- | --- |
-| `SAM2_DATA_ROOT` | `/data-local` (fallback `/storage4`) | Local NVMe or NAS volumes |
+| `SAM2_DATA_ROOT` | `/data-local/current` (symlink to a version; fallback `/storage4`) | Local NVMe or NAS volumes |
 | `SAM2_OUTPUT_ROOT` | `/outputs` | Splits, pretrained download, TB pid/log |
 | `SAM2_CHECKPOINT_ROOT` | `/storage4/Sam2Trainer` | Run dir: `last.pt`, `best_model.pt`, epoch snaps, TB events (CIFS) |
 | workspace | `/workspace` | This git checkout (editable install) |
@@ -70,16 +70,41 @@ If the 32k dataset is not under `/storage4`, add a row to `D:\Docker\Run\nornir-
 
 ## AnnotationCrops layout
 
-Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/storage4`). Each volume uses `{volume}/AnnotationCrops`:
+Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-local/current`). Each volume uses `{volume}/AnnotationCrops`:
 
 - `manifest.jsonl` — index (`image` or `jpeg`, `json`, `imageKey`, `locationIds`, `downsample`, `volume`, `z`)
 - `images/` — tile PNG/JPEG plus COCO-RLE sidecar JSON
-- `masks/` — optional raster `{imageKey}_{locationId}.png` (used when present; otherwise RLE in the JSON)
+- `masks/` — required raster `{imageKey}_{locationId}.png` (examples without a mask PNG are skipped; no RLE fallback)
 - `overlays/` — viewing only, not used for training
 
 One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Within each volume, 90% go to train and 10% to val.
 
 This is **not** Pascal VOC (`JPEGImages` / `Annotations` / `ImageSets`). Do not reshape the NAS.
+
+## Local version mirrors
+
+On the WSL host, `~/sam2-training` is mounted at `/data-local`. Source trees live under `/mnt/d/TrainingData/<ver>` (`v1`, `v1b`, `v2`, …). Sync from that host, not inside the container:
+
+```bash
+# Mirror the highest source version and point current at it.
+scripts/sync_training_data.sh
+# Mirror one version and select it.
+scripts/sync_training_data.sh v1b
+# Mirror without changing current.
+scripts/sync_training_data.sh -noselect v1
+# Only retarget current (no copy). No arg picks the highest local version.
+scripts/select_training_data.sh v2
+```
+
+`current` is a relative symlink (`v2`). Restart training after it changes.
+
+If `~/sam2-training` still has flat `RC1` `RC2` `RPC1` `RPC2` and no version directories yet, move them aside once before the first sync:
+
+```bash
+mkdir -p ~/sam2-training/v1
+mv ~/sam2-training/RC1 ~/sam2-training/RC2 \
+   ~/sam2-training/RPC1 ~/sam2-training/RPC2 ~/sam2-training/v1/
+```
 
 SAM2 is trained class-agnostic (binary mask + point prompt). Viking labels such as `MC` / `ConePR` are kept only for split reports and eval tables.
 
@@ -97,7 +122,8 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 # Restart continues the run with the newest last.pt (for example sam2_em_rpc1).
 # -refresh starts the next sam2_em_vN from pretrained weights.
 # Each volume keeps every usable sample, split 90/10 inside that volume.
-sam2-em-train data.root=/data-local
+sam2-em-train
+# Pin a version: sam2-em-train data.root=/data-local/v1b
 # Overrides: sam2-em-train training.num_epochs=8 training.batch_size=2
 
 # Crash / Ctrl+C: rerun the same command. It loads last.pt (or last.pt.bak) and continues.
@@ -111,6 +137,13 @@ sam2-em-train -benchmark --benchmark-steps 80 --benchmark-val-steps 30
 # TensorBoard starts with the container (cursor-dev-entry.sh) on :6006.
 # Compose maps host 8060 -> 6006. Events under /storage4/Sam2Trainer/runs/<run>/tb/.
 # Open http://localhost:8060  (no need to start tensorboard by hand)
+
+# Annotation gallery is the other Compose service. It reads the same
+# /data-local/current tree. Trash moves a mask from masks/ to ignored/;
+# the next sam2-em-train skips that sample. HTTP http://127.0.0.1:8080
+# HTTPS https://127.0.0.1:8443 when SSL_CERT_PATH and SSL_KEY_PATH exist.
+# Reopen in Container starts it. From the CLI:
+#   docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml up -d annotation-gallery
 
 # Live progress is also published to the Nornir build dashboard when its Mosquitto
 # broker is up (nornir-docker/start-dashboard.ps1). The container uses

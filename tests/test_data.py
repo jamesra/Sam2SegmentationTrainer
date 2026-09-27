@@ -136,6 +136,21 @@ class ManifestSplitTests(unittest.TestCase):
             self.assertFalse(any(ex.location_id == 999001 for ex in usable))
             self.assertLess(len(usable), len(all_ex))
 
+    def test_skips_examples_without_raster_mask(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_crops(root, "RC1", n=4)
+            examples = index_volumes(volumes=["RC1"], root=root, skip_missing=True)
+            target = examples[0]
+            target.mask_path.unlink()
+            all_ex = index_volumes(volumes=["RC1"], root=root, skip_missing=False)
+            usable = index_volumes(volumes=["RC1"], root=root, skip_missing=True)
+            self.assertTrue(any(ex.split_key == target.split_key for ex in all_ex))
+            self.assertFalse(any(ex.split_key == target.split_key for ex in usable))
+            self.assertEqual(len(usable), len(examples) - 1)
+            summary = summarize_index(all_ex)
+            self.assertEqual(summary["missing_raster_mask"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -170,23 +170,34 @@ def predict_masks(
 
 
 def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Per-sample dice loss (shape ``[B]``)."""
     pred_s = torch.sigmoid(pred).flatten(1)
     target_f = target.float().flatten(1)
     inter = (pred_s * target_f).sum(1)
     return 1 - (2 * inter + eps) / (pred_s.sum(1) + target_f.sum(1) + eps)
 
 
-def focal_loss(
+def focal_loss_per_sample(
     pred: torch.Tensor, target: torch.Tensor, gamma: float = 2.0
 ) -> torch.Tensor:
+    """Per-sample mean focal loss over spatial dims (shape ``[B]``)."""
     bce = F.binary_cross_entropy_with_logits(
         pred, target.float(), reduction="none"
     )
     pt = torch.exp(-bce)
-    return ((1 - pt) ** gamma * bce).mean()
+    return ((1 - pt) ** gamma * bce).flatten(1).mean(1)
 
 
-def iou_prediction_loss(pred: torch.Tensor, target: torch.Tensor, iou_preds: torch.Tensor) -> torch.Tensor:
+def focal_loss(
+    pred: torch.Tensor, target: torch.Tensor, gamma: float = 2.0
+) -> torch.Tensor:
+    return focal_loss_per_sample(pred, target, gamma=gamma).mean()
+
+
+def iou_prediction_loss_per_sample(
+    pred: torch.Tensor, target: torch.Tensor, iou_preds: torch.Tensor
+) -> torch.Tensor:
+    """Per-sample IoU-head MSE (shape ``[B]``)."""
     with torch.no_grad():
         pred_bin = torch.sigmoid(pred) > 0.5
         target_b = target.bool()
@@ -194,7 +205,13 @@ def iou_prediction_loss(pred: torch.Tensor, target: torch.Tensor, iou_preds: tor
         union = (pred_bin | target_b).flatten(1).sum(1).float()
         gt_iou = inter / (union + 1e-6)
     iou_head = iou_preds[:, 0] if iou_preds.ndim > 1 else iou_preds
-    return F.mse_loss(iou_head.float(), gt_iou)
+    return (iou_head.float() - gt_iou).pow(2)
+
+
+def iou_prediction_loss(
+    pred: torch.Tensor, target: torch.Tensor, iou_preds: torch.Tensor
+) -> torch.Tensor:
+    return iou_prediction_loss_per_sample(pred, target, iou_preds).mean()
 
 
 def combined_loss(
@@ -205,15 +222,22 @@ def combined_loss(
     focal_weight: float,
     dice_weight: float,
     iou_weight: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    loss_focal = focal_loss(pred, target)
-    loss_dice = dice_loss(pred, target).mean()
-    loss_iou = iou_prediction_loss(pred, target, iou_preds)
-    loss = focal_weight * loss_focal + dice_weight * loss_dice + iou_weight * loss_iou
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Return the batch loss and detached GPU stats. Callers sync when they log."""
+    loss_focal_ps = focal_loss_per_sample(pred, target)
+    loss_dice_ps = dice_loss(pred, target)
+    loss_iou_ps = iou_prediction_loss_per_sample(pred, target, iou_preds)
+    sample_losses = (
+        float(focal_weight) * loss_focal_ps
+        + float(dice_weight) * loss_dice_ps
+        + float(iou_weight) * loss_iou_ps
+    )
+    loss = sample_losses.mean()
     stats = {
-        "loss": float(loss.detach()),
-        "loss_focal": float(loss_focal.detach()),
-        "loss_dice": float(loss_dice.detach()),
-        "loss_iou": float(loss_iou.detach()),
+        "loss": loss.detach(),
+        "loss_focal": loss_focal_ps.mean().detach(),
+        "loss_dice": loss_dice_ps.mean().detach(),
+        "loss_iou": loss_iou_ps.mean().detach(),
+        "sample_losses": sample_losses.detach(),
     }
     return loss, stats

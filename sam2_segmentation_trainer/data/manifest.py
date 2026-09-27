@@ -94,15 +94,17 @@ def index_volumes(
         manifest = crops / "manifest.jsonl"
         if not manifest.is_file():
             raise FileNotFoundError(f"missing manifest: {manifest}")
-        vol_examples, n_skip_ann = _index_manifest(
+        vol_examples, n_skip_ann, n_skip_mask = _index_manifest(
             volume, crops, manifest, skip_missing=skip_missing
         )
         examples.extend(vol_examples)
-        if skip_missing and n_skip_ann:
-            print(
-                f"index {volume}: skipped {n_skip_ann} examples "
-                f"(locationId missing from sidecar JSON)"
-            )
+        if skip_missing and (n_skip_ann or n_skip_mask):
+            parts: list[str] = []
+            if n_skip_ann:
+                parts.append(f"{n_skip_ann} missing from sidecar JSON")
+            if n_skip_mask:
+                parts.append(f"{n_skip_mask} missing raster mask")
+            print(f"index {volume}: skipped {'; '.join(parts)}")
     return examples
 
 
@@ -112,10 +114,12 @@ def _index_manifest(
     manifest: Path,
     *,
     skip_missing: bool,
-) -> tuple[list[CropExample], int]:
+) -> tuple[list[CropExample], int, int]:
     image_names = list_filenames(crops / "images") if skip_missing else None
+    mask_names = list_filenames(crops / "masks") if skip_missing else None
     examples: list[CropExample] = []
     skipped_missing_ann = 0
+    skipped_missing_mask = 0
     with manifest.open(encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             text = line.strip()
@@ -152,6 +156,10 @@ def _index_manifest(
                 if present_ids is not None and loc_i not in present_ids:
                     skipped_missing_ann += 1
                     continue
+                mask_path = crops / "masks" / f"{image_key}_{loc_i}.png"
+                if mask_names is not None and mask_path.name not in mask_names:
+                    skipped_missing_mask += 1
+                    continue
                 examples.append(
                     CropExample(
                         volume=rec_volume,
@@ -161,13 +169,13 @@ def _index_manifest(
                         location_id=loc_i,
                         image_path=image_path,
                         json_path=json_path,
-                        mask_path=crops / "masks" / f"{image_key}_{loc_i}.png",
+                        mask_path=mask_path,
                         split_key=f"{rec_volume}:{loc_i}",
                         width=width,
                         height=height,
                     )
                 )
-    return examples, skipped_missing_ann
+    return examples, skipped_missing_ann, skipped_missing_mask
 
 
 def summarize_index(examples: Sequence[CropExample]) -> dict[str, object]:

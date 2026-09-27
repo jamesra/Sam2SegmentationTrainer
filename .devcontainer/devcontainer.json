@@ -5,13 +5,22 @@
     "${localEnv:NORNIR_DOCKER_USER_ROOT:D:\\Docker}/Run/sam2-dev/compose.net-mounts.override.yaml"
   ],
   "service": "cursor-dev",
+  "runServices": ["cursor-dev", "annotation-gallery"],
   "workspaceFolder": "/workspace",
   "overrideCommand": false,
-  "forwardPorts": [6006],
+  "forwardPorts": [6006, 80, 443],
   "portsAttributes": {
     "6006": {
       "label": "TensorBoard",
       "onAutoForward": "notify"
+    },
+    "80": {
+      "label": "Annotation gallery HTTP (host 8080)",
+      "onAutoForward": "silent"
+    },
+    "443": {
+      "label": "Annotation gallery HTTPS (host 8443)",
+      "onAutoForward": "silent"
     }
   },
   "postAttachCommand": "SAM2_CURSOR_DEV_SETUP_ONLY=1 /usr/local/bin/cursor-dev-entry.sh",
@@ -19,13 +28,15 @@
     "vscode": {
       "extensions": [
         "ms-python.python",
-        "ms-python.debugpy"
+        "ms-python.debugpy",
+        "ozzafar.debugmcpextension"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
         "python.testing.pytestEnabled": true,
         "python.testing.unittestEnabled": false,
-        "python.languageServer": "Jedi"
+        "python.languageServer": "Jedi",
+        "debugmcp.serverPort": 2001
       }
     }
   }

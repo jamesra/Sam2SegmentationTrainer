@@ -12,6 +12,7 @@ import math
 import os
 import random
 import signal
+import sqlite3
 import statistics
 import time
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ from sam2_segmentation_trainer.model import (
     predict_masks,
 )
 from sam2_segmentation_trainer.paths import (
+    annotation_crops_root,
     checkpoint_root,
     data_root,
     latest_resumable_run,
@@ -464,6 +466,105 @@ def run_validation(model, loader, device, image_size: int, threshold: float) -> 
     return float(np.mean(ious))
 
 
+class _LossWindow:
+    """Detached GPU losses, copied to the CPU in one transfer when drained."""
+
+    def __init__(self) -> None:
+        self._rows: list[torch.Tensor] = []
+        self._meta: list[tuple[int, int, int, float, list]] = []
+
+    def add(
+        self,
+        stats: dict[str, torch.Tensor],
+        *,
+        epoch: int,
+        step: int,
+        global_step: int,
+        duration_s: float,
+        meta: list,
+    ) -> None:
+        packed = torch.cat(
+            [
+                stats["loss"].reshape(1),
+                stats["loss_focal"].reshape(1),
+                stats["loss_dice"].reshape(1),
+                stats["loss_iou"].reshape(1),
+                stats["sample_losses"].reshape(-1),
+            ]
+        )
+        self._rows.append(packed.detach())
+        self._meta.append((epoch, step, global_step, duration_s, meta))
+
+    def drain(self) -> list[dict]:
+        if not self._rows:
+            return []
+        packed = torch.stack(self._rows).float().cpu()
+        records = []
+        for i, (epoch, step, global_step, duration_s, meta) in enumerate(self._meta):
+            row = packed[i].tolist()
+            records.append(
+                {
+                    "epoch": epoch,
+                    "step": step,
+                    "global_step": global_step,
+                    "duration_s": duration_s,
+                    "meta": meta,
+                    "loss": row[0],
+                    "loss_focal": row[1],
+                    "loss_dice": row[2],
+                    "loss_iou": row[3],
+                    "sample_losses": row[4:],
+                }
+            )
+        self._rows.clear()
+        self._meta.clear()
+        return records
+
+
+_SCORE_SQL = """
+CREATE TABLE IF NOT EXISTS location_scores (
+    location_id INTEGER NOT NULL,
+    epoch INTEGER NOT NULL,
+    score REAL NOT NULL,
+    PRIMARY KEY (location_id, epoch)
+)
+"""
+
+
+def record_location_scores(data_dir: Path, rows: list[dict]) -> None:
+    """Upsert one combined loss per location per epoch into each volume catalog."""
+    by_volume: dict[str, list[tuple[int, int, float]]] = {}
+    for row in rows:
+        meta = row.get("meta") or []
+        sample_losses = row.get("sample_losses") or []
+        epoch = int(row["epoch"])
+        for item, score in zip(meta, sample_losses, strict=False):
+            volume = item.get("volume")
+            location_id = item.get("location_id")
+            if volume is None or location_id is None:
+                continue
+            by_volume.setdefault(str(volume), []).append(
+                (int(location_id), epoch, float(score))
+            )
+    for volume, scores in by_volume.items():
+        path = annotation_crops_root(volume, data_dir) / "annotation_crops.sqlite"
+        if not path.is_file():
+            continue
+        connection = sqlite3.connect(str(path), timeout=5.0)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(_SCORE_SQL)
+            connection.executemany(
+                "INSERT OR REPLACE INTO location_scores (location_id, epoch, score) "
+                "VALUES (?, ?, ?)",
+                scores,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+
 def _snapshot(
     *,
     model,
@@ -869,6 +970,42 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         )
         interrupted = False
         t_prev = time.perf_counter()
+        loss_window = _LossWindow()
+        log_every = max(1, int(cfg.training.log_every_n_steps))
+
+        def flush_losses() -> None:
+            rows = loss_window.drain()
+            if not rows:
+                return
+            for row in rows:
+                anomaly.observe(
+                    progress=progress,
+                    epoch=row["epoch"],
+                    step=row["step"],
+                    duration_s=row["duration_s"],
+                    loss=row["loss"],
+                    meta=row["meta"],
+                    sample_losses=row["sample_losses"],
+                )
+                writer.add_scalar("train/loss", row["loss"], row["global_step"])
+                writer.add_scalar("train/loss_focal", row["loss_focal"], row["global_step"])
+                writer.add_scalar("train/loss_dice", row["loss_dice"], row["global_step"])
+                writer.add_scalar("train/loss_iou", row["loss_iou"], row["global_step"])
+                writer.add_scalar(
+                    "train/lr", optimizer.param_groups[0]["lr"], row["global_step"]
+                )
+            record_location_scores(data_dir, rows)
+            last = rows[-1]
+            pbar.set_postfix(loss=f"{last['loss']:.4f}")
+            progress.report_step(
+                step=last["step"],
+                batches_per_epoch=batches_per_epoch,
+                global_step=last["global_step"],
+                log_every=1,
+                loss=last["loss"],
+                lr=float(optimizer.param_groups[0]["lr"]),
+            )
+
         for rel_i, batch in enumerate(pbar):
             step = step0 + rel_i
             images = batch["image"].to(device, non_blocking=True)
@@ -910,32 +1047,18 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 if opt_step % save_every == 0:
                     save_now(epoch, step + 1)
                     pbar.write(f"  saved last.pt (epoch {epoch} step {step + 1})")
-            step_loss = float(stats["loss"])
             t_done = time.perf_counter()
-            anomaly.observe(
-                progress=progress,
+            loss_window.add(
+                stats,
                 epoch=epoch,
                 step=step,
+                global_step=global_step,
                 duration_s=t_done - t_prev,
-                loss=step_loss,
                 meta=batch.get("meta") or [],
             )
             t_prev = t_done
-            if global_step % int(cfg.training.log_every_n_steps) == 0:
-                writer.add_scalar("train/loss", stats["loss"], global_step)
-                writer.add_scalar("train/loss_focal", stats["loss_focal"], global_step)
-                writer.add_scalar("train/loss_dice", stats["loss_dice"], global_step)
-                writer.add_scalar("train/loss_iou", stats["loss_iou"], global_step)
-                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-                pbar.set_postfix(loss=f"{stats['loss']:.4f}")
-                progress.report_step(
-                    step=step,
-                    batches_per_epoch=batches_per_epoch,
-                    global_step=global_step,
-                    log_every=int(cfg.training.log_every_n_steps),
-                    loss=step_loss,
-                    lr=float(optimizer.param_groups[0]["lr"]),
-                )
+            if (global_step + 1) % log_every == 0:
+                flush_losses()
             global_step += 1
             if stop.stop:
                 save_now(epoch, step + 1)
@@ -945,6 +1068,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 )
                 interrupted = True
                 break
+
+        flush_losses()
 
         if interrupted:
             writer.close()

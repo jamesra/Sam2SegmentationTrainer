@@ -20,20 +20,47 @@ _RUN_ID_ENV = "NORNIR_RUN_ID"
 _LOAD_PUBLISHERS = object()
 
 
+def _sample_label(item: Mapping[str, Any]) -> str:
+    volume = item.get("volume", "?")
+    image_key = item.get("image_key", "?")
+    location_id = item.get("location_id", "?")
+    return f"{volume}/{image_key}#{location_id}"
+
+
 def format_batch_samples(
     meta: Sequence[Mapping[str, Any]],
     *,
     max_samples: int = 8,
 ) -> str:
     """Compact ``volume/image_key#location_id`` list for warning transcripts."""
-    parts: list[str] = []
-    for item in meta[:max_samples]:
-        volume = item.get("volume", "?")
-        image_key = item.get("image_key", "?")
-        location_id = item.get("location_id", "?")
-        parts.append(f"{volume}/{image_key}#{location_id}")
+    parts = [_sample_label(item) for item in meta[:max_samples]]
     text = ", ".join(parts) if parts else "(no meta)"
     extra = len(meta) - max_samples
+    if extra > 0:
+        text = f"{text} (+{extra} more)"
+    return text
+
+
+def format_ranked_samples(
+    meta: Sequence[Mapping[str, Any]],
+    sample_losses: Sequence[float],
+    *,
+    max_samples: int = 8,
+) -> str:
+    """Samples worst→best, with matching ``loss=(...)`` scores listed separately."""
+    n = min(len(meta), len(sample_losses))
+    ranked = sorted(
+        ((_sample_label(meta[i]), float(sample_losses[i])) for i in range(n)),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    shown = ranked[:max_samples]
+    if not shown:
+        return "(no meta)"
+    names = ", ".join(label for label, _score in shown)
+    scores = ", ".join(f"{score:.4f}" for _label, score in shown)
+    text = f"{names} loss=({scores})"
+    extra = len(ranked) - max_samples
     if extra > 0:
         text = f"{text} (+{extra} more)"
     return text
@@ -70,14 +97,18 @@ class StepAnomalyMonitor:
         duration_s: float,
         loss: float,
         meta: Sequence[Mapping[str, Any]],
+        sample_losses: Sequence[float] | None = None,
     ) -> list[str]:
-        """Compare against history, emit MQTT warnings, then record this step.
+        """Compare against history, emit MQTT messages, then record this step.
 
-        Returns the warning messages that were published (empty when none).
+        Slow batches are warnings (batch membership only). High-loss batches are
+        errors and list samples sorted worst→best with per-sample scores when
+        ``sample_losses`` is provided.
+
+        Returns the messages that were published (empty when none).
         """
         self._seen += 1
         messages: list[str] = []
-        samples = format_batch_samples(meta)
         ready = self._seen > int(self.warmup) and len(self._times) >= 10
 
         if ready:
@@ -87,7 +118,7 @@ class StepAnomalyMonitor:
                 msg = (
                     f"slow batch epoch={epoch} step={step} "
                     f"took={float(duration_s):.2f}s (median={med_t:.2f}s) "
-                    f"loss={float(loss):.4f} samples={samples}"
+                    f"loss={float(loss):.4f} samples={format_batch_samples(meta)}"
                 )
                 progress.warn(msg)
                 messages.append(msg)
@@ -98,12 +129,16 @@ class StepAnomalyMonitor:
                 med_l * float(self.high_loss_factor),
             )
             if float(loss) >= threshold_l:
+                if sample_losses:
+                    ranked = format_ranked_samples(meta, sample_losses)
+                else:
+                    ranked = format_batch_samples(meta)
                 msg = (
-                    f"high loss epoch={epoch} step={step} "
+                    f"ERROR high loss epoch={epoch} step={step} "
                     f"loss={float(loss):.4f} (median={med_l:.4f}) "
-                    f"took={float(duration_s):.2f}s samples={samples}"
+                    f"took={float(duration_s):.2f}s samples={ranked}"
                 )
-                progress.warn(msg)
+                progress.log_error(msg)
                 messages.append(msg)
 
         self._times.append(float(duration_s))

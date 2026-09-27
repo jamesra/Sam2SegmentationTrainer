@@ -15,6 +15,7 @@ from sam2_segmentation_trainer.mqtt_progress import (
     _Publishers,
     _load_publishers,
     format_batch_samples,
+    format_ranked_samples,
 )
 
 
@@ -146,7 +147,21 @@ class MqttProgressTests(unittest.TestCase):
         )
         self.assertEqual(text, "RC1/img_a#1, RC2/img_b#2")
 
-    def test_anomaly_monitor_warns_on_slow_and_high_loss(self) -> None:
+    def test_format_ranked_samples_worst_first(self) -> None:
+        text = format_ranked_samples(
+            [
+                {"volume": "RC1", "image_key": "a", "location_id": 1},
+                {"volume": "RPC1", "image_key": "b", "location_id": 2},
+                {"volume": "RC2", "image_key": "c", "location_id": 3},
+            ],
+            [0.5, 4.2, 1.1],
+        )
+        self.assertEqual(
+            text,
+            "RPC1/b#2, RC2/c#3, RC1/a#1 loss=(4.2000, 1.1000, 0.5000)",
+        )
+
+    def test_anomaly_monitor_warns_on_slow_and_errors_on_high_loss(self) -> None:
         log_err = Mock()
         progress = TrainingProgress(
             publishers=_Publishers(
@@ -165,7 +180,10 @@ class MqttProgressTests(unittest.TestCase):
             high_loss_factor=5.0,
             high_loss_absolute=2.0,
         )
-        meta = [{"volume": "RC1", "image_key": "k", "location_id": 42}]
+        meta = [
+            {"volume": "RC1", "image_key": "good", "location_id": 1},
+            {"volume": "RPC1", "image_key": "bad", "location_id": 99},
+        ]
         for i in range(15):
             msgs = monitor.observe(
                 progress=progress,
@@ -174,6 +192,7 @@ class MqttProgressTests(unittest.TestCase):
                 duration_s=1.2,
                 loss=0.2,
                 meta=meta,
+                sample_losses=[0.15, 0.25],
             )
             self.assertEqual(msgs, [])
 
@@ -184,10 +203,14 @@ class MqttProgressTests(unittest.TestCase):
             duration_s=4.0,
             loss=0.25,
             meta=meta,
+            sample_losses=[0.2, 0.3],
         )
         self.assertEqual(len(slow), 1)
         self.assertIn("slow batch", slow[0])
-        self.assertIn("RC1/k#42", slow[0])
+        self.assertIn("RC1/good#1", slow[0])
+        self.assertIn("RPC1/bad#99", slow[0])
+        self.assertNotIn("=", slow[0].split("samples=")[1])
+        self.assertTrue(log_err.call_args_list[-1].args[0].startswith("WARN "))
 
         high = monitor.observe(
             progress=progress,
@@ -196,12 +219,17 @@ class MqttProgressTests(unittest.TestCase):
             duration_s=1.3,
             loss=7.23,
             meta=meta,
+            sample_losses=[0.4, 14.0],
         )
         self.assertEqual(len(high), 1)
-        self.assertIn("high loss", high[0])
+        self.assertIn("ERROR high loss", high[0])
         self.assertIn("7.2300", high[0])
-        self.assertGreaterEqual(log_err.call_count, 2)
-        self.assertTrue(all(c.args[0].startswith("WARN ") for c in log_err.call_args_list))
+        self.assertIn(
+            "samples=RPC1/bad#99, RC1/good#1 loss=(14.0000, 0.4000)",
+            high[0],
+        )
+        self.assertTrue(log_err.call_args_list[-1].args[0].startswith("ERROR "))
+        self.assertFalse(log_err.call_args_list[-1].args[0].startswith("WARN "))
 
     def test_missing_nornir_does_not_raise(self) -> None:
         with patch(

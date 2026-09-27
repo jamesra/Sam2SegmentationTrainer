@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Annotation overlay gallery</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="bar">
+    <h1>Annotation overlay gallery</h1>
+    <p id="who" class="who"></p>
+  </header>
+  <section class="filters" id="filters">
+    <div class="filter">
+      <label for="training-set">Training set</label>
+      <div class="filter-row">
+        <select id="training-set" title="Version folder under the training data root. current is the set the trainer reads."></select>
+      </div>
+    </div>
+    <div class="filter">
+      <label for="volume">Volume</label>
+      <div class="filter-row">
+        <select id="volume"></select>
+        <button type="button" id="volume-settings" title="OData endpoint and crop exporter for this volume">Settings</button>
+      </div>
+    </div>
+    <div class="filter">
+      <span title="Unknown is not yet reviewed. Approved stays in the dataset and is hidden until checked. Rejected is left out of training.">View</span>
+      <div class="view-stack" id="view-classes">
+        <label><input type="checkbox" data-view="approved"> Approved</label>
+        <label><input type="checkbox" data-view="rejected"> Rejected</label>
+        <label><input type="checkbox" data-view="unknown" checked> Unknown</label>
+      </div>
+    </div>
+    <div class="filter">
+      <label for="type" title="Matches a type id or a type name. This field is a substring, not a list or a regular expression.">Type</label>
+      <div class="filter-row">
+        <input id="type" type="search" placeholder="type id or name" title="Matches a type id or a type name. This field is a substring, not a list or a regular expression.">
+        <button type="button" class="reverse" data-sort="type_id" title="Sort by type. Click again to reverse.">Reverse</button>
+      </div>
+    </div>
+    <div class="filter">
+      <label for="label" title="Comma-separated structure ids, such as 487, 120. Or a regular expression matched against structure labels, such as ^M.">Structure</label>
+      <div class="filter-row">
+        <input id="label" type="search" placeholder="ids or label regex" title="Comma-separated structure ids, such as 487, 120. Or a regular expression matched against structure labels, such as ^M.">
+        <button type="button" class="reverse" data-sort="structure_label" title="Sort by structure label. Click again to reverse.">Reverse</button>
+      </div>
+    </div>
+    <div class="filter">
+      <label for="locate" title="Scroll to this location id. Other cards stay in the list.">Location</label>
+      <div class="filter-row">
+        <input id="locate" type="search" inputmode="numeric" placeholder="location id" title="Scroll to this location id. Other cards stay in the list.">
+      </div>
+    </div>
+    <div class="filter">
+      <label for="tags" title="A tag, or a regular expression matched against structure tags from OData, such as synapse|gap. Use ^tag$ for an exact tag.">Tags</label>
+      <div class="filter-row">
+        <input id="tags" type="search" placeholder="tag or regex" title="A tag, or a regular expression matched against structure tags from OData, such as synapse|gap. Use ^tag$ for an exact tag.">
+      </div>
+    </div>
+    <div class="filter">
+      <label for="z" title="One section number.">Z</label>
+      <div class="filter-row">
+        <input id="z" type="search" placeholder="section" title="One section number.">
+        <button type="button" class="reverse" data-sort="z" title="Sort by section. Click again to reverse.">Reverse</button>
+      </div>
+    </div>
+    <div class="filter">
+      <label for="radius" title="One radius, or a min-max range such as 100-500.">Radius</label>
+      <div class="filter-row">
+        <input id="radius" type="search" placeholder="min-max" title="One radius, or a min-max range such as 100-500.">
+        <button type="button" class="reverse" data-sort="radius" title="Sort by radius. Click again to reverse.">Reverse</button>
+      </div>
+    </div>
+    <div class="filter">
+      <span title="Export downloads approved and rejected lists for every volume in this training set. Import writes those lists back. A volume that is not in the set is kept in the file and not applied.">Review lists</span>
+      <div class="filter-row">
+        <button type="button" id="export-ignore" title="Download approved and rejected lists for every volume in this training set.">Export</button>
+        <button type="button" id="repair-pack" title="Download rejected crops, masks, and a manifest to send for repair. Check Rejected under View to review them here first.">Repair pack</button>
+        <button type="button" id="import-ignore" class="review-only" title="Import review lists for every volume in the file. A volume that is not in this training set is stored and not applied.">Import</button>
+        <input id="import-ignore-file" type="file" accept="application/json,.json" hidden>
+      </div>
+    </div>
+    <div class="filter" id="sort-filter">
+      <span>Sort</span>
+      <div id="sort-stack"></div>
+    </div>
+    <div class="filter">
+      <span title="Huge is the original 1024 PNG. Large, Medium, and Small are cached JPEGs. Zoom still opens the 1024 PNG.">Size</span>
+      <div class="filter-row" id="card-size" role="group" aria-label="Card size">
+        <button type="button" data-card-size="huge" title="Huge, 1024 PNG" aria-pressed="false">Huge</button>
+        <button type="button" data-card-size="large" title="Large, 512 JPEG" aria-pressed="true">Large</button>
+        <button type="button" data-card-size="medium" title="Medium, 384 JPEG" aria-pressed="false">Medium</button>
+        <button type="button" data-card-size="small" title="Small, 256 JPEG" aria-pressed="false">Small</button>
+      </div>
+    </div>
+    <label>Hue
+      <input id="hue" type="color" value="#3478cb">
+    </label>
+    <label>Visibility
+      <span class="filter-row">
+        <input id="visibility" type="range" min="0" max="100" value="30">
+        <output id="visibility-value" for="visibility">30%</output>
+      </span>
+    </label>
+  </section>
+  <p id="status" class="status"></p>
+  <div id="scroller" class="scroller">
+    <div id="spacer" class="spacer"></div>
+    <div id="grid" class="grid"></div>
+  </div>
+  <div id="viewer" class="viewer" hidden>
+    <div class="viewer-bar">
+      <div class="key-help-wrap">
+        <button type="button" id="viewer-keys" class="key-cluster" aria-label="Arrow key shortcuts" aria-expanded="false" title="Arrow key shortcuts">
+          <span class="key-grid" aria-hidden="true">
+            <span></span><span>↑</span><span></span>
+            <span>←</span><span>↓</span><span>→</span>
+          </span>
+        </button>
+        <div id="viewer-keys-help" class="key-help" hidden>
+          <div><kbd>↑</kbd> Approve and next</div>
+          <div><kbd>←</kbd> Previous</div>
+          <div><kbd>↓</kbd> Reject and next</div>
+          <div><kbd>→</kbd> Next</div>
+          <div><kbd>Space</kbd> Flip mask while held</div>
+        </div>
+      </div>
+      <button type="button" id="viewer-back" hidden>Back</button>
+    </div>
+    <div id="viewer-stage" class="viewer-stage">
+      <div class="viewer-row">
+        <button type="button" id="viewer-approve" class="icon check viewer-act" title="Approve" aria-label="Approve">✓</button>
+        <div class="viewer-zoom">
+          <button type="button" id="viewer-prev" class="viewer-nav" title="Previous" aria-label="Previous">‹</button>
+          <div id="viewer-frame" class="viewer-frame">
+          <button type="button" id="viewer-refresh" class="icon refresh review-only" title="Refresh mask from OData" aria-label="Refresh mask">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 6V3L8 7l4 4V8a4 4 0 1 1-4 4H6a6 6 0 1 0 6-6z"/></svg>
+          </button>
+          <canvas id="viewer-image"></canvas>
+          <canvas id="viewer-mask"></canvas>
+          <div id="viewer-grid" class="viewer-grid" hidden></div>
+          <div id="viewer-cues" class="viewer-cues" hidden>
+            <div class="viewer-cue hide" data-side="hide"><span>Hide</span></div>
+            <div class="viewer-cue show" data-side="show"><span>Show</span></div>
+          </div>
+          </div>
+          <button type="button" id="viewer-next" class="viewer-nav" title="Next" aria-label="Next">›</button>
+        </div>
+        <button type="button" id="viewer-reject" class="icon trash viewer-act" title="Reject" aria-label="Reject">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 3h6l1 2h5v2H3V5h5l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9zm-1 12h12l1-13H5l1 13z"/></svg>
+        </button>
+        <button type="button" id="viewer-close" aria-label="Close">×</button>
+        <aside id="viewer-info" class="viewer-info" hidden></aside>
+      </div>
+    </div>
+  </div>
+  <div id="settings-dialog" class="import-dialog" hidden>
+    <div class="import-card" role="dialog" aria-labelledby="settings-title">
+      <h2 id="settings-title">Volume settings</h2>
+      <label for="settings-odata">Endpoint</label>
+      <input id="settings-odata" type="url" autocomplete="off">
+      <label for="settings-exporter">Exporter</label>
+      <select id="settings-exporter">
+        <option value="tiled">tiled</option>
+        <option value="legacy">legacy</option>
+      </select>
+      <p class="import-totals">tiled keeps these crop windows and redraws the mask. legacy is stored for the same refresh and does not download a new image.</p>
+      <div class="import-actions">
+        <button type="button" id="settings-save" class="review-only">Save</button>
+        <button type="button" id="settings-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

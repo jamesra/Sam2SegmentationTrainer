@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../VikingLegacy"
+		},
+		{
+			"path": "../VikingLegacy-Maintenance"
 		}
 	],
 	"settings": {}
