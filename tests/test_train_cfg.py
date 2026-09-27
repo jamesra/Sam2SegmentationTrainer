@@ -15,6 +15,7 @@ class TrainCfgTests(unittest.TestCase):
         self.assertTrue(bool(cfg.model.activation_checkpointing))
         self.assertTrue(bool(cfg.training.resume))
         self.assertEqual(int(cfg.training.save_every_n_steps), 200)
+        self.assertEqual(float(cfg.training.early_stopping_min_delta), 0.0)
         self.assertIsNone(cfg.training.checkpoint_dir)
         self.assertEqual(str(cfg.training.run_name), "auto")
         self.assertFalse(bool(cfg.data.even_per_volume))

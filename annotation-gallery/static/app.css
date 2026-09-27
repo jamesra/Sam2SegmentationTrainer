@@ -229,11 +229,12 @@ button.reverse.active,
   right: 16px;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(512px, 512px));
-  gap: 12px;
+  gap: 4px;
 }
 
 .card {
   position: relative;
+  align-self: start;
   background: var(--card);
   border: 1px solid #2a313c;
   border-radius: 8px;
@@ -245,24 +246,29 @@ button.reverse.active,
   display: none;
 }
 
-.card > button.refresh,
+.card button.refresh,
 #viewer-refresh {
   display: none;
-  width: 32px;
-  height: 32px;
   border-radius: 50%;
   z-index: 4;
 }
 
-body.can-refresh .card > button.refresh,
+body.can-refresh .card button.refresh,
 body.can-refresh #viewer-refresh {
   display: inline-flex;
 }
 
-.card > button.refresh {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
+.meta button.refresh {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin-left: 6px;
+  padding: 2px;
+}
+
+.meta button.refresh svg {
+  width: 18px;
+  height: 18px;
 }
 
 #viewer-refresh {
@@ -311,6 +317,8 @@ body.can-refresh #viewer-refresh {
   position: relative;
 }
 
+/* Card corner buttons stay 75% transparent. Do not change this without explicit permission.
+   #232833 and the approved green are drawn at 25% opacity. Zoom-viewer buttons stay opaque. */
 .card > .icon.check,
 .card > .icon.trash,
 .card > .icon.plus {
@@ -320,6 +328,7 @@ body.can-refresh #viewer-refresh {
   padding: 8px;
   font-size: 32px;
   line-height: 1;
+  background: rgba(35, 40, 51, 0.25);
 }
 
 .card > .icon.check {
@@ -336,6 +345,17 @@ body.can-refresh #viewer-refresh {
 .card > .icon.plus svg {
   width: 32px;
   height: 32px;
+}
+
+body[data-card-size="small"] .card > .icon.check {
+  transform: scale(0.75);
+  transform-origin: top left;
+}
+
+body[data-card-size="small"] .card > .icon.trash,
+body[data-card-size="small"] .card > .icon.plus {
+  transform: scale(0.75);
+  transform-origin: top right;
 }
 
 .composite .media-state {
@@ -371,7 +391,11 @@ body.can-refresh #viewer-refresh {
   content: "Image missing";
 }
 
-.card > .icon.check.on,
+.card > .icon.check.on {
+  background: rgba(20, 83, 45, 0.25);
+  color: #bbf7d0;
+}
+
 .viewer-act.check.on {
   background: #14532d;
   color: #bbf7d0;
@@ -420,9 +444,9 @@ body.can-refresh #viewer-refresh {
 }
 
 .meta {
-  padding: 8px;
-  display: grid;
-  gap: 4px;
+  padding: 1px 6px 2px;
+  font-size: 12px;
+  line-height: 1.2;
 }
 
 .meta a { color: var(--accent); }
@@ -712,15 +736,15 @@ button.plus { color: var(--ok); }
 body.no-review button.trash,
 body.no-review button.plus,
 body.no-review button.check,
-body.no-review .card > button.refresh,
+body.no-review .card button.refresh,
 body.no-review #viewer-refresh,
 body.no-review .review-only {
   display: none;
 }
 
 .badge {
-  display: inline-block;
-  padding: 1px 6px;
+  display: inline;
+  padding: 0 4px;
   border-radius: 999px;
   background: #232833;
   color: var(--muted);

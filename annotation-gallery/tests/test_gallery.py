@@ -150,8 +150,11 @@ def test_catalog_loss_is_latest_score_or_null(httpd: tuple[str, int], registry: 
         "'images/RC2_18_D1_X0_Y0.png', 'masks/RC2_18_D1_X0_Y0_99.png', 0)"
     )
     connection.executemany(
-        "INSERT INTO location_scores (location_id, epoch, score) VALUES (?, ?, ?)",
-        [(42, 1, 1.5), (42, 3, 0.25)],
+        "INSERT INTO location_scores (location_id, image_key, epoch, score) VALUES (?, ?, ?, ?)",
+        [
+            (42, "RC2_17_D1_X0_Y0", 1, 1.5),
+            (42, "RC2_17_D1_X0_Y0", 3, 0.25),
+        ],
     )
     connection.commit()
     connection.close()
@@ -160,6 +163,50 @@ def test_catalog_loss_is_latest_score_or_null(httpd: tuple[str, int], registry: 
     by_id = {row["location_id"]: row for row in catalog["rows"]}
     assert by_id[42]["loss"] == 0.25
     assert by_id[99]["loss"] is None
+
+
+def test_catalog_loss_is_per_window_with_legacy_fallback(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE locations ("
+        "location_id INTEGER NOT NULL, z INTEGER NOT NULL, structure_id INTEGER, "
+        "structure_label TEXT, type_id INTEGER, type_name TEXT, radius REAL, "
+        "image_key TEXT NOT NULL, image_relpath TEXT, mask_relpath TEXT, "
+        "ignored INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (location_id, image_key))"
+    )
+    connection.execute(
+        "CREATE TABLE location_scores ("
+        "location_id INTEGER NOT NULL, epoch INTEGER NOT NULL, score REAL NOT NULL, "
+        "PRIMARY KEY (location_id, epoch))"
+    )
+    connection.executemany(
+        "INSERT INTO locations (location_id, z, structure_id, structure_label, "
+        "type_id, type_name, radius, image_key, image_relpath, mask_relpath, ignored) "
+        "VALUES (?, 17, 7, 'soma', 1, 'Cell', 12.5, ?, ?, ?, 0)",
+        [
+            (42, "win-a", "images/a.png", "masks/a_42.png"),
+            (42, "win-b", "images/b.png", "masks/b_42.png"),
+            (99, "win-c", "images/c.png", "masks/c_99.png"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO location_scores (location_id, epoch, score) VALUES (42, 3, 0.25)"
+    )
+    connection.commit()
+    connection.close()
+    connection = connect(crops)
+    connection.execute(
+        "INSERT INTO location_scores (location_id, image_key, epoch, score) "
+        "VALUES (42, 'win-a', 4, 1.5)"
+    )
+    connection.commit()
+    connection.close()
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key["win-a"]["loss"] == 1.5
+    assert by_key["win-b"]["loss"] == 0.25
+    assert by_key["win-c"]["loss"] is None
 
 
 def test_training_sets_defaults_to_current_outside_a_version_tree(httpd: tuple[str, int]) -> None:
@@ -238,12 +285,18 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "function windowsForLocation" in js
     mutate = js.split("async function mutate", 1)[1].split("async function applyRememberedStatus", 1)[0]
     assert "loadCatalog(" not in mutate
+    assert "paintReviewNow(locationId)" in mutate
+    assert "forgetVisibleLocation(locationId)" in mutate
+    assert "await afterPaint()" in mutate
     assert "render(true, true)" in mutate
     assert "function reconcileGrid" in js
     assert 'postReview(act, locationId, "")' in mutate
     assert ".card[hidden]" in css
     assert "visibleKeys" in js
-    pack = js.split("function packGrid", 1)[1].split("function packKey", 1)[0]
+    pack = js.split("function packGrid", 1)[1].split("function layoutCards", 1)[0]
+    assert "byLocation" in pack
+    assert "anchorStarts" in pack
+    assert "windowsForLocation(" not in pack
     assert "windows[0]" not in pack
     assert "function windowOrigin" in js
     assert "Math.floor(dc / columns)" in js
@@ -252,8 +305,69 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "loadParts" not in opener
     assert 'closest(".card")' in js
     assert "width: 32px" in css
+    assert "rgba(35, 40, 51, 0.25)" in css
+    assert "rgba(20, 83, 45, 0.25)" in css
+    assert "Do not change this without explicit permission" in css
+    assert 'document.body.dataset.cardSize = state.cardSize' in js
+    assert 'body[data-card-size="small"] .card > .icon.check' in css
+    assert "scale(0.75)" in css
+    assert "const GRID_GAP = 4" in js
+    assert "cardPx + 20" in js
+    assert "align-self: start" in css
     assert 'content: "Generating thumbnail"' in css
     assert 'content: "Image missing"' in css
+
+
+def test_ignore_keeps_a_mask_for_every_window(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    keys = [
+        "RC2_17_D1_X0-1024_Y0-1024",
+        "RC2_17_D1_X1024-2048_Y0-1024",
+    ]
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE locations ("
+        "location_id INTEGER NOT NULL, z INTEGER NOT NULL, structure_id INTEGER, "
+        "structure_label TEXT, type_id INTEGER, type_name TEXT, radius REAL, "
+        "image_key TEXT NOT NULL, image_relpath TEXT, mask_relpath TEXT, "
+        "ignored INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (location_id, image_key))"
+    )
+    connection.executemany(
+        "INSERT INTO locations (location_id, z, structure_id, structure_label, "
+        "type_id, type_name, radius, image_key, image_relpath, mask_relpath, ignored) "
+        "VALUES (?, 17, 7, 'soma', 1, 'Cell', 12.5, ?, ?, ?, 0)",
+        [
+            (7, key, f"images/{key}.png", f"masks/{key}_7.png")
+            for key in keys
+        ],
+    )
+    connection.commit()
+    connection.close()
+    masks = crops / "masks"
+    masks.mkdir()
+    for key in keys:
+        (masks / f"{key}_7.png").write_bytes(b"png")
+    ignore_location(crops, 7)
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key[keys[0]]["mask_relpath"] == f"ignored/{keys[0]}_7.png"
+    assert by_key[keys[1]]["mask_relpath"] == f"ignored/{keys[1]}_7.png"
+    assert (crops / "ignored" / f"{keys[0]}_7.png").is_file()
+    assert (crops / "ignored" / f"{keys[1]}_7.png").is_file()
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "UPDATE locations SET mask_relpath = ? WHERE location_id = 7",
+        [f"ignored/{keys[0]}_7.png"],
+    )
+    connection.commit()
+    connection.close()
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key[keys[1]]["mask_relpath"] == f"ignored/{keys[1]}_7.png"
+    restore_location(crops, 7)
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key[keys[0]]["mask_relpath"] == f"masks/{keys[0]}_7.png"
+    assert by_key[keys[1]]["mask_relpath"] == f"masks/{keys[1]}_7.png"
+    assert (crops / "masks" / f"{keys[1]}_7.png").is_file()
 
 
 def test_location_review_covers_every_window(tmp_path: Path) -> None:

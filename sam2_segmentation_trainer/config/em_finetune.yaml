@@ -23,6 +23,8 @@ training:
   save_every_n_steps: 200
   resume: true
   early_stopping_patience: 5
+  # 0: any val IoU increase resets patience. Pass training.early_stopping_min_delta=0.0005 to require a larger gain.
+  early_stopping_min_delta: 0
   # MQTT warn when a step is much slower / higher-loss than the recent median.
   warn_anomaly_warmup: 30
   warn_anomaly_window: 100

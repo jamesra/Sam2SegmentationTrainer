@@ -524,16 +524,48 @@ class _LossWindow:
 _SCORE_SQL = """
 CREATE TABLE IF NOT EXISTS location_scores (
     location_id INTEGER NOT NULL,
+    image_key TEXT NOT NULL,
     epoch INTEGER NOT NULL,
     score REAL NOT NULL,
-    PRIMARY KEY (location_id, epoch)
+    PRIMARY KEY (location_id, image_key, epoch)
 )
 """
 
 
+def _ensure_score_schema(connection: sqlite3.Connection) -> None:
+    """Create per-window scores, or keep a location-only table under an empty image key."""
+    connection.execute(_SCORE_SQL)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(location_scores)")}
+    if "image_key" in columns:
+        return
+    connection.execute(
+        """
+        CREATE TABLE location_scores_window (
+            location_id INTEGER NOT NULL,
+            image_key TEXT NOT NULL,
+            epoch INTEGER NOT NULL,
+            score REAL NOT NULL,
+            PRIMARY KEY (location_id, image_key, epoch)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO location_scores_window (location_id, image_key, epoch, score)
+        SELECT location_id, '', epoch, score FROM location_scores
+        """
+    )
+    connection.execute("DROP TABLE location_scores")
+    connection.execute("ALTER TABLE location_scores_window RENAME TO location_scores")
+
+
 def record_location_scores(data_dir: Path, rows: list[dict]) -> None:
-    """Upsert one combined loss per location per epoch into each volume catalog."""
-    by_volume: dict[str, list[tuple[int, int, float]]] = {}
+    """Upsert one combined loss per mask image per epoch into each volume catalog.
+
+    A sample with no image key is skipped so a run cannot write another
+    location-wide row. The same window twice in one epoch keeps the later score.
+    """
+    by_volume: dict[str, list[tuple[int, str, int, float]]] = {}
     for row in rows:
         meta = row.get("meta") or []
         sample_losses = row.get("sample_losses") or []
@@ -541,10 +573,11 @@ def record_location_scores(data_dir: Path, rows: list[dict]) -> None:
         for item, score in zip(meta, sample_losses, strict=False):
             volume = item.get("volume")
             location_id = item.get("location_id")
-            if volume is None or location_id is None:
+            image_key = item.get("image_key")
+            if volume is None or location_id is None or not image_key:
                 continue
             by_volume.setdefault(str(volume), []).append(
-                (int(location_id), epoch, float(score))
+                (int(location_id), str(image_key), epoch, float(score))
             )
     for volume, scores in by_volume.items():
         path = annotation_crops_root(volume, data_dir) / "annotation_crops.sqlite"
@@ -554,13 +587,15 @@ def record_location_scores(data_dir: Path, rows: list[dict]) -> None:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute(_SCORE_SQL)
+            _ensure_score_schema(connection)
             connection.executemany(
-                "INSERT OR REPLACE INTO location_scores (location_id, epoch, score) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO location_scores "
+                "(location_id, image_key, epoch, score) VALUES (?, ?, ?, ?)",
                 scores,
             )
             connection.commit()
+        except sqlite3.Error as exc:
+            print(f"location_scores write skipped for {volume}: {exc}")
         finally:
             connection.close()
 
@@ -862,6 +897,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     start_epoch = 0
     start_step = 0
     patience = int(cfg.training.early_stopping_patience)
+    min_delta = float(cfg.training.get("early_stopping_min_delta", 0.0))
     save_every = max(1, int(cfg.training.get("save_every_n_steps", 200)))
     resume_enabled = bool(cfg.training.get("resume", True))
 
@@ -1090,7 +1126,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 progress.stage("validate", "end")
             writer.add_scalar("val/iou", val_iou, epoch)
             progress.transcript(f"epoch {epoch} val IoU {val_iou:.4f}")
-            if val_iou > best_val_iou:
+            if val_iou > best_val_iou + min_delta:
                 best_val_iou = val_iou
                 epochs_without_improve = 0
                 atomic_torch_save(model.state_dict(), run_dir / "best_model.pt")

@@ -28,7 +28,7 @@ THUMB_SIZES = frozenset({512, 384, 256})
 JPEG_QUALITY = 90
 IMAGE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
 _CROP_SUFFIXES = (".png", ".jpg", ".jpeg")
-_ENCODE_WORKERS = 4
+_ENCODE_WORKERS = 8
 _WATCH_INTERVAL_S = 5.0
 _WATCH_FOLDERS = ("images", "masks", "ignored")
 
