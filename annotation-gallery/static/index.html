@@ -112,22 +112,19 @@
   </div>
   <div id="viewer" class="viewer" hidden>
     <div class="viewer-bar">
-      <div class="key-help-wrap">
-        <button type="button" id="viewer-keys" class="key-cluster" aria-label="Arrow key shortcuts" aria-expanded="false" title="Arrow key shortcuts">
-          <span class="key-grid" aria-hidden="true">
-            <span></span><span>↑</span><span></span>
-            <span>←</span><span>↓</span><span>→</span>
-          </span>
-        </button>
-        <div id="viewer-keys-help" class="key-help" hidden>
-          <div><kbd>↑</kbd> Approve and next</div>
-          <div><kbd>←</kbd> Previous</div>
-          <div><kbd>↓</kbd> Reject and next</div>
-          <div><kbd>→</kbd> Next</div>
-          <div><kbd>Space</kbd> Flip mask while held</div>
-        </div>
-      </div>
       <button type="button" id="viewer-back" hidden>Back</button>
+    </div>
+    <div class="key-legend" aria-label="Zoom keyboard shortcuts">
+      <div class="key-arrows">
+        <span class="keycap up"><b>↑</b><small>Approve</small></span>
+        <span class="keycap left"><b>←</b><small>Previous</small></span>
+        <span class="keycap down"><b>↓</b><small>Reject</small></span>
+        <span class="keycap right"><b>→</b><small>Next</small></span>
+      </div>
+      <div class="key-row">
+        <span class="keycap wide"><b>Space</b><small>Flip mask</small></span>
+        <span class="keycap"><b>Esc</b><small>Close</small></span>
+      </div>
     </div>
     <div id="viewer-stage" class="viewer-stage">
       <div class="viewer-row">

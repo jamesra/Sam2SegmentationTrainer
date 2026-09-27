@@ -81,6 +81,10 @@ def _ensure_locations_schema(connection: sqlite3.Connection) -> None:
     if "jpeg_relpath" in columns and "image_relpath" not in columns:
         connection.execute("ALTER TABLE locations RENAME COLUMN jpeg_relpath TO image_relpath")
         connection.commit()
+    for name in ("origin_x", "origin_y"):
+        if name in columns:
+            connection.execute(f"ALTER TABLE locations DROP COLUMN {name}")
+    connection.commit()
 
 
 def load_ignore_ids(crops: str | os.PathLike[str]) -> set[int]:
@@ -244,16 +248,13 @@ def list_catalog_rows(crops: str | os.PathLike[str]) -> list[dict[str, Any]]:
         losses = _latest_loss_by_location(connection)
     finally:
         connection.close()
-    ignored_ids = load_ignore_ids(crops)
     approved = load_approved(crops)
     for row in result:
         location_id = int(row["location_id"])
         row["loss"] = losses.get(location_id)
         row["approved"] = int(_approval_key(location_id, row.get("image_key") or "") in approved)
-        if location_id in ignored_ids:
-            row["ignored"] = 1
+        if row.get("ignored"):
             row["approved"] = 0
-            row["mask_relpath"] = _mask_relpath_for_id(crops, location_id, ignored=True)
     return result
 
 

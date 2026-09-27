@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import sys
 import threading
 import zipfile
@@ -17,7 +18,13 @@ GALLERY_ROOT = Path(__file__).resolve().parents[1]
 if str(GALLERY_ROOT) not in sys.path:
     sys.path.insert(0, str(GALLERY_ROOT))
 
-from catalog import connect  # noqa: E402
+from catalog import (  # noqa: E402
+    approve_window,
+    connect,
+    ignore_location,
+    list_catalog_rows,
+    restore_location,
+)
 from identity import OidcIdentity, map_permission_names  # noqa: E402
 from server import (  # noqa: E402
     list_registry_names,
@@ -35,6 +42,21 @@ _MIN_PNG = (
     b"\x08\x00\x00\x00\x00:\x7e\x9bU\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01"
     b"\x01\x01\x00\x1b\xb6\xeeV\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+
+def test_connect_drops_window_origin_columns(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    connection = connect(crops)
+    connection.execute("ALTER TABLE locations ADD COLUMN origin_x INTEGER")
+    connection.execute("ALTER TABLE locations ADD COLUMN origin_y INTEGER")
+    connection.commit()
+    connection.close()
+    connection = connect(crops)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(locations)")}
+    connection.close()
+    assert "origin_x" not in columns
+    assert "origin_y" not in columns
 
 
 def _seed_crops(crops: Path, *, location_id: int = 42) -> None:
@@ -213,6 +235,16 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "windowActions(row)" in js
     assert "data-key" in js
     assert "function packGrid" in js
+    assert "function windowsForLocation" in js
+    mutate = js.split("async function mutate", 1)[1].split("async function applyRememberedStatus", 1)[0]
+    assert "loadCatalog(" not in mutate
+    assert "render(true, true)" in mutate
+    assert "function reconcileGrid" in js
+    assert 'postReview(act, locationId, "")' in mutate
+    assert ".card[hidden]" in css
+    assert "visibleKeys" in js
+    pack = js.split("function packGrid", 1)[1].split("function packKey", 1)[0]
+    assert "windows[0]" not in pack
     assert "function windowOrigin" in js
     assert "Math.floor(dc / columns)" in js
     opener = js.split("async function openViewer", 1)[1].split("function viewerRow", 1)[0]
@@ -222,6 +254,41 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "width: 32px" in css
     assert 'content: "Generating thumbnail"' in css
     assert 'content: "Image missing"' in css
+
+
+def test_location_review_covers_every_window(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE locations ("
+        "location_id INTEGER NOT NULL, z INTEGER NOT NULL, structure_id INTEGER, "
+        "structure_label TEXT, type_id INTEGER, type_name TEXT, radius REAL, "
+        "image_key TEXT NOT NULL, image_relpath TEXT, mask_relpath TEXT, "
+        "ignored INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (location_id, image_key))"
+    )
+    connection.executemany(
+        "INSERT INTO locations (location_id, z, structure_id, structure_label, "
+        "type_id, type_name, radius, image_key, image_relpath, mask_relpath, ignored) "
+        "VALUES (?, 17, 7, 'soma', 1, 'Cell', 12.5, ?, ?, ?, 0)",
+        [
+            (7, "RC2_17_D1_X0-1024_Y0-1024", "images/a.png", "masks/a_7.png"),
+            (7, "RC2_17_D1_X1024-2048_Y0-1024", "images/b.png", "masks/b_7.png"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+    ignore_location(crops, 7)
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key["RC2_17_D1_X0-1024_Y0-1024"]["ignored"] == 1
+    assert by_key["RC2_17_D1_X1024-2048_Y0-1024"]["ignored"] == 1
+    restore_location(crops, 7)
+    approve_window(crops, 7)
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key["RC2_17_D1_X0-1024_Y0-1024"]["approved"] == 1
+    assert by_key["RC2_17_D1_X1024-2048_Y0-1024"]["approved"] == 1
+    assert by_key["RC2_17_D1_X0-1024_Y0-1024"]["ignored"] == 0
+    assert by_key["RC2_17_D1_X1024-2048_Y0-1024"]["ignored"] == 0
 
 
 def test_approve_without_image_key_covers_the_location(httpd: tuple[str, int], registry: Path) -> None:

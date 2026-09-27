@@ -723,9 +723,6 @@
   const WINDOW_ORIGIN = /_X(\d+)(?:-(\d+))?_Y(\d+)(?:-(\d+))?$/;
 
   function windowOrigin(row) {
-    if (row.origin_x != null && row.origin_y != null && row.origin_x !== "" && row.origin_y !== "") {
-      return { x: Number(row.origin_x), y: Number(row.origin_y) };
-    }
     const match = WINDOW_ORIGIN.exec(String(row.image_key || ""));
     if (!match) {
       return null;
@@ -840,6 +837,10 @@
     return cards;
   }
 
+  function windowsForLocation(locationId) {
+    return state.rows.filter((row) => row.location_id === locationId);
+  }
+
   function packGrid(cards, columns) {
     const occupied = new Set();
     const cells = [];
@@ -850,7 +851,7 @@
       return col >= 0 && col < columns && row >= 0 && !occupied.has(row * columns + col);
     }
 
-    function take(row, col, source) {
+    function reserve(row, col) {
       occupied.add(row * columns + col);
       if (row + 1 > maxRow) {
         maxRow = row + 1;
@@ -858,16 +859,30 @@
       while (occupied.has(scanFrom)) {
         scanFrom += 1;
       }
+    }
+
+    function take(row, col, source) {
+      reserve(row, col);
       cells.push({ row: source, gr: row, gc: col });
     }
 
-    for (const windows of cards) {
-      const offsets = shapeOffsets(windows, columns);
+    function placeSingles(windows) {
+      for (const source of windows) {
+        const index = scanFrom;
+        take(Math.floor(index / columns), index % columns, source);
+      }
+    }
+
+    for (const visible of cards) {
+      const all = windowsForLocation(visible[0].location_id);
+      const offsets = shapeOffsets(all.length ? all : visible, columns);
       if (!offsets) {
-        const row = Math.floor(scanFrom / columns);
-        take(row, scanFrom % columns, windows[0]);
+        placeSingles(visible);
         continue;
       }
+      // Hide one window by leaving its cell empty. Sibling windows keep the
+      // shape, including a pair that would otherwise collapse into one tile.
+      const visibleKeys = new Set(visible.map((row) => row.image_key || ""));
       const height = Math.max(...offsets.map((cell) => cell.dr)) + 1;
       const limit = scanFrom + columns * (maxRow + height + 2);
       let placed = false;
@@ -878,16 +893,19 @@
           continue;
         }
         for (const cell of offsets) {
-          take(row + cell.dr, col + cell.dc, cell.row);
+          const atRow = row + cell.dr;
+          const atCol = col + cell.dc;
+          if (visibleKeys.has(cell.row.image_key || "")) {
+            take(atRow, atCol, cell.row);
+          } else {
+            reserve(atRow, atCol);
+          }
         }
         placed = true;
         break;
       }
       if (!placed) {
-        for (const row of windows) {
-          const index = scanFrom;
-          take(Math.floor(index / columns), index % columns, row);
-        }
+        placeSingles(visible);
       }
     }
     return { columns, totalRows: Math.max(maxRow, 1), cells };
@@ -961,7 +979,55 @@
     return Math.max(1, Math.floor((width + GRID_GAP) / (card + GRID_GAP)));
   }
 
-  function render(force = true) {
+  function cardKey(row) {
+    return `${row.location_id}|${row.image_key || ""}`;
+  }
+
+  function reconcileGrid(visible, rowOffset) {
+    const wanted = new Map();
+    for (const cell of visible) {
+      wanted.set(cardKey(cell.row), cell);
+    }
+    const existing = new Map();
+    els.grid.querySelectorAll(".card").forEach((node) => {
+      existing.set(`${node.dataset.id}|${node.dataset.key || ""}`, node);
+    });
+    for (const [key, node] of existing) {
+      if (!wanted.has(key)) {
+        node.remove();
+      }
+    }
+    const fresh = [];
+    for (const cell of visible) {
+      const key = cardKey(cell.row);
+      const column = String(cell.gc + 1);
+      const row = String(cell.gr - rowOffset + 1);
+      let node = existing.get(key);
+      if (!node) {
+        const holder = document.createElement("div");
+        holder.innerHTML = cellHtml(cell, rowOffset);
+        node = holder.firstElementChild;
+        els.grid.appendChild(node);
+        fresh.push(node);
+        continue;
+      }
+      node.hidden = false;
+      node.style.gridColumn = column;
+      node.style.gridRow = row;
+    }
+    if (!fresh.length) {
+      return;
+    }
+    const token = ++paintToken;
+    fresh.forEach((node) => {
+      const composite = node.querySelector(".composite");
+      if (composite) {
+        paintComposite(composite, token);
+      }
+    });
+  }
+
+  function render(force = true, reuse = false) {
     const scroll = els.scroller.scrollTop;
     const viewH = els.scroller.clientHeight || 1;
     const page = viewH;
@@ -996,8 +1062,12 @@
     windowBottom = rowOffsets[last] || windowTop + baseHeight;
     els.grid.style.top = `${windowTop}px`;
     const visible = cells.filter((cell) => cell.gr >= first && cell.gr < last);
-    els.grid.innerHTML = visible.map((cell) => cellHtml(cell, first)).join("");
-    paintVisible();
+    if (reuse) {
+      reconcileGrid(visible, first);
+    } else {
+      els.grid.innerHTML = visible.map((cell) => cellHtml(cell, first)).join("");
+      paintVisible();
+    }
     const card = els.grid.querySelector(".card");
     if (!card) {
       return;
@@ -1050,25 +1120,27 @@
 
   const undoStack = [];
 
-  function rememberStatus(row) {
-    if (!row) {
-      return;
-    }
-    undoStack.push({
-      locationId: Number(row.location_id),
-      imageKey: row.image_key || "",
-      ignored: Boolean(row.ignored),
-      approved: Boolean(row.approved),
-    });
-    if (undoStack.length > 50) {
-      undoStack.shift();
-    }
-  }
-
   function findStatusRow(locationId, imageKey) {
     return state.rows.find((row) =>
       Number(row.location_id) === Number(locationId) && (row.image_key || "") === (imageKey || "")
     );
+  }
+
+  function applyLocalReview(row, act) {
+    if (!row) {
+      return;
+    }
+    if (act === "approve") {
+      row.approved = 1;
+      row.ignored = 0;
+    } else if (act === "unapprove") {
+      row.approved = 0;
+    } else if (act === "ignore") {
+      row.ignored = 1;
+      row.approved = 0;
+    } else if (act === "restore") {
+      row.ignored = 0;
+    }
   }
 
   async function postReview(act, locationId, imageKey) {
@@ -1079,33 +1151,93 @@
     });
   }
 
-  async function mutate(act, locationId, imageKey) {
-    rememberStatus(findStatusRow(locationId, imageKey));
-    await postReview(act, locationId, imageKey);
-    await loadCatalog();
+  function rowsForLocation(locationId) {
+    const id = Number(locationId);
+    return state.rows.filter((row) => Number(row.location_id) === id);
+  }
+
+  function rememberLocation(locationId) {
+    const rows = rowsForLocation(locationId);
+    if (!rows.length) {
+      return;
+    }
+    undoStack.push({
+      locationId: Number(locationId),
+      windows: rows.map((row) => ({
+        imageKey: row.image_key || "",
+        ignored: Boolean(row.ignored),
+        approved: Boolean(row.approved),
+      })),
+    });
+    if (undoStack.length > 50) {
+      undoStack.shift();
+    }
+  }
+
+  async function mutate(act, locationId) {
+    const rows = rowsForLocation(locationId);
+    rememberLocation(locationId);
+    const snapshot = rows.map((row) => ({
+      imageKey: row.image_key || "",
+      approved: row.approved,
+      ignored: row.ignored,
+    }));
+    for (const row of rows) {
+      applyLocalReview(row, act);
+    }
+    render(true, true);
+    try {
+      await postReview(act, locationId, "");
+    } catch (error) {
+      if (rows.length) {
+        undoStack.pop();
+      }
+      for (const item of snapshot) {
+        const row = findStatusRow(locationId, item.imageKey);
+        if (row) {
+          row.approved = item.approved;
+          row.ignored = item.ignored;
+        }
+      }
+      render(true, true);
+      throw error;
+    }
   }
 
   async function applyRememberedStatus(entry) {
-    let row = findStatusRow(entry.locationId, entry.imageKey);
-    if (entry.ignored) {
-      if (!row || !row.ignored) {
-        await postReview("ignore", entry.locationId, entry.imageKey);
-        await loadCatalog(false, true);
-        row = findStatusRow(entry.locationId, entry.imageKey);
+    const windows = entry.windows || [{
+      imageKey: entry.imageKey || "",
+      ignored: Boolean(entry.ignored),
+      approved: Boolean(entry.approved),
+    }];
+    const locationId = entry.locationId;
+    const first = windows[0];
+    const uniform = windows.every((item) => item.ignored === first.ignored && item.approved === first.approved);
+    if (uniform && first) {
+      if (first.ignored) {
+        await postReview("ignore", locationId, "");
+      } else {
+        await postReview("restore", locationId, "");
+        await postReview(first.approved ? "approve" : "unapprove", locationId, "");
       }
-    } else if (row && row.ignored) {
-      await postReview("restore", entry.locationId, entry.imageKey);
-      await loadCatalog(false, true);
-      row = findStatusRow(entry.locationId, entry.imageKey);
-    }
-    if (entry.approved) {
-      if (!row || !row.approved) {
-        await postReview("approve", entry.locationId, entry.imageKey);
+    } else {
+      for (const item of windows) {
+        if (item.ignored) {
+          await postReview("ignore", locationId, item.imageKey);
+        } else {
+          await postReview("restore", locationId, item.imageKey);
+          await postReview(item.approved ? "approve" : "unapprove", locationId, item.imageKey);
+        }
       }
-    } else if (row && row.approved) {
-      await postReview("unapprove", entry.locationId, entry.imageKey);
     }
-    await loadCatalog(false, true);
+    for (const item of windows) {
+      const row = findStatusRow(locationId, item.imageKey);
+      if (row) {
+        row.ignored = item.ignored ? 1 : 0;
+        row.approved = item.approved ? 1 : 0;
+      }
+    }
+    render(true, true);
   }
 
   async function undoLastStatus() {
@@ -1440,10 +1572,15 @@
   async function reviewFromViewer(act) {
     const cells = viewerCells();
     const index = viewerCellIndex(cells);
-    const next = index >= 0 && cells[index + 1] ? cells[index + 1].row : null;
-    rememberStatus(viewerRow());
-    await postReview(act, Number(viewer.locationId), viewer.imageKey || "");
-    await loadCatalog(false, true);
+    const locationId = Number(viewer.locationId);
+    let next = null;
+    for (let cursor = index + 1; cursor < cells.length; cursor += 1) {
+      if (Number(cells[cursor].row.location_id) !== locationId) {
+        next = cells[cursor].row;
+        break;
+      }
+    }
+    await mutate(act, locationId);
     if (!next) {
       closeViewer();
       return;
@@ -1482,7 +1619,7 @@
         });
         return;
       }
-      mutate(button.dataset.act, Number(button.dataset.id), button.dataset.key).catch((error) => {
+      mutate(button.dataset.act, Number(button.dataset.id)).catch((error) => {
         els.status.textContent = error.message;
       });
       return;
@@ -1497,21 +1634,6 @@
     }
   });
 
-  const keysButton = document.getElementById("viewer-keys");
-  const keysHelp = document.getElementById("viewer-keys-help");
-  keysButton.addEventListener("click", (event) => {
-    event.stopPropagation();
-    const open = keysHelp.hidden;
-    keysHelp.hidden = !open;
-    keysButton.setAttribute("aria-expanded", open ? "true" : "false");
-  });
-  document.addEventListener("click", (event) => {
-    if (keysHelp.hidden || keysButton.contains(event.target) || keysHelp.contains(event.target)) {
-      return;
-    }
-    keysHelp.hidden = true;
-    keysButton.setAttribute("aria-expanded", "false");
-  });
   document.getElementById("viewer-prev").addEventListener("click", () => stepViewer(-1));
   document.getElementById("viewer-next").addEventListener("click", () => stepViewer(1));
   document.addEventListener("click", (event) => {
@@ -1593,6 +1715,11 @@
   }
 
   window.addEventListener("keydown", (event) => {
+    if (!els.viewer.hidden && (event.key === "Escape" || event.key === "Esc" || event.code === "Escape")) {
+      event.preventDefault();
+      closeViewer();
+      return;
+    }
     if (els.viewer.hidden || !isSpaceKey(event) || zoomKeyTarget(event)) {
       return;
     }
@@ -1622,10 +1749,6 @@
     }
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !els.viewer.hidden) {
-      closeViewer();
-      return;
-    }
     if (!els.viewer.hidden && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
       const tag = event.target && event.target.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
