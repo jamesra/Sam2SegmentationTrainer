@@ -136,6 +136,27 @@ class ManifestSplitTests(unittest.TestCase):
             self.assertFalse(any(ex.location_id == 999001 for ex in usable))
             self.assertLess(len(usable), len(all_ex))
 
+    def test_ignore_json_moves_masks_and_drops_locations(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_crops(root, "RC1", n=4)
+            before = index_volumes(volumes=["RC1"], root=root)
+            target = before[0]
+            crops = target.mask_path.parents[1]
+            (crops / "ignore.json").write_text(
+                json.dumps([target.location_id]), encoding="utf-8"
+            )
+            self.assertTrue(target.mask_path.is_file())
+            after = index_volumes(volumes=["RC1"], root=root)
+            self.assertFalse(any(ex.location_id == target.location_id for ex in after))
+            self.assertFalse(target.mask_path.is_file())
+            moved = crops / "ignored" / target.mask_path.name
+            self.assertTrue(moved.is_file())
+            again = index_volumes(volumes=["RC1"], root=root, skip_missing=False)
+            self.assertFalse(any(ex.location_id == target.location_id for ex in again))
+            self.assertEqual(len(again), len(after))
+            self.assertEqual(len(after), len(before) - 1)
+
     def test_skips_examples_without_raster_mask(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
