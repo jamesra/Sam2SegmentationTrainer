@@ -155,8 +155,28 @@ button.reverse.active,
   align-self: flex-start;
 }
 
-.card.located {
-  outline: 2px solid var(--accent);
+.card.join-n {
+  border-top-color: transparent;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.card.join-e {
+  border-right-color: transparent;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-s {
+  border-bottom-color: transparent;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-w {
+  border-left-color: transparent;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
 }
 
 .status {
@@ -224,22 +244,71 @@ button.reverse.active,
 .spacer { width: 100%; }
 
 .grid {
+  --ring-width: 2px;
+  --grid-gap: 4px;
   position: absolute;
   left: 16px;
   right: 16px;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(512px, 512px));
-  gap: 4px;
+  gap: var(--grid-gap);
 }
 
 .card {
+  --link-h: 216;
+  --link-s: 18%;
+  --link-l: 8%;
+  --ring: hsl(var(--link-h) 78% 62%);
   position: relative;
   align-self: start;
-  background: var(--card);
-  border: 1px solid #2a313c;
+  background: hsl(var(--link-h) var(--link-s) var(--link-l));
+  border: 1px solid hsl(var(--link-h) calc(var(--link-s) + 6%) calc(var(--link-l) + 8%));
   border-radius: 8px;
-  overflow: hidden;
+  overflow: visible;
   cursor: pointer;
+  transition: background 80ms linear, border-color 80ms linear, filter 80ms linear;
+}
+
+/* Side borders run across the grid gap so tiles of one location share one perimeter. */
+.card::after {
+  content: "";
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  top: calc(-1 * var(--ring-width));
+  right: calc(-1 * var(--ring-width));
+  bottom: calc(-1 * var(--ring-width));
+  left: calc(-1 * var(--ring-width));
+  border: var(--ring-width) solid var(--ring);
+  border-radius: calc(8px + var(--ring-width));
+}
+
+.card.join-n::after {
+  top: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-top-width: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.card.join-e::after {
+  right: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-right-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-s::after {
+  bottom: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-bottom-width: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-w::after {
+  left: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-left-width: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
 }
 
 .card[hidden] {
@@ -302,6 +371,19 @@ body.can-refresh #viewer-refresh {
   aspect-ratio: 1;
   background: #808080;
   cursor: pointer;
+  overflow: hidden;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+
+.card.join-n .composite,
+.card.join-w .composite {
+  border-top-left-radius: 0;
+}
+
+.card.join-n .composite,
+.card.join-e .composite {
+  border-top-right-radius: 0;
 }
 
 .assembly-grid {
@@ -447,6 +529,19 @@ body[data-card-size="small"] .card > .icon.plus {
   padding: 1px 6px 2px;
   font-size: 12px;
   line-height: 1.2;
+  overflow: hidden;
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+}
+
+.card.join-s .meta,
+.card.join-w .meta {
+  border-bottom-left-radius: 0;
+}
+
+.card.join-s .meta,
+.card.join-e .meta {
+  border-bottom-right-radius: 0;
 }
 
 .meta a { color: var(--accent); }

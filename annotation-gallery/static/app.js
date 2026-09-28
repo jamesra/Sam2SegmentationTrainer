@@ -69,6 +69,111 @@
   };
 
   const GRID_GAP = 4;
+  // Dark, low-saturation tones. Same location shares one; neighbors take another.
+  const LINK_TONES = [
+    [215, 18, 11],
+    [198, 20, 12],
+    [172, 16, 11],
+    [142, 14, 11],
+    [88, 12, 12],
+    [42, 16, 12],
+    [18, 18, 12],
+    [350, 14, 12],
+    [322, 14, 11],
+    [276, 16, 12],
+    [246, 14, 11],
+    [230, 10, 14],
+  ];
+
+  function linkToneIndex(locationId, used) {
+    const palette = LINK_TONES.length;
+    const hashed = Math.abs(Math.imul(Number(locationId) | 0, 2654435761) >>> 0) % palette;
+    if (!used.has(hashed)) {
+      return hashed;
+    }
+    for (let step = 1; step < palette; step += 1) {
+      const candidate = (hashed + step) % palette;
+      if (!used.has(candidate)) {
+        return candidate;
+      }
+    }
+    return hashed;
+  }
+
+  function assignLinkHues(cells) {
+    const at = new Map();
+    for (const cell of cells) {
+      at.set(`${cell.gr},${cell.gc}`, Number(cell.row.location_id));
+    }
+    const neighbors = new Map();
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    const order = [];
+    const seen = new Set();
+    for (const cell of cells) {
+      const id = Number(cell.row.location_id);
+      if (!neighbors.has(id)) {
+        neighbors.set(id, new Set());
+      }
+      if (!seen.has(id)) {
+        seen.add(id);
+        order.push(id);
+      }
+      for (const [dr, dc] of dirs) {
+        const other = at.get(`${cell.gr + dr},${cell.gc + dc}`);
+        if (other != null && other !== id) {
+          neighbors.get(id).add(other);
+        }
+      }
+    }
+    const assigned = new Map();
+    for (const id of order) {
+      const used = new Set();
+      for (const other of neighbors.get(id) || []) {
+        if (assigned.has(other)) {
+          used.add(assigned.get(other));
+        }
+      }
+      assigned.set(id, linkToneIndex(id, used));
+    }
+    for (const cell of cells) {
+      const tone = LINK_TONES[assigned.get(Number(cell.row.location_id))];
+      cell.linkH = tone[0];
+      cell.linkS = tone[1];
+      cell.linkL = tone[2];
+    }
+  }
+
+  // A shared grid edge of one location stays open so the ring is the group's perimeter.
+  function assignJoins(cells) {
+    const at = new Map();
+    for (const cell of cells) {
+      at.set(`${cell.gr},${cell.gc}`, Number(cell.row.location_id));
+    }
+    for (const cell of cells) {
+      const id = Number(cell.row.location_id);
+      cell.joinN = at.get(`${cell.gr - 1},${cell.gc}`) === id;
+      cell.joinE = at.get(`${cell.gr},${cell.gc + 1}`) === id;
+      cell.joinS = at.get(`${cell.gr + 1},${cell.gc}`) === id;
+      cell.joinW = at.get(`${cell.gr},${cell.gc - 1}`) === id;
+    }
+  }
+
+  function joinClasses(cell) {
+    const names = [];
+    if (cell.joinN) {
+      names.push("join-n");
+    }
+    if (cell.joinE) {
+      names.push("join-e");
+    }
+    if (cell.joinS) {
+      names.push("join-s");
+    }
+    if (cell.joinW) {
+      names.push("join-w");
+    }
+    return names.join(" ");
+  }
   let rowStride = 0;
   let windowTop = -1;
   let packMemo = { packed: null, repackFrom: null };
@@ -814,7 +919,7 @@
   function cellHtml(cell, rowOffset) {
     const row = cell.row;
     return `
-      <article class="card" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
+      <article class="card ${joinClasses(cell)}" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="--link-h:${cell.linkH};--link-s:${cell.linkS}%;--link-l:${cell.linkL}%;grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
         ${windowHtml(row)}
         ${windowActions(row)}
         <div class="meta"><div class="meta-row"><div>${captionHtml(row)}</div>${refreshButton(row)}</div></div>
@@ -1032,7 +1137,10 @@
       starts.push(cells.length);
       anchorStarts.push(anchors.length);
     }
-    return { columns, totalRows: Math.max(maxRow, 1), cells, starts, anchors, anchorStarts };
+    const packed = { columns, totalRows: Math.max(maxRow, 1), cells, starts, anchors, anchorStarts };
+    assignLinkHues(packed.cells);
+    assignJoins(packed.cells);
+    return packed;
   }
 
   function layoutCards(cards) {
@@ -1077,12 +1185,6 @@
     }
     els.scroller.scrollTop = layout.rowOffsets[cell.gr] || 0;
     render(true);
-    els.grid.querySelectorAll(".card.located").forEach((node) => node.classList.remove("located"));
-    els.grid.querySelectorAll(".card").forEach((node) => {
-      if (node.dataset.id === text) {
-        node.classList.add("located");
-      }
-    });
     els.status.textContent = `Location ${text}.`;
   }
 
@@ -1127,8 +1229,15 @@
         continue;
       }
       node.hidden = false;
+      node.classList.toggle("join-n", Boolean(cell.joinN));
+      node.classList.toggle("join-e", Boolean(cell.joinE));
+      node.classList.toggle("join-s", Boolean(cell.joinS));
+      node.classList.toggle("join-w", Boolean(cell.joinW));
       node.style.gridColumn = column;
       node.style.gridRow = row;
+      node.style.setProperty("--link-h", String(cell.linkH));
+      node.style.setProperty("--link-s", `${cell.linkS}%`);
+      node.style.setProperty("--link-l", `${cell.linkL}%`);
     }
     if (!fresh.length) {
       return;
@@ -1156,6 +1265,7 @@
     const cards = ensureVisibleCards();
     const layout = layoutCards(cards);
     const { cardPx, columns, baseHeight, totalRows, rowOffsets, cells } = layout;
+    els.grid.style.setProperty("--grid-gap", `${GRID_GAP}px`);
     els.grid.style.gridTemplateColumns = `repeat(${columns}, ${cardPx}px)`;
     els.grid.style.gridAutoRows = `${Math.max(1, baseHeight - GRID_GAP)}px`;
     els.spacer.style.height = `${rowOffsets[rowOffsets.length - 1] || baseHeight}px`;

@@ -312,6 +312,11 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert 'body[data-card-size="small"] .card > .icon.check' in css
     assert "scale(0.75)" in css
     assert "const GRID_GAP = 4" in js
+    assert "function assignLinkHues" in js
+    assert "function assignJoins" in js
+    assert "join-n" in js
+    assert "join-n" in css
+    assert "border-top-width: 0" in css
     assert "cardPx + 20" in js
     assert "align-self: start" in css
     assert 'content: "Generating thumbnail"' in css
