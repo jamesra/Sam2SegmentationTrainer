@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 
+from sam2_segmentation_trainer.losses import mask_containment_loss_per_sample
+
 def build_em_sam2(
     config_file: str,
     checkpoint: str,
@@ -26,7 +28,16 @@ def build_em_sam2(
     return model
 
 
-def configure_trainable_params(model, freeze_mode: str = "none") -> tuple[int, int]:
+def configure_trainable_params(
+    model, freeze_mode: str = "none", unfreeze_mask_cnn: bool = False
+) -> tuple[int, int]:
+    """Set ``requires_grad`` for the chosen ``freeze_mode`` and return (trainable, total) parameter counts.
+
+    The prompt encoder stays frozen except, when ``unfreeze_mask_cnn`` is set, its ``mask_downscaling``
+    network (about 50K parameters), which turns a dense mask prompt into an embedding and has to learn the
+    -1/0/+1 mask semantics of mixed-prompt training. Those parameters join the non-encoder optimizer group.
+    Changing this setting changes the optimizer's parameter list, so a run cannot resume across it.
+    """
     if freeze_mode == "none":
         for param in model.parameters():
             param.requires_grad = True
@@ -43,6 +54,10 @@ def configure_trainable_params(model, freeze_mode: str = "none") -> tuple[int, i
                 param.requires_grad = True
     else:
         raise ValueError(f"Unknown freeze_mode: {freeze_mode}")
+
+    if unfreeze_mask_cnn:
+        for param in model.sam_prompt_encoder.mask_downscaling.parameters():
+            param.requires_grad = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -117,22 +132,12 @@ def transform_prompt_coords(
     return scaled * float(image_size)
 
 
-def predict_masks(
-    model,
-    images: torch.Tensor,
-    point_coords: torch.Tensor,
-    point_labels: torch.Tensor,
-    *,
-    image_size: int,
-    orig_hw: tuple[int, int] | None = None,
-):
-    if orig_hw is None:
-        orig_hw = (image_size, image_size)
-    coords = transform_prompt_coords(point_coords, orig_hw, image_size)
-    labels = point_labels
-    if labels.dtype != torch.int32:
-        labels = labels.to(dtype=torch.int32)
+def encode_images(model, images: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Run the image encoder once: returns ``(image_embed, high_res_features)`` for the mask decoder.
 
+    Split from :func:`decode_prompts` so one batch can be decoded in several prompt groups (some samples
+    with boxes or dense masks, some without) while sharing a single encoder pass.
+    """
     backbone_out = model.forward_image(images)
     _, vision_feats, _, feat_sizes = model._prepare_backbone_features(backbone_out)
     if model.directly_add_no_mem_embed:
@@ -143,13 +148,50 @@ def predict_masks(
         feat.permute(1, 2, 0).view(batch, -1, *feat_size)
         for feat, feat_size in zip(vision_feats[::-1], feat_sizes[::-1])
     ][::-1]
-    image_embed = feats[-1]
-    high_res_features = feats[:-1]
+    return feats[-1], feats[:-1]
+
+
+def decode_prompts(
+    model,
+    image_embed: torch.Tensor,
+    high_res_features: list[torch.Tensor],
+    point_coords: torch.Tensor | None,
+    point_labels: torch.Tensor | None,
+    *,
+    image_size: int,
+    orig_hw: tuple[int, int] | None = None,
+    boxes: torch.Tensor | None = None,
+    dense_masks: torch.Tensor | None = None,
+):
+    """Prompt encoder + mask decoder for a batch that shares one prompt structure.
+
+    ``point_coords`` is ``[B, N, 2]`` in ``orig_hw`` pixels with ``point_labels`` ``[B, N]`` (1 foreground,
+    0 background, -1 padding that SAM2 ignores); ``N == 0`` or None means no points. ``boxes`` is ``[B, 4]``
+    xyxy in ``orig_hw`` pixels, passed as ``boxes=`` (the encoder adds the corner embeddings itself, so no
+    corner labels are built here). ``dense_masks`` is ``[B, 1, 256, 256]`` float ``mask_input`` logits. None
+    selects the encoder's learned no-box / no-mask embedding, which an all-zero tensor would not.
+
+    Returns ``(pred_logits [B, image_size, image_size], iou_preds [B, 1])``.
+    """
+    if orig_hw is None:
+        orig_hw = (image_size, image_size)
+    points = None
+    if point_coords is not None and point_coords.shape[1] > 0:
+        coords = transform_prompt_coords(point_coords, orig_hw, image_size)
+        labels = point_labels
+        if labels.dtype != torch.int32:
+            labels = labels.to(dtype=torch.int32)
+        points = (coords, labels)
+    box_prompt = None
+    if boxes is not None:
+        box_prompt = transform_prompt_coords(boxes.reshape(-1, 2, 2), orig_hw, image_size).reshape(-1, 4)
+    if points is None and box_prompt is None:
+        raise ValueError("decode_prompts needs at least one point or box")
 
     sparse_embed, dense_embed = model.sam_prompt_encoder(
-        points=(coords, labels),
-        boxes=None,
-        masks=None,
+        points=points,
+        boxes=box_prompt,
+        masks=dense_masks,
     )
     low_res_masks, iou_preds, _, _ = model.sam_mask_decoder(
         image_embeddings=image_embed,
@@ -166,6 +208,89 @@ def predict_masks(
         mode="bilinear",
         align_corners=False,
     )[:, 0]
+    return pred_logits, iou_preds
+
+
+def predict_masks(
+    model,
+    images: torch.Tensor,
+    point_coords: torch.Tensor,
+    point_labels: torch.Tensor,
+    *,
+    image_size: int,
+    orig_hw: tuple[int, int] | None = None,
+):
+    """Points-only prediction for a whole batch (validation, evaluation, benchmarks)."""
+    image_embed, high_res = encode_images(model, images)
+    return decode_prompts(
+        model,
+        image_embed,
+        high_res,
+        point_coords,
+        point_labels,
+        image_size=image_size,
+        orig_hw=orig_hw,
+    )
+
+
+def predict_masks_mixed(
+    model,
+    images: torch.Tensor,
+    point_coords: torch.Tensor,
+    point_labels: torch.Tensor,
+    boxes: Sequence[torch.Tensor | None],
+    dense_masks: Sequence[torch.Tensor | None],
+    *,
+    image_size: int,
+    orig_hw: tuple[int, int] | None = None,
+):
+    """Prediction for a batch whose samples may have boxes and dense masks or not.
+
+    The image encoder runs once. The prompt encoder takes a single ``boxes`` and ``masks`` tensor per call, so
+    samples are grouped by (has box, has dense mask) and each group is decoded separately, then scattered
+    back to batch order. ``boxes[i]`` is ``[4]`` xyxy and ``dense_masks[i]`` is ``[256, 256]`` or None.
+    Returns ``(pred_logits [B, H, W], iou_preds [B, 1])`` like :func:`predict_masks`.
+    """
+    batch = images.shape[0]
+    image_embed, high_res = encode_images(model, images)
+    groups: dict[tuple[bool, bool], list[int]] = {}
+    for i in range(batch):
+        groups.setdefault((boxes[i] is not None, dense_masks[i] is not None), []).append(i)
+
+    device = images.device
+    pieces: list[tuple[list[int], torch.Tensor, torch.Tensor]] = []
+    for (has_box, has_dense), members in groups.items():
+        sel = torch.tensor(members, device=device, dtype=torch.long)
+        group_boxes = (
+            torch.stack([boxes[i] for i in members]).to(device, non_blocking=True) if has_box else None
+        )
+        group_dense = (
+            torch.stack([dense_masks[i] for i in members]).unsqueeze(1).to(device, non_blocking=True)
+            if has_dense
+            else None
+        )
+        logits, iou = decode_prompts(
+            model,
+            image_embed[sel],
+            [feat[sel] for feat in high_res],
+            point_coords[sel],
+            point_labels[sel],
+            image_size=image_size,
+            orig_hw=orig_hw,
+            boxes=group_boxes,
+            dense_masks=group_dense,
+        )
+        pieces.append((members, logits, iou))
+
+    if len(pieces) == 1:
+        return pieces[0][1], pieces[0][2]
+    first_logits, first_iou = pieces[0][1], pieces[0][2]
+    pred_logits = first_logits.new_empty((batch, *first_logits.shape[1:]))
+    iou_preds = first_iou.new_empty((batch, *first_iou.shape[1:]))
+    for members, logits, iou in pieces:
+        index = torch.tensor(members, device=device, dtype=torch.long)
+        pred_logits = pred_logits.index_copy(0, index, logits)
+        iou_preds = iou_preds.index_copy(0, index, iou)
     return pred_logits, iou_preds
 
 
@@ -263,8 +388,15 @@ def combined_loss(
     labels: torch.Tensor | None = None,
     containment_weight: float = 0.0,
     containment_radius: float = 8.0,
+    prompt_foreground: torch.Tensor | None = None,
+    mask_contain_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Return the batch loss and detached GPU stats. Callers sync when they log."""
+    """Return the batch loss and detached GPU stats. Callers sync when they log.
+
+    ``prompt_foreground`` (``[B, H, W]``, non-zero where a dense mask prompt said foreground) with a positive
+    ``mask_contain_weight`` adds the one-sided mask containment penalty; the caller scales the weight by its
+    warmup. ``stats`` then also has ``loss_mask_contain``.
+    """
     loss_focal_ps = focal_loss_per_sample(pred, target)
     loss_dice_ps = dice_loss(pred, target)
     loss_iou_ps = iou_prediction_loss_per_sample(pred, target, iou_preds)
@@ -286,6 +418,10 @@ def combined_loss(
         )
         sample_losses = sample_losses + float(containment_weight) * loss_containment_ps
         stats["loss_containment"] = loss_containment_ps.mean().detach()
+    if float(mask_contain_weight) > 0.0 and prompt_foreground is not None:
+        loss_mask_ps = mask_containment_loss_per_sample(pred, prompt_foreground)
+        sample_losses = sample_losses + float(mask_contain_weight) * loss_mask_ps
+        stats["loss_mask_contain"] = loss_mask_ps.mean().detach()
     loss = sample_losses.mean()
     stats["loss"] = loss.detach()
     stats["sample_losses"] = sample_losses.detach()

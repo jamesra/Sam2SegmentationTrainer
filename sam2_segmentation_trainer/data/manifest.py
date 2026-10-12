@@ -26,6 +26,9 @@ class CropExample:
     split_key: str
     width: int | None = None
     height: int | None = None
+    target_circle: tuple[float, float, float] | None = None
+    """``(center_x, center_y, radius)`` in tile pixels for an example whose target is a circle annotation
+    with no mask file (see ``tiles.circle_target_examples``); None for the usual polygon-mask example."""
 
     @property
     def image_ext(self) -> str:

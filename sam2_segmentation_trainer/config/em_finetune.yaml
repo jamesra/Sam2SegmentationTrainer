@@ -68,10 +68,47 @@ lr_schedule:
 differential_lr:
   encoder_lr_factor: 0.1
 
+# Prompt mix for training samples. Probabilities must sum to 1.0 (checked when the config loads).
+# A sample whose tile has no circle for its target, or no other annotation, loses those two types and
+# their share moves to the rest. Validation always uses a single centroid point so IoU stays comparable.
+prompt:
+  # false: every training sample is the original single centroid point.
+  enabled: true
+  prob_points_only: 0.10
+  prob_box_only: 0.05
+  prob_box_points: 0.05
+  prob_circle_mask: 0.45  # design doc said 0.40, which left the table at 95%; the 5% goes to the production prompt
+  prob_full_mask: 0.30
+  prob_negative_only: 0.05
+  # Each box edge is pushed out by uniform(0, box_jitter_frac * edge length). A box is only a hint that the
+  # object is most likely inside; nothing penalizes predictions that leave it.
+  box_jitter_frac: 0.15
+  box_points_max: 3
+  # Foreground and background points stay at least this far (pixels) from the mask boundary.
+  min_edge_px: 15
+  line_frac_min: 0.40
+  line_frac_max: 0.90
+
+# Other annotations in the same tile are negative context: a -1 area of the dense mask prompt and, by chance,
+# background points.
+negative:
+  bg_point_prob_circle: 0.25
+  bg_point_prob_polygon: 0.15
+  # Decoded neighbor masks kept per DataLoader worker (each worker has its own cache).
+  cache_size: 64
+  # Also train the negative-only prompt on circle annotations that have no mask (the disc is the target).
+  allow_circle_targets: false
+  # Cap on those samples as a fraction of the mask-bearing examples.
+  circle_target_fraction: 0.05
+
 loss:
   focal_weight: 20.0
   dice_weight: 1.0
   iou_weight: 1.0
+  # Hinge penalty for predicting background where a dense mask prompt said foreground (the mask is a seed
+  # the engine grows beyond). 0 disables. Ramps up linearly over containment_warmup_epochs.
+  mask_contain_weight: 0.5
+  containment_warmup_epochs: 2
   # Penalizes predicting background at prompted point locations (BCE toward 1
   # inside a disk of containment_radius pixels around each positive point).
   # 0 disables the term.
@@ -93,6 +130,9 @@ model:
   checkpoint: null
   config: configs/sam2.1/sam2.1_hiera_l.yaml
   freeze_mode: none
+  # Train the prompt encoder's mask_downscaling network (about 50K parameters) so it learns the -1/0/+1
+  # mask prompt. Only applies with prompt.enabled. Changing it needs -refresh, not resume.
+  unfreeze_mask_cnn: true
   activation_checkpointing: true
 
 eval:

@@ -76,6 +76,7 @@ Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-
 - `images/` — tile PNG/JPEG plus COCO-RLE sidecar JSON
 - `masks/` — required raster `{imageKey}_{locationId}.png` (examples without a mask PNG are skipped; no RLE fallback)
 - `overlays/` — viewing only, not used for training
+- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (already scaled by the file's `diameter_scale`), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter (`-CircleDiameterScale`, default 0.8). Without it training still runs; other annotations in a tile then come only from their masks.
 
 One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Within each volume, 90% go to train and 10% to val.
 
@@ -106,7 +107,21 @@ mv ~/sam2-training/RC1 ~/sam2-training/RC2 \
    ~/sam2-training/RPC1 ~/sam2-training/RPC2 ~/sam2-training/v1/
 ```
 
-SAM2 is trained class-agnostic (binary mask + point prompt). Viking labels such as `MC` / `ConePR` are kept only for split reports and eval tables.
+SAM2 is trained class-agnostic. Viking labels such as `MC` / `ConePR` are kept only for split reports and eval tables.
+
+### Prompts in training
+
+Each training sample draws one prompt type (`prompt:` in `em_finetune.yaml`; they must sum to 1.0): points only (10%), box only (5%), box and points (5%), circle mask (45%), full mask (30%), negative only (5%). `prompt.enabled: false` goes back to one centroid point. Validation always uses one centroid point so its IoU stays comparable between runs.
+
+- **Circle mask:** the annotation circle is the dense mask prompt (+1), one foreground point sits at its center, and the loss compares to the full polygon. The model learns to grow from the circle to the boundary.
+- **Full mask:** the whole ground-truth mask is the dense prompt with one interior point.
+- **Negative only:** no foreground prompt; background points and the negative mask only. Needs another annotation in the tile.
+- **Box:** a hint that the object is most likely inside (each edge jittered outward by up to `box_jitter_frac`). Nothing penalizes predictions that leave the box.
+- **Negative context:** every other annotation in the tile (neighbor masks, plus circles that have no mask) is a -1 area of the dense mask and, with probability `negative.bg_point_prob_*`, becomes 1-9 background points. Where a +1 area and a -1 area overlap the value is 0 (unknown). With no negatives and no foreground mask the dense prompt is omitted so the encoder uses its learned no-mask embedding, not an all-zero mask.
+- **Dense mask scale:** the signed mask is downsampled (nearest) to the 256x256 `mask_input` and fed as logits of +/-10 (`data/prompts.py` `MASK_PROMPT_LOGIT`). The segmentation server does not yet turn a 1-bit mask Feature into `mask_input`; when it does it must use the same values.
+- **Losses:** `loss.mask_contain_weight` penalizes predicting background where a mask prompt said foreground (zero when the model respects it; ramps up over `loss.containment_warmup_epochs`). There is no box counterpart, and no hard clamp on box exteriors.
+- **Prompt encoder:** still frozen except its `mask_downscaling` network (`model.unfreeze_mask_cnn`), which has to learn the mask semantics. A run cannot resume across changing this; use `-refresh`.
+- **Circle-only targets:** `negative.allow_circle_targets` also trains the negative-only prompt on circles that have no mask (the disc is the target), capped at `negative.circle_target_fraction` of the mask-bearing examples.
 
 ## Train / eval / infer
 
@@ -118,7 +133,7 @@ sam2-em-validate --json-report /outputs/validate.json
 
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)"
 
-# Fine-tune sam2.1_hiera_large (prompt encoder frozen).
+# Fine-tune sam2.1_hiera_large (prompt encoder frozen except its mask network).
 # Restart continues the run with the newest last.pt (for example sam2_em_rpc1).
 # -refresh starts the next sam2_em_vN from pretrained weights.
 # Each volume keeps every usable sample, split 90/10 inside that volume.

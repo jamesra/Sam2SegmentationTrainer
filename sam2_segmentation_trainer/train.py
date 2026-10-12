@@ -34,7 +34,19 @@ from sam2_segmentation_trainer.checkpoint import (
     migrate_run_artifacts,
     remaining_epoch_indices,
 )
-from sam2_segmentation_trainer.data.dataset import EMSegDataset, MissingTileFlag, collate_em
+from sam2_segmentation_trainer.data.dataset import (
+    EMSegDataset,
+    EpochCounter,
+    MissingTileFlag,
+    collate_em,
+)
+from sam2_segmentation_trainer.data.prompts import PromptConfig
+from sam2_segmentation_trainer.data.tiles import (
+    TileContext,
+    build_tile_context,
+    circle_target_examples,
+)
+from sam2_segmentation_trainer.losses import containment_warmup_scale
 from annotation_crops.scores import ensure_location_scores_schema
 
 from sam2_segmentation_trainer.data.manifest import (
@@ -60,6 +72,7 @@ from sam2_segmentation_trainer.model import (
     enable_activation_checkpointing,
     param_groups,
     predict_masks,
+    predict_masks_mixed,
 )
 from sam2_segmentation_trainer.mqtt_progress import StepAnomalyMonitor, TrainingProgress
 from sam2_segmentation_trainer.overlays import denorm_preview, overlay_panel
@@ -288,13 +301,20 @@ def run_throughput_benchmark(
         masks = batch["mask"].to(device, non_blocking=True)
         points = batch["point"].to(device, non_blocking=True)
         labels = batch["point_label"].to(device, non_blocking=True)
+        prompt_fg = batch["prompt_fg"].to(device, non_blocking=True)
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
             enabled=bool(mixed_precision) and device.type == "cuda",
         ):
-            pred, iou_preds = predict_masks(
-                model, images, points, labels, image_size=image_size
+            pred, iou_preds = predict_masks_mixed(
+                model,
+                images,
+                points,
+                labels,
+                batch["boxes"],
+                batch["dense_mask"],
+                image_size=image_size,
             )
             loss, stats = combined_loss(
                 pred,
@@ -307,6 +327,8 @@ def run_throughput_benchmark(
                 labels=labels,
                 containment_weight=float(cfg.loss.get("containment_weight", 0.0)),
                 containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
+                prompt_foreground=prompt_fg,
+                mask_contain_weight=_mask_contain_weight(cfg, 1.0),
             )
             loss = loss / accum
         scaler.scale(loss).backward()
@@ -443,6 +465,37 @@ def run_throughput_benchmark(
     return projected
 
 
+def _mixed_prompts_enabled(cfg: DictConfig) -> bool:
+    """Whether training uses the mixed prompt mix (``prompt.enabled``, default on) or the single centroid point."""
+    return bool(OmegaConf.select(cfg, "prompt.enabled", default=True))
+
+
+def _with_circle_targets(
+    examples: list,
+    prompt_cfg: PromptConfig,
+    seed: int,
+) -> tuple[list, TileContext]:
+    """Tile context for ``examples`` plus, when allowed, circle-only training examples appended to them.
+
+    The context is built from the mask-bearing examples alone, so the added circle targets are not their own
+    neighbors. Used at startup and again whenever the inventory is rebuilt.
+    """
+    context = build_tile_context(examples)
+    if prompt_cfg.allow_circle_targets:
+        extra = circle_target_examples(
+            examples, context, max_fraction=prompt_cfg.circle_target_fraction, seed=seed
+        )
+        if extra:
+            print(f"added {len(extra)} circle-only negative-prompt targets")
+            return list(examples) + extra, context
+    return list(examples), context
+
+
+def _mask_contain_weight(cfg: DictConfig, scale: float) -> float:
+    """Configured mask-containment weight times the warmup ``scale`` (0..1)."""
+    return float(OmegaConf.select(cfg, "loss.mask_contain_weight", default=0.0)) * float(scale)
+
+
 def _make_loader(
     dataset,
     indices: list[int],
@@ -539,12 +592,19 @@ def run_validation(
 
 
 class _LossWindow:
-    """Detached GPU losses, copied to the CPU in one transfer when drained."""
+    """Detached GPU losses, copied to the CPU in one transfer when drained.
+
+    Besides the four always-present losses, the optional prompt-containment and mask-containment losses are
+    carried when ``stats`` has them. The per-sample losses ride along with each sample's prompt type so the
+    log can show which prompt families are hard.
+    """
+
+    _OPTIONAL = ("loss_containment", "loss_mask_contain")
 
     def __init__(self) -> None:
         self._rows: list[torch.Tensor] = []
-        self._meta: list[tuple[int, int, int, float, list]] = []
-        self._has_containment = False
+        self._meta: list[tuple[int, int, int, float, list, list[str]]] = []
+        self._extras: tuple[str, ...] = ()
 
     def add(
         self,
@@ -555,28 +615,28 @@ class _LossWindow:
         global_step: int,
         duration_s: float,
         meta: list,
+        prompt_types: list[str] | None = None,
     ) -> None:
-        self._has_containment = "loss_containment" in stats
+        self._extras = tuple(key for key in self._OPTIONAL if key in stats)
         head = [
             stats["loss"].reshape(1),
             stats["loss_focal"].reshape(1),
             stats["loss_dice"].reshape(1),
             stats["loss_iou"].reshape(1),
         ]
-        if self._has_containment:
-            head.append(stats["loss_containment"].reshape(1))
+        head.extend(stats[key].reshape(1) for key in self._extras)
         packed = torch.cat(head + [stats["sample_losses"].reshape(-1)])
         self._rows.append(packed.detach())
-        self._meta.append((epoch, step, global_step, duration_s, meta))
+        self._meta.append((epoch, step, global_step, duration_s, meta, list(prompt_types or [])))
 
     def drain(self) -> list[dict]:
         if not self._rows:
             return []
-        has_containment = self._has_containment
-        head_len = 5 if has_containment else 4
+        extras = self._extras
+        head_len = 4 + len(extras)
         packed = torch.stack(self._rows).float().cpu()
         records = []
-        for i, (epoch, step, global_step, duration_s, meta) in enumerate(self._meta):
+        for i, (epoch, step, global_step, duration_s, meta, prompt_types) in enumerate(self._meta):
             row = packed[i].tolist()
             record = {
                 "epoch": epoch,
@@ -584,14 +644,15 @@ class _LossWindow:
                 "global_step": global_step,
                 "duration_s": duration_s,
                 "meta": meta,
+                "prompt_types": prompt_types,
                 "loss": row[0],
                 "loss_focal": row[1],
                 "loss_dice": row[2],
                 "loss_iou": row[3],
                 "sample_losses": row[head_len:],
             }
-            if has_containment:
-                record["loss_containment"] = row[4]
+            for offset, key in enumerate(extras):
+                record[key] = row[4 + offset]
             records.append(record)
         self._rows.clear()
         self._meta.clear()
@@ -657,6 +718,7 @@ def _snapshot(
     best_val_iou: float,
     epochs_without_improve: int,
     freeze_mode: str,
+    unfreeze_mask_cnn: bool = False,
 ) -> dict:
     return TrainSnapshot(
         model=model,
@@ -671,6 +733,7 @@ def _snapshot(
         epochs_without_improve=epochs_without_improve,
         freeze_mode=freeze_mode,
         rng=capture_rng(),
+        unfreeze_mask_cnn=unfreeze_mask_cnn,
     ).as_checkpoint()
 
 
@@ -777,6 +840,22 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     if not examples:
         raise RuntimeError(f"no usable AnnotationCrops examples under {data_dir} {volumes}")
 
+    mixed_prompts = _mixed_prompts_enabled(cfg)
+    prompt_cfg = PromptConfig.from_cfg(cfg)
+    tile_context: TileContext | None = None
+    if mixed_prompts:
+        examples, tile_context = _with_circle_targets(examples, prompt_cfg, int(cfg.training.seed))
+        n_with_negatives = sum(
+            1
+            for ex in examples
+            if len(tile_context.neighbor_ids((ex.volume, ex.image_key))) > 1
+            or tile_context.circles_in((ex.volume, ex.image_key))
+        )
+        print(
+            f"mixed prompts on: {n_with_negatives}/{len(examples)} examples have other "
+            "annotations in their tile"
+        )
+
     even = bool(cfg.data.get("even_per_volume", False))
     run_split = run_dir / "split.json"
     legacy_split = out_dir / "splits" / f"{cfg.data.split_name}.json"
@@ -842,8 +921,16 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     persistent_workers = bool(cfg.training.persistent_workers)
     seed = int(cfg.training.seed)
     freeze_mode = str(cfg.model.freeze_mode)
+    epoch_counter = EpochCounter()
     train_ds = EMSegDataset(
-        train_ex, split="train", image_size=image_size, missing_tiles=missing_tiles
+        train_ex,
+        split="train",
+        image_size=image_size,
+        missing_tiles=missing_tiles,
+        tiles=tile_context,
+        prompt_cfg=prompt_cfg if mixed_prompts else None,
+        seed=seed,
+        epoch=epoch_counter,
     )
     val_ds = EMSegDataset(
         val_ex, split="val", image_size=image_size, missing_tiles=missing_tiles
@@ -860,7 +947,12 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     if enable_cudnn_benchmark(device):
         print("cuDNN benchmark on (fixed image size)")
     model = build_em_sam2(cfg.model.config, str(checkpoint), device, train=True)
-    configure_trainable_params(model, freeze_mode=freeze_mode)
+    unfreeze_mask_cnn = mixed_prompts and bool(
+        OmegaConf.select(cfg, "model.unfreeze_mask_cnn", default=True)
+    )
+    configure_trainable_params(
+        model, freeze_mode=freeze_mode, unfreeze_mask_cnn=unfreeze_mask_cnn
+    )
     if bool(cfg.model.get("activation_checkpointing", True)):
         n_ckpt = enable_activation_checkpointing(model)
         print(f"Activation checkpointing on {n_ckpt} Hiera blocks")
@@ -946,6 +1038,12 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 f"cannot resume: freeze_mode {saved_freeze!r} != {freeze_mode!r} "
                 "(pass -refresh to start from scratch)"
             )
+        saved_mask_cnn = bool(payload.get("unfreeze_mask_cnn", False))
+        if saved_mask_cnn != unfreeze_mask_cnn:
+            raise RuntimeError(
+                f"cannot resume: unfreeze_mask_cnn {saved_mask_cnn} != {unfreeze_mask_cnn} "
+                "(the optimizer's parameters differ; pass -refresh to start from scratch)"
+            )
         if saved_groups != len(optimizer.param_groups):
             raise RuntimeError(
                 f"cannot resume: optimizer param groups {saved_groups} != "
@@ -986,6 +1084,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 best_val_iou=best_val_iou,
                 epochs_without_improve=epochs_without_improve,
                 freeze_mode=freeze_mode,
+                unfreeze_mask_cnn=unfreeze_mask_cnn,
             ),
         )
 
@@ -1011,6 +1110,9 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             _move_ignored_masks(volumes, data_dir)
             examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
             examples, rejected_tiles = take_model_sized(examples, image_size)
+            if mixed_prompts:
+                examples, tile_context = _with_circle_targets(examples, prompt_cfg, seed)
+                train_ds.tiles = tile_context
             grown = include_new_keys(
                 split,
                 examples,
@@ -1043,6 +1145,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 f"train={len(train_ex)} val={len(val_ex)}"
             )
         step0 = start_step if epoch == start_epoch else 0
+        epoch_counter.set(epoch)
         indices = remaining_epoch_indices(
             n_train,
             seed,
@@ -1104,6 +1207,17 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     writer.add_scalar(
                         "train/loss_containment", row["loss_containment"], row["global_step"]
                     )
+                if "loss_mask_contain" in row:
+                    writer.add_scalar(
+                        "train/loss_mask_contain", row["loss_mask_contain"], row["global_step"]
+                    )
+                by_type: dict[str, list[float]] = {}
+                for ptype, score in zip(row["prompt_types"], row["sample_losses"], strict=False):
+                    by_type.setdefault(ptype, []).append(score)
+                for ptype, scores in by_type.items():
+                    writer.add_scalar(
+                        f"train/loss_by_prompt/{ptype}", sum(scores) / len(scores), row["global_step"]
+                    )
                 writer.add_scalar(
                     "train/lr", optimizer.param_groups[0]["lr"], row["global_step"]
                 )
@@ -1125,13 +1239,26 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             masks = batch["mask"].to(device, non_blocking=True)
             points = batch["point"].to(device, non_blocking=True)
             labels = batch["point_label"].to(device, non_blocking=True)
+            prompt_fg = batch["prompt_fg"].to(device, non_blocking=True)
+            contain_scale = containment_warmup_scale(
+                epoch,
+                step,
+                batches_per_epoch,
+                float(OmegaConf.select(cfg, "loss.containment_warmup_epochs", default=2)),
+            )
             with torch.amp.autocast(
                 device_type=device.type,
                 dtype=amp_dtype,
                 enabled=bool(cfg.training.mixed_precision) and device.type == "cuda",
             ):
-                pred, iou_preds = predict_masks(
-                    model, images, points, labels, image_size=image_size
+                pred, iou_preds = predict_masks_mixed(
+                    model,
+                    images,
+                    points,
+                    labels,
+                    batch["boxes"],
+                    batch["dense_mask"],
+                    image_size=image_size,
                 )
                 loss, stats = combined_loss(
                     pred,
@@ -1144,6 +1271,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     labels=labels,
                     containment_weight=float(cfg.loss.get("containment_weight", 0.0)),
                     containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
+                    prompt_foreground=prompt_fg,
+                    mask_contain_weight=_mask_contain_weight(cfg, contain_scale),
                 )
                 loss = loss / accum
             scaler.scale(loss).backward()
@@ -1172,6 +1301,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 global_step=global_step,
                 duration_s=t_done - t_prev,
                 meta=batch.get("meta") or [],
+                prompt_types=batch.get("prompt_type") or [],
             )
             t_prev = t_done
             if (global_step + 1) % log_every == 0:
@@ -1285,6 +1415,7 @@ def load_train_cfg(overrides: list[str] | None = None) -> DictConfig:
     cfg = OmegaConf.load(cfg_path)
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+    PromptConfig.from_cfg(cfg)  # fail on bad prompt probabilities before any data or model loads
     return cfg
 
 

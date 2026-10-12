@@ -37,5 +37,7 @@ Desktop.ini
 _tmp_*
 _window_span_scan.py
 
-# Generated crop data
-annotation_crops/
+# Generated crop data. The annotation_crops Python package (shared by the trainer and the gallery) is
+# source, so only generated files in it are ignored.
+annotation_crops/*
+!annotation_crops/*.py
