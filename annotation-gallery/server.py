@@ -349,6 +349,50 @@ def content_type_for(path: Path) -> str:
     return "application/octet-stream"
 
 
+def https_redirect_location(
+    host_header: str,
+    request_target: str,
+    *,
+    http_port: int,
+    https_port: int,
+    public_origin: str | None = None,
+) -> str:
+    """Build the Location URL for an HTTP→HTTPS redirect.
+
+    When ``public_origin`` is set (e.g. ``https://gallery.codepharm.net``), that
+    origin wins. Otherwise the Host header is rewritten to HTTPS using
+    ``https_port`` as the browser-facing port (compose may set this to the
+    published port, e.g. 8443, while the container still listens on 443).
+    ``http_port`` matches Host ports that should be replaced (80 or 8080).
+    """
+    path = request_target if request_target.startswith("/") else f"/{request_target}"
+    origin = (public_origin or "").strip().rstrip("/")
+    if origin:
+        return f"{origin}{path}"
+
+    host = (host_header or "127.0.0.1").strip() or "127.0.0.1"
+    hostname = host
+    host_port: int | None = None
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            hostname = host[: end + 1]
+            rest = host[end + 1 :]
+            if rest.startswith(":") and rest[1:].isdigit():
+                host_port = int(rest[1:])
+    elif host.count(":") == 1:
+        maybe_host, port_text = host.rsplit(":", 1)
+        if port_text.isdigit():
+            hostname = maybe_host
+            host_port = int(port_text)
+
+    if https_port == 443:
+        return f"https://{hostname}{path}"
+    if host_port is None or host_port in {80, http_port, https_port}:
+        return f"https://{hostname}:{https_port}{path}"
+    return f"https://{hostname}:{https_port}{path}"
+
+
 class GalleryHandler(BaseHTTPRequestHandler):
     """HTTP API + static SPA. Does not spawn nornir-build."""
 
@@ -365,7 +409,26 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return registry_dir()
         return resolve_training_set(name)
 
+    def _maybe_redirect_https(self) -> bool:
+        """When this process has HTTPS bound, send 301 from the cleartext listener."""
+        if not getattr(self.server, "force_https_redirect", False):
+            return False
+        location = https_redirect_location(
+            self.headers.get("Host") or "",
+            self.path,
+            http_port=int(getattr(self.server, "gallery_http_port", 80)),
+            https_port=int(getattr(self.server, "gallery_https_port", 443)),
+            public_origin=getattr(self.server, "gallery_public_https_origin", None),
+        )
+        self.send_response(301)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
     def do_GET(self) -> None:
+        if self._maybe_redirect_https():
+            return
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         query = parse_qs(parsed.query)
@@ -443,6 +506,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self) -> None:
+        if self._maybe_redirect_https():
+            return
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         if path == "/api/review-lists":
@@ -945,6 +1010,21 @@ def make_server(
     return ThreadingHTTPServer((host, port), GalleryHandler)
 
 
+def _configure_http_redirect(
+    http_server: ThreadingHTTPServer,
+    *,
+    enabled: bool,
+    http_port: int,
+    https_port: int,
+) -> None:
+    """Mark the cleartext server so handlers 301 to HTTPS when TLS is up."""
+    http_server.force_https_redirect = enabled
+    http_server.gallery_http_port = http_port
+    http_server.gallery_https_port = https_port
+    origin = (os.environ.get("GALLERY_PUBLIC_HTTPS_ORIGIN") or "").strip()
+    http_server.gallery_public_https_origin = origin or None
+
+
 def _https_server(host: str, port: int) -> ThreadingHTTPServer | None:
     """Bind HTTPS when both PEM paths exist. Missing certs leave HTTPS off."""
     cert = os.environ.get("SSL_CERT_PATH") or ""
@@ -956,6 +1036,8 @@ def _https_server(host: str, port: int) -> ThreadingHTTPServer | None:
         )
         return None
     server = make_server(host, port)
+    # HTTPS listener must not redirect to itself.
+    _configure_http_redirect(server, enabled=False, http_port=port, https_port=port)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         context.load_cert_chain(cert, key)
@@ -971,12 +1053,22 @@ def main() -> None:
     host = os.environ.get("GALLERY_HOST") or "0.0.0.0"
     http_port = int(os.environ.get("GALLERY_HTTP_PORT") or os.environ.get("GALLERY_PORT") or "80")
     https_port = int(os.environ.get("GALLERY_HTTPS_PORT") or "443")
+    # Browser-facing ports may differ from container listen ports (8080/8443 publish).
+    http_public_port = int(os.environ.get("GALLERY_HTTP_PUBLIC_PORT") or http_port)
+    https_public_port = int(os.environ.get("GALLERY_HTTPS_PUBLIC_PORT") or https_port)
     http_server = make_server(host, http_port)
     https_server = _https_server(host, https_port)
+    _configure_http_redirect(
+        http_server,
+        enabled=https_server is not None,
+        http_port=http_public_port,
+        https_port=https_public_port,
+    )
     start_thumbnail_watch(registry_dir())
     print(f"annotation-gallery HTTP on {host}:{http_port}", flush=True)
     if https_server is not None:
         print(f"annotation-gallery HTTPS on {host}:{https_port}", flush=True)
+        print("annotation-gallery HTTP redirects to HTTPS", flush=True)
         threading.Thread(target=https_server.serve_forever, daemon=True).start()
     try:
         http_server.serve_forever()

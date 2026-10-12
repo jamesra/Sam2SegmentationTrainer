@@ -140,10 +140,12 @@ sam2-em-train -benchmark --benchmark-steps 80 --benchmark-val-steps 30
 
 # Annotation gallery is the other Compose service. It reads the same
 # /data-local/current tree. Trash moves a mask from masks/ to ignored/;
-# the next sam2-em-train skips that sample. HTTP http://127.0.0.1:8080
-# HTTPS https://127.0.0.1:8443 when SSL_CERT_PATH and SSL_KEY_PATH exist.
-# Reopen in Container starts it. From the CLI:
+# the next sam2-em-train skips that sample.
+# Local: HTTP http://127.0.0.1:8080 ; HTTPS https://127.0.0.1:8443 when PEMs exist.
+# When HTTPS is up, HTTP 301s to HTTPS. Production: gallery.codepharm.net via
+# certbot (compose profile letsencrypt; see annotation-gallery/config-template).
 #   docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml up -d annotation-gallery
+#   docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml --profile letsencrypt up -d annotation-gallery annotation-gallery-certbot-renewer
 
 # Live progress is also published to the Nornir build dashboard when its Mosquitto
 # broker is up (nornir-docker/start-dashboard.ps1). The container uses

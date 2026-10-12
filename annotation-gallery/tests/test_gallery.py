@@ -27,6 +27,7 @@ from catalog import (  # noqa: E402
 )
 from identity import OidcIdentity, map_permission_names  # noqa: E402
 from server import (  # noqa: E402
+    https_redirect_location,
     list_registry_names,
     make_server,
     safe_crop_file,
@@ -624,6 +625,67 @@ def test_dockerfile_has_no_nornir() -> None:
     assert "refresh-export" not in text
     assert "nornir_shared" not in text
     assert "pip install --no-cache-dir pillow" in text
+
+
+def test_https_redirect_location_public_origin_wins() -> None:
+    assert (
+        https_redirect_location(
+            "127.0.0.1:8080",
+            "/api/me?x=1",
+            http_port=8080,
+            https_port=8443,
+            public_origin="https://gallery.codepharm.net",
+        )
+        == "https://gallery.codepharm.net/api/me?x=1"
+    )
+
+
+def test_https_redirect_location_maps_published_ports() -> None:
+    assert (
+        https_redirect_location(
+            "127.0.0.1:8080",
+            "/",
+            http_port=8080,
+            https_port=8443,
+        )
+        == "https://127.0.0.1:8443/"
+    )
+    assert (
+        https_redirect_location(
+            "gallery.codepharm.net",
+            "/static/app.js",
+            http_port=80,
+            https_port=443,
+        )
+        == "https://gallery.codepharm.net/static/app.js"
+    )
+
+
+def test_http_redirects_when_https_flag_set(httpd: tuple[str, int]) -> None:
+    """Cleartext handler 301s once the process marks HTTPS as available."""
+    # Re-bind attributes on the live test server used by the fixture's make_server.
+    # The fixture does not expose the server object; open a one-off redirect server.
+    del httpd
+    server = make_server("127.0.0.1", 0)
+    server.force_https_redirect = True
+    server.gallery_http_port = 8080
+    server.gallery_https_port = 8443
+    server.gallery_public_https_origin = None
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    try:
+        connection = HTTPConnection(str(host), int(port), timeout=5)
+        connection.request("GET", "/health", headers={"Host": "127.0.0.1:8080"})
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        assert response.status == 301
+        assert response.getheader("Location") == "https://127.0.0.1:8443/health"
+        assert body == b""
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_map_permission_names_read_vs_review() -> None:
