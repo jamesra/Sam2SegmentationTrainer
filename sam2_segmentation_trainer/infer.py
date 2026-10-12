@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
