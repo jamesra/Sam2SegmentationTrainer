@@ -137,10 +137,16 @@ sam2-em-train -benchmark --benchmark-steps 80 --benchmark-val-steps 30
 # TensorBoard starts with the container (cursor-dev-entry.sh) on :6006.
 # Compose maps host 8060 -> 6006. Events under /storage4/Sam2Trainer/runs/<run>/tb/.
 # Open http://localhost:8060  (no need to start tensorboard by hand)
+# PYTORCH_PROFILER reads torch.profiler traces from that same tb/ folder.
+# Training records one short window per process (training.profiler in em_finetune.yaml).
+# The trace file shows up after skip_first+wait+warmup+active batches (default 10).
+# sam2-em-train training.profiler.enabled=false
 
 # Annotation gallery is the other Compose service. It reads the same
-# /data-local/current tree. Trash moves a mask from masks/ to ignored/;
-# the next sam2-em-train skips that sample. HTTP http://127.0.0.1:8080
+# /data-local/current tree. Trash moves a mask from masks/ to ignored/.
+# A running sam2-em-train rebuilds its inventory at the next epoch when
+# ignore.json is newer than the last read, or when a listed tile is missing.
+# HTTP http://127.0.0.1:8080
 # HTTPS https://127.0.0.1:8443 when SSL_CERT_PATH and SSL_KEY_PATH exist.
 # Reopen in Container starts it. From the CLI:
 #   docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml up -d annotation-gallery

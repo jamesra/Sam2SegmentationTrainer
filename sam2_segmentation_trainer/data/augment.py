@@ -30,9 +30,15 @@ def build_val_transform() -> A.Compose:
 
 
 def to_rgb_uint8(gray: np.ndarray) -> np.ndarray:
-    if gray.ndim == 3 and gray.shape[2] == 3:
-        return gray
-    if gray.ndim == 3 and gray.shape[2] == 1:
-        gray = gray[:, :, 0]
-    stacked = np.stack([gray, gray, gray], axis=-1)
-    return stacked
+    """Stack a gray plane to HxWx3 uint8. An array that is already uint8 is not rescaled."""
+    array = np.asarray(gray)
+    if array.ndim == 3 and array.shape[2] == 3:
+        channels = array
+    elif array.ndim == 3 and array.shape[2] == 1:
+        plane = array[:, :, 0]
+        channels = np.stack([plane, plane, plane], axis=-1)
+    else:
+        channels = np.stack([array, array, array], axis=-1)
+    if channels.dtype == np.uint8:
+        return np.ascontiguousarray(channels)
+    return np.ascontiguousarray(channels, dtype=np.uint8)

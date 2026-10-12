@@ -5,7 +5,12 @@ import unittest
 import numpy as np
 import torch
 
-from sam2_segmentation_trainer.metrics import boundary_f1, iou_dice_pr, summarize_records
+from sam2_segmentation_trainer.metrics import (
+    boundary_f1,
+    iou_dice_pr,
+    mean_iou_by_volume,
+    summarize_records,
+)
 from sam2_segmentation_trainer.model import transform_prompt_coords
 
 
@@ -58,6 +63,27 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(summary["overall"]["iou"], 0.75)
         self.assertIn("RC1", summary["by_volume"])
         self.assertIn("1", summary["by_downsample"])
+
+    def test_mean_iou_by_volume_uses_example_names(self) -> None:
+        overall, by_volume = mean_iou_by_volume(
+            [
+                ("RC1", 0.2),
+                ("RC1", 0.4),
+                ("RC2", 0.9),
+                ("NewVolume", 0.1),
+                ("", 0.0),
+            ]
+        )
+        self.assertAlmostEqual(overall, (0.2 + 0.4 + 0.9 + 0.1 + 0.0) / 5)
+        self.assertEqual(list(by_volume), ["NewVolume", "RC1", "RC2"])
+        self.assertAlmostEqual(by_volume["RC1"], 0.3)
+        self.assertAlmostEqual(by_volume["RC2"], 0.9)
+        self.assertAlmostEqual(by_volume["NewVolume"], 0.1)
+
+    def test_mean_iou_by_volume_empty(self) -> None:
+        overall, by_volume = mean_iou_by_volume([])
+        self.assertEqual(overall, 0.0)
+        self.assertEqual(by_volume, {})
 
 
 if __name__ == "__main__":

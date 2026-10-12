@@ -84,6 +84,24 @@ ensure_checkpoint() {
   mv "${file}.partial" "${file}"
 }
 
+# torch-tb-profiler registers the PYTORCH_PROFILER tab via TensorBoard entry points.
+# Training writes traces next to SummaryWriter events under runs/<run_name>/tb/.
+ensure_tb_profiler_plugin() {
+  if python -c "import torch_tb_profiler" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "cursor-dev-entry: installing TensorBoard PyTorch Profiler plugin (torch-tb-profiler)"
+  if ! pip install --no-cache-dir 'torch-tb-profiler'; then
+    echo "cursor-dev-entry: torch-tb-profiler install failed; PYTORCH_PROFILER tab unavailable" >&2
+    return 1
+  fi
+  if ! python -c "import torch_tb_profiler" >/dev/null 2>&1; then
+    echo "cursor-dev-entry: torch_tb_profiler import failed; PYTORCH_PROFILER tab unavailable" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Training writes SummaryWriter events to $SAM2_CHECKPOINT_ROOT/runs/<run_name>/tb/
 # (CIFS). Prefer that over the Windows /outputs bind for large last.pt writes.
 ensure_tensorboard() {
@@ -94,17 +112,42 @@ ensure_tensorboard() {
   local host_port="${SAM2_TENSORBOARD_HOST_PORT:-8060}"
   local pidfile="${out_root}/tensorboard.pid"
   local logfile="${out_root}/tensorboard.log"
+  local stampfile="${out_root}/tensorboard.plugins"
   local pid=""
+  local plugin_stamp="none"
 
   mkdir -p "${logdir}"
+
+  if ensure_tb_profiler_plugin; then
+    plugin_stamp="torch-tb-profiler"
+  fi
+  plugin_stamp="${plugin_stamp}+gallery-link"
 
   if [[ -f "${pidfile}" ]]; then
     pid="$(cat "${pidfile}" 2>/dev/null || true)"
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-      echo "cursor-dev-entry: tensorboard already running pid=${pid} logdir=${logdir} :${port} (http://localhost:${host_port})"
-      return 0
+      local have=""
+      have="$(cat "${stampfile}" 2>/dev/null || true)"
+      if [[ "${have}" == "${plugin_stamp}" || "${plugin_stamp}" == "none" ]]; then
+        echo "cursor-dev-entry: tensorboard already running pid=${pid} logdir=${logdir} :${port} (http://localhost:${host_port})"
+        return 0
+      fi
+      echo "cursor-dev-entry: restarting tensorboard to load ${plugin_stamp}"
+      kill "${pid}" 2>/dev/null || true
+      local _
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+          break
+        fi
+        sleep 0.2
+      done
+      if kill -0 "${pid}" 2>/dev/null; then
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+      rm -f "${pidfile}"
+    else
+      rm -f "${pidfile}"
     fi
-    rm -f "${pidfile}"
   fi
 
   if ! command -v tensorboard >/dev/null 2>&1; then
@@ -112,14 +155,16 @@ ensure_tensorboard() {
     return 0
   fi
 
-  nohup tensorboard \
+  # Same flags as `tensorboard`, plus a Gallery link in the header.
+  nohup python -m sam2_segmentation_trainer.tb_gallery_link \
     --logdir "${logdir}" \
     --bind_all \
     --port "${port}" \
     --reload_interval 30 \
     >"${logfile}" 2>&1 &
   echo $! >"${pidfile}"
-  echo "cursor-dev-entry: tensorboard started pid=$(cat "${pidfile}") logdir=${logdir} :${port} -> http://localhost:${host_port}"
+  echo "${plugin_stamp}" >"${stampfile}"
+  echo "cursor-dev-entry: tensorboard started pid=$(cat "${pidfile}") plugins=${plugin_stamp} logdir=${logdir} :${port} -> http://localhost:${host_port}"
 }
 
 if [[ "${SAM2_CURSOR_DEV_SETUP_ONLY:-}" == "1" ]]; then

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -15,68 +16,53 @@ from tqdm import tqdm
 from sam2_segmentation_trainer.data.dataset import EMSegDataset, collate_em
 from sam2_segmentation_trainer.data.manifest import index_volumes
 from sam2_segmentation_trainer.data.splits import load_split
+from sam2_segmentation_trainer.export_serve import load_finetuned_model
 from sam2_segmentation_trainer.metrics import boundary_f1, iou_dice_pr, summarize_records
-from sam2_segmentation_trainer.model import build_em_sam2, predict_masks
+from sam2_segmentation_trainer.model import predict_masks
+from sam2_segmentation_trainer.overlays import denorm_preview, overlay_panel
 from sam2_segmentation_trainer.paths import data_root, output_root, pretrained_checkpoint
 
 
-def _denorm_preview(image_chw: torch.Tensor) -> np.ndarray:
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    rgb = (image_chw.cpu() * std + mean).clamp(0, 1)
-    arr = (rgb.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    return arr
+@dataclass(frozen=True, slots=True)
+class EvalRequest:
+    """Arguments for one evaluation run."""
+
+    finetuned: Path
+    base_ckpt: Path
+    model_cfg: str
+    data_dir: Path
+    volumes: list[str]
+    split_path: Path
+    image_size: int
+    threshold: float
+    out_dir: Path
+    grid_every: int
+    max_grids: int
+    num_workers: int
 
 
-def _overlay_panel(gray_rgb: np.ndarray, gt: np.ndarray, pred: np.ndarray) -> Image.Image:
-    base = gray_rgb.copy()
-    gt_panel = base.copy()
-    pred_panel = base.copy()
-    gt_m = gt.astype(bool)
-    pred_m = pred.astype(bool)
-    gt_panel[gt_m] = (0.6 * gt_panel[gt_m] + np.array([0, 180, 0]) * 0.4).astype(np.uint8)
-    pred_panel[pred_m] = (0.6 * pred_panel[pred_m] + np.array([0, 180, 0]) * 0.4).astype(np.uint8)
-    fp = pred_m & ~gt_m
-    fn = gt_m & ~pred_m
-    pred_panel[fp] = (0.4 * pred_panel[fp] + np.array([220, 30, 30]) * 0.6).astype(np.uint8)
-    pred_panel[fn] = (0.4 * pred_panel[fn] + np.array([30, 80, 220]) * 0.6).astype(np.uint8)
-    return Image.fromarray(np.concatenate([base, gt_panel, pred_panel], axis=1))
-
-
-def evaluate(
-    *,
-    finetuned: Path,
-    base_ckpt: Path,
-    model_cfg: str,
-    data_dir: Path,
-    volumes: list[str],
-    split_path: Path,
-    image_size: int,
-    threshold: float,
-    out_dir: Path,
-    grid_every: int,
-    max_grids: int,
-    num_workers: int,
-) -> dict:
-    examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
-    split = load_split(split_path)
+def evaluate(request: EvalRequest) -> dict:
+    examples = index_volumes(volumes=request.volumes, root=request.data_dir, skip_missing=True)
+    split = load_split(request.split_path)
     _train_ex, val_ex = split.partition(examples)
-    dataset = EMSegDataset(val_ex, split="val", image_size=image_size)
+    dataset = EMSegDataset(val_ex, split="val", image_size=request.image_size)
     loader = DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=request.num_workers,
         collate_fn=collate_em,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_em_sam2(model_cfg, str(base_ckpt), device, train=False)
-    state = torch.load(finetuned, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
+    model = load_finetuned_model(
+        request.finetuned,
+        request.base_ckpt,
+        request.model_cfg,
+        str(device),
+    )
 
     records = []
-    grid_dir = out_dir / "grids"
+    grid_dir = request.out_dir / "grids"
     grid_dir.mkdir(parents=True, exist_ok=True)
     grids_written = 0
     with torch.no_grad():
@@ -86,25 +72,25 @@ def evaluate(
             points = batch["point"].to(device)
             labels = batch["point_label"].to(device)
             pred, _iou = predict_masks(
-                model, images, points, labels, image_size=image_size
+                model, images, points, labels, image_size=request.image_size
             )
-            pred_bin = (torch.sigmoid(pred) > threshold)[0].cpu().numpy().astype(np.uint8)
+            pred_bin = (torch.sigmoid(pred) > request.threshold)[0].cpu().numpy().astype(np.uint8)
             gt = masks[0].cpu().numpy().astype(np.uint8)
             stats = iou_dice_pr(pred_bin, gt)
             stats["bf"] = boundary_f1(pred_bin, gt)
             meta = batch["meta"][0]
             stats.update(meta)
             records.append(stats)
-            if grid_every > 0 and i % grid_every == 0 and grids_written < max_grids:
-                preview = _denorm_preview(batch["image"][0])
-                panel = _overlay_panel(preview, gt, pred_bin)
+            if request.grid_every > 0 and i % request.grid_every == 0 and grids_written < request.max_grids:
+                preview = denorm_preview(batch["image"][0])
+                panel = overlay_panel(preview, gt, pred_bin)
                 name = f"{meta['volume']}_{meta['image_key']}_{meta['location_id']}.png"
-                panel.save(grid_dir / name)
+                Image.fromarray(panel).save(grid_dir / name)
                 grids_written += 1
 
     summary = summarize_records(records)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    request.out_dir.mkdir(parents=True, exist_ok=True)
+    (request.out_dir / "metrics.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
 
@@ -131,18 +117,20 @@ def main(argv: list[str] | None = None) -> int:
     base = args.base_checkpoint or pretrained_checkpoint(out_root)
     volumes = [v.strip() for v in args.volumes.split(",") if v.strip()]
     summary = evaluate(
-        finetuned=args.checkpoint,
-        base_ckpt=base,
-        model_cfg=args.model_config,
-        data_dir=data_dir,
-        volumes=volumes,
-        split_path=split_path,
-        image_size=args.image_size,
-        threshold=args.threshold,
-        out_dir=out_dir,
-        grid_every=args.grid_every,
-        max_grids=args.max_grids,
-        num_workers=args.num_workers,
+        EvalRequest(
+            finetuned=args.checkpoint,
+            base_ckpt=base,
+            model_cfg=args.model_config,
+            data_dir=data_dir,
+            volumes=volumes,
+            split_path=split_path,
+            image_size=args.image_size,
+            threshold=args.threshold,
+            out_dir=out_dir,
+            grid_every=args.grid_every,
+            max_grids=args.max_grids,
+            num_workers=args.num_workers,
+        )
     )
     print(json.dumps(summary, indent=2))
     return 0

@@ -18,6 +18,8 @@
   const HUE_KEY = "galleryOverlayHue";
   const VIS_KEY = "galleryOverlayVisibility";
   const SIZE_KEY = "galleryCardSize";
+  // Last training set, and the volume last opened inside each set.
+  const VIEW_KEY = "galleryView";
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
   const CACHE_MAX = 80;
 
@@ -35,8 +37,9 @@
     cropSize: 1024,
     cardSize: "large",
     settings: null,
-    maskGeneration: 0,
   };
+
+  const locationGenerations = new Map();
 
   const els = {
     who: document.getElementById("who"),
@@ -171,6 +174,9 @@
     }
     if (cell.joinW) {
       names.push("join-w");
+    }
+    if (!names.length) {
+      names.push("solo");
     }
     return names.join(" ");
   }
@@ -524,6 +530,16 @@
     return withSet(`/api/volumes/${encodeURIComponent(volume)}/file?path=${encodeURIComponent(rel)}`);
   }
 
+  function locationGen(locationId) {
+    return locationGenerations.get(Number(locationId)) || 0;
+  }
+
+  function mediaUrl(volume, rel, locationId) {
+    const url = fileUrl(volume, rel);
+    const gen = locationGen(locationId);
+    return gen ? `${url}&v=${gen}` : url;
+  }
+
   function vikingHref(row) {
     let template = state.config.vikingUrl || "";
     if (!template || template.includes("connectomes.utah.edu/connectome")) {
@@ -579,6 +595,35 @@
       button.classList.toggle("active", on);
       button.setAttribute("aria-pressed", on ? "true" : "false");
     });
+  }
+
+  function readView() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(VIEW_KEY) || "");
+      if (!parsed || typeof parsed !== "object") {
+        return { set: "", volumes: {} };
+      }
+      const volumes = {};
+      if (parsed.volumes && typeof parsed.volumes === "object") {
+        for (const [key, value] of Object.entries(parsed.volumes)) {
+          if (typeof value === "string") {
+            volumes[key] = value;
+          }
+        }
+      }
+      return { set: typeof parsed.set === "string" ? parsed.set : "", volumes };
+    } catch {
+      return { set: "", volumes: {} };
+    }
+  }
+
+  function rememberView(keepVolume) {
+    const view = readView();
+    view.set = state.trainingSet || "current";
+    if (keepVolume && state.volume) {
+      view.volumes[view.set] = state.volume;
+    }
+    localStorage.setItem(VIEW_KEY, JSON.stringify(view));
   }
 
   function loadCardSizePref() {
@@ -819,14 +864,14 @@
   }
 
   function windowHtml(row) {
-    const image = fileUrl(state.volume, tissueRelpath(row));
-    const mask = fileUrl(state.volume, row.mask_relpath);
+    const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+    const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
     const hue = overlayHue();
     const visibility = overlayVisibility();
     const status = row.ignored ? "rejected" : (row.approved ? "approved" : "");
     return `
       <div class="window">
-        <div class="composite waiting" data-loc="${row.location_id}" data-key="${row.image_key || ""}" data-size="${state.cardSize}" data-status="${status}" data-gen="${state.maskGeneration}" data-image="${image}" data-mask="${mask}" data-hue="${hue}" data-visibility="${visibility}">
+        <div class="composite waiting" data-loc="${row.location_id}" data-key="${row.image_key || ""}" data-size="${state.cardSize}" data-status="${status}" data-gen="${locationGen(row.location_id)}" data-image="${image}" data-mask="${mask}" data-hue="${hue}" data-visibility="${visibility}">
           <img class="jpeg pending" alt="" src="${image}">
           <canvas class="tint" aria-hidden="true"></canvas>
           <span class="media-state" aria-hidden="true"></span>
@@ -926,9 +971,16 @@
       </article>`;
   }
 
+  const refreshMarks = new Map();
+
+  function refreshMarkClass(locationId) {
+    const mark = refreshMarks.get(Number(locationId));
+    return mark ? ` ${mark}` : "";
+  }
+
   function refreshButton(row) {
-    const icon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08a5.99 5.99 0 0 1-5.65 4c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>`;
-    return `<button type="button" class="icon refresh review-only" data-act="refresh" data-id="${row.location_id}" title="Refresh mask from OData" aria-label="Refresh mask">${icon}</button>`;
+    const icon = `<svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08a5.99 5.99 0 0 1-5.65 4c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>`;
+    return `<button type="button" class="icon refresh review-only${refreshMarkClass(row.location_id)}" data-act="refresh" data-id="${row.location_id}" title="Refresh mask from OData" aria-label="Refresh mask">${icon}</button>`;
   }
 
   function cardsFrom(rows) {
@@ -1233,12 +1285,14 @@
       node.classList.toggle("join-e", Boolean(cell.joinE));
       node.classList.toggle("join-s", Boolean(cell.joinS));
       node.classList.toggle("join-w", Boolean(cell.joinW));
+      node.classList.toggle("solo", !(cell.joinN || cell.joinE || cell.joinS || cell.joinW));
       node.style.gridColumn = column;
       node.style.gridRow = row;
       node.style.setProperty("--link-h", String(cell.linkH));
       node.style.setProperty("--link-s", `${cell.linkS}%`);
       node.style.setProperty("--link-l", `${cell.linkL}%`);
     }
+    applyLinkHot(linkHotId);
     if (!fresh.length) {
       return;
     }
@@ -1292,6 +1346,7 @@
       els.grid.innerHTML = visible.map((cell) => cellHtml(cell, first)).join("");
       paintVisible();
     }
+    applyLinkHot(linkHotId);
     const card = els.grid.querySelector(".card");
     if (!card) {
       return;
@@ -1868,19 +1923,59 @@
       dataset: {
         loc: String(row.location_id),
         key: row.image_key || "",
-        mask: fileUrl(state.volume, row.mask_relpath),
+        mask: mediaUrl(state.volume, row.mask_relpath, row.location_id),
         hue: overlayHue(),
         visibility: String(overlayVisibility()),
-        image: fileUrl(state.volume, tissueRelpath(row)),
+        image: mediaUrl(state.volume, tissueRelpath(row), row.location_id),
       },
     };
     return openViewer(node);
   }
 
+  let linkHotId = "";
+
+  function applyLinkHot(locationId) {
+    if (!locationId) {
+      return;
+    }
+    linkHotId = String(locationId);
+    els.grid.querySelectorAll(".card").forEach((node) => {
+      node.classList.toggle("link-hot", node.dataset.id === linkHotId);
+    });
+  }
+
+  function clearLinkHot() {
+    linkHotId = "";
+    els.grid.querySelectorAll(".card.link-hot").forEach((node) => node.classList.remove("link-hot"));
+  }
+
+  els.grid.addEventListener("pointerover", (event) => {
+    const card = event.target.closest(".card");
+    if (!card || card.dataset.id === linkHotId) {
+      return;
+    }
+    applyLinkHot(card.dataset.id);
+  });
+
+  els.grid.addEventListener("pointerout", (event) => {
+    const card = event.target.closest(".card");
+    if (!card) {
+      return;
+    }
+    const next = event.relatedTarget;
+    const nextCard = next && next.closest ? next.closest(".card") : null;
+    if (nextCard && nextCard.dataset.id === card.dataset.id && els.grid.contains(nextCard)) {
+      return;
+    }
+    clearLinkHot();
+  });
+
   els.grid.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-act]");
     if (button) {
       if (button.dataset.act === "refresh") {
+        event.preventDefault();
+        event.stopPropagation();
         refreshLocation(Number(button.dataset.id)).catch((error) => {
           els.status.textContent = error.message;
         });
@@ -1981,36 +2076,55 @@
     return event.code === "Space" || event.key === " ";
   }
 
+  let gridSpaceHidesMask = false;
+
+  function setGridMasksHidden(hidden) {
+    gridSpaceHidesMask = hidden;
+    document.body.classList.toggle("grid-hide-masks", hidden);
+  }
+
   window.addEventListener("keydown", (event) => {
     if (!els.viewer.hidden && (event.key === "Escape" || event.key === "Esc" || event.code === "Escape")) {
       event.preventDefault();
       closeViewer();
       return;
     }
-    if (els.viewer.hidden || !isSpaceKey(event) || zoomKeyTarget(event)) {
+    if (!isSpaceKey(event) || zoomKeyTarget(event)) {
+      return;
+    }
+    if (els.viewer.hidden) {
+      event.preventDefault();
+      if (!event.repeat) {
+        setGridMasksHidden(true);
+      }
       return;
     }
     event.preventDefault();
-    if (event.repeat || spaceHidesMask) {
+    if (event.repeat) {
       return;
     }
-    spaceHidesMask = true;
+    // A tap used to hide the mask only until keyup, which fired before the
+    // change was visible. Space toggles and stays until the next press.
+    spaceHidesMask = !spaceHidesMask;
     applyMaskVisibility();
   }, true);
   window.addEventListener("keyup", (event) => {
     if (!isSpaceKey(event)) {
       return;
     }
-    if (!els.viewer.hidden) {
+    if (gridSpaceHidesMask) {
       event.preventDefault();
+      setGridMasksHidden(false);
+      return;
     }
-    spaceHidesMask = false;
-    if (!els.viewer.hidden) {
-      applyMaskVisibility();
+    if (els.viewer.hidden) {
+      return;
     }
+    event.preventDefault();
   }, true);
   window.addEventListener("blur", () => {
     spaceHidesMask = false;
+    setGridMasksHidden(false);
     if (!els.viewer.hidden) {
       applyMaskVisibility();
     }
@@ -2177,6 +2291,7 @@
   });
   els.trainingSet.addEventListener("change", () => {
     state.trainingSet = els.trainingSet.value || "current";
+    rememberView(false);
     undoStack.length = 0;
     closeViewer();
     loadVolumes().catch((error) => {
@@ -2186,6 +2301,7 @@
   els.volume.addEventListener("change", () => {
     undoStack.length = 0;
     state.volume = els.volume.value;
+    rememberView(true);
     tagEpoch += 1;
     state.tagIds = null;
     if (els.tags) {
@@ -2289,6 +2405,11 @@
     els.volume.innerHTML = volumes
       .map((item) => `<option value="${item.name}">${item.name} · ${item.permission}</option>`)
       .join("");
+    const names = volumes.map((item) => item.name);
+    const preferred = readView().volumes[state.trainingSet];
+    state.volume = names.includes(preferred) ? preferred : (names[0] || "");
+    els.volume.value = state.volume;
+    rememberView(true);
     const volumeWrap = els.volume.closest(".filter");
     if (volumes.length <= 1) {
       els.volume.style.display = volumes.length ? "none" : "";
@@ -2297,7 +2418,6 @@
         volumeLabel.style.display = volumes.length ? "none" : "";
       }
     }
-    state.volume = volumes[0] ? volumes[0].name : "";
     if (!volumes.length) {
       state.rows = [];
       els.status.textContent = "No volumes with Read access in this training set.";
@@ -2327,8 +2447,9 @@
     const endpoint = document.getElementById("settings-odata");
     const exporter = document.getElementById("settings-exporter");
     const current = state.settings || {};
-    endpoint.value = current.odata || "";
-    endpoint.placeholder = current.placeholder || `https://websvc.codepharm.net/${state.volume}/OData`;
+    const fallback = current.placeholder || `https://websvc.codepharm.net/${state.volume}/OData`;
+    endpoint.value = (current.odata || fallback).trim();
+    endpoint.placeholder = fallback;
     exporter.value = current.exporter === "legacy" ? "legacy" : "tiled";
     dialog.hidden = false;
   }
@@ -2348,27 +2469,94 @@
       : "Cleared the endpoint for this volume.";
   }
 
+  function paintRefreshMark(locationId) {
+    const mark = refreshMarks.get(Number(locationId)) || "";
+    const id = String(locationId);
+    document.querySelectorAll(`button.refresh[data-id="${id}"]`).forEach((button) => {
+      button.classList.toggle("busy", mark === "busy");
+      button.classList.toggle("done", mark === "done");
+      button.disabled = mark === "busy";
+      button.title = mark === "busy" ? "Refreshing mask" : (mark === "done" ? "Mask refreshed" : "Refresh mask from OData");
+    });
+    const viewerButton = document.getElementById("viewer-refresh");
+    if (viewerButton && String(viewer.locationId) === id) {
+      viewerButton.classList.toggle("busy", mark === "busy");
+      viewerButton.classList.toggle("done", mark === "done");
+      viewerButton.disabled = mark === "busy";
+    }
+  }
+
+  function setRefreshMark(locationId, mark) {
+    const id = Number(locationId);
+    if (mark) {
+      refreshMarks.set(id, mark);
+    } else {
+      refreshMarks.delete(id);
+    }
+    paintRefreshMark(id);
+  }
+
+  function repaintLocation(locationId) {
+    const id = String(locationId);
+    const gen = String(locationGen(locationId));
+    const rows = state.rows.filter((row) => String(row.location_id) === id);
+    els.grid.querySelectorAll(`.composite[data-loc="${id}"]`).forEach((node) => {
+      const row = rows.find((item) => (item.image_key || "") === (node.dataset.key || ""));
+      if (!row) {
+        return;
+      }
+      const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+      const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
+      node.dataset.gen = gen;
+      node.dataset.image = image;
+      node.dataset.mask = mask;
+      node.classList.add("waiting");
+      const photo = node.querySelector("img.jpeg");
+      if (photo) {
+        photo.classList.add("pending");
+        photo.src = image;
+      }
+      paintComposite(node, paintToken);
+    });
+  }
+
   async function refreshLocation(locationId) {
+    const id = Number(locationId);
+    if (refreshMarks.get(id) === "busy") {
+      return;
+    }
     const openId = viewer.locationId;
     const openKey = viewer.imageKey;
-    const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/refresh-location`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ location_id: locationId }),
-    });
-    state.maskGeneration += 1;
-    await loadCatalog(false, true);
-    const count = (result.imageKeys || []).length;
-    els.status.textContent = count
-      ? `Refreshed ${count} crop mask${count === 1 ? "" : "s"}.`
-      : "No existing crop for that location.";
-    if (!els.viewer.hidden && String(openId) === String(locationId)) {
-      const row = state.rows.find((item) =>
-        String(item.location_id) === String(openId) && (item.image_key || "") === (openKey || "")
-      );
-      if (row) {
-        await openViewerFromRow(row);
+    setRefreshMark(id, "busy");
+    try {
+      const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/refresh-location`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ location_id: locationId }),
+      });
+      locationGenerations.set(id, locationGen(id) + 1);
+      setRefreshMark(id, "done");
+      repaintLocation(id);
+      const count = (result.imageKeys || []).length;
+      els.status.textContent = count
+        ? `Refreshed ${count} crop mask${count === 1 ? "" : "s"}.`
+        : "No existing crop for that location.";
+      if (!els.viewer.hidden && String(openId) === String(locationId)) {
+        const row = state.rows.find((item) =>
+          String(item.location_id) === String(openId) && (item.image_key || "") === (openKey || "")
+        );
+        if (row) {
+          await openViewerFromRow(row);
+        }
       }
+      window.setTimeout(() => {
+        if (refreshMarks.get(id) === "done") {
+          setRefreshMark(id, "");
+        }
+      }, 2500);
+    } catch (error) {
+      setRefreshMark(id, "");
+      throw error;
     }
   }
 
@@ -2391,7 +2579,10 @@
     state.config = await getJson("/api/config");
     const setsPayload = await getJson("/api/training-sets");
     const sets = setsPayload.sets && setsPayload.sets.length ? setsPayload.sets : ["current"];
-    state.trainingSet = sets.includes("current") ? "current" : sets[0];
+    const rememberedSet = readView().set;
+    state.trainingSet = sets.includes(rememberedSet)
+      ? rememberedSet
+      : (sets.includes("current") ? "current" : sets[0]);
     els.trainingSet.innerHTML = sets
       .map((name) => `<option value="${name}">${name}</option>`)
       .join("");

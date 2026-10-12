@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import zipfile
@@ -265,6 +266,7 @@ def test_location_search_scrolls_and_sort_stacks() -> None:
     html = (GALLERY_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert 'id="locate"' in html
+    assert 'href="https://tensor.codepharm.net"' in html
     assert "Other cards stay in the list." in html
     assert "scrollToLocation" in js
     assert '["structure_id", "Structure ID"]' in js
@@ -309,14 +311,32 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "rgba(20, 83, 45, 0.25)" in css
     assert "Do not change this without explicit permission" in css
     assert 'document.body.dataset.cardSize = state.cardSize' in js
+    assert 'const VIEW_KEY = "galleryView"' in js
+    assert "sets.includes(rememberedSet)" in js
+    assert "readView().volumes[state.trainingSet]" in js
     assert 'body[data-card-size="small"] .card > .icon.check' in css
     assert "scale(0.75)" in css
     assert "const GRID_GAP = 4" in js
+    assert "setGridMasksHidden" in js
+    assert "grid-hide-masks" in css
     assert "function assignLinkHues" in js
     assert "function assignJoins" in js
     assert "join-n" in js
     assert "join-n" in css
     assert "border-top-width: 0" in css
+    assert 'names.push("solo")' in js
+    assert ".card.solo::after" in css
+    assert "content: none" in css.split(".card.solo::after", 1)[1].split("}", 1)[0]
+    assert "function linkToneIndex" in js
+    assert "link-hot" in js
+    assert "link-hot" in css
+    assert "refreshMarks" in js
+    refresh = js.split("async function refreshLocation", 1)[1].split('document.getElementById("volume-settings")', 1)[0]
+    assert "loadCatalog(" not in refresh
+    assert "maskGeneration" not in js
+    assert "locationGenerations.set" in refresh
+    assert "repaintLocation(id)" in refresh
+    assert "button.refresh.busy" in css
     assert "cardPx + 20" in js
     assert "align-self: start" in css
     assert 'content: "Generating thumbnail"' in css
@@ -679,6 +699,69 @@ def test_refresh_drops_thumbnails_for_existing_crops(
     assert payload["imageKeys"] == ["RC2_17_D1_X0_Y0"]
     assert not thumb.is_file()
     assert image.read_bytes() == image_before
+
+
+def test_refresh_uses_the_default_odata_endpoint(
+    httpd: tuple[str, int],
+    registry: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("server.nornir_buildmanager_root", lambda: registry)
+    seen: list[str] = []
+
+    def fake_fetch(url: str, location_id: int) -> dict:
+        seen.append(url)
+        return {"ID": location_id, "MosaicShape": {}, "LastModified": "2022-01-01T00:00:00Z"}
+
+    monkeypatch.setattr("server.fetch_odata_location", fake_fetch)
+    monkeypatch.setattr("server.refresh_location", lambda *_args, **_kwargs: ["RC2_17_D1_X0_Y0"])
+    status, payload = _request(
+        httpd,
+        "POST",
+        "/api/volumes/RC2/refresh-location",
+        body=json.dumps({"location_id": 42}).encode(),
+        bearer="review",
+    )
+    assert status == 200
+    assert payload["imageKeys"] == ["RC2_17_D1_X0_Y0"]
+    assert seen == ["https://websvc.codepharm.net/RC2/OData"]
+
+
+def test_mask_refresh_import_skips_the_export_pipeline() -> None:
+    root = Path(r"D:\src\git\nornir\nornir-buildmanager")
+    if not (root / "nornir_buildmanager" / "operations" / "segmentationtraining" / "maskrefresh.py").is_file():
+        pytest.skip("nornir-buildmanager checkout is not available")
+    gallery = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from refresh import load_mask_refresh
+before = set(sys.modules)
+load_mask_refresh(Path(sys.argv[2]))
+added = set(sys.modules) - before
+forbidden = (
+    "nornir_imageregistration",
+    "nornir_pools",
+    "nornir_shared",
+    "nornir_buildmanager.build",
+    "nornir_buildmanager.operations.segmentationtraining.pipeline",
+    "nornir_buildmanager.operations.segmentationtraining.update",
+    "nornir_buildmanager.operations.segmentationtraining.stitch",
+    "nornir_buildmanager.operations.segmentationtraining.ingest",
+    "nornir_buildmanager.operations.segmentationtraining.catalog",
+)
+bad = [name for name in sorted(added) if name in forbidden or any(name.startswith(item + ".") for item in forbidden)]
+if bad:
+    raise SystemExit("imported " + ", ".join(bad))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(gallery), str(root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_path_traversal_rejected(httpd: tuple[str, int], registry: Path) -> None:

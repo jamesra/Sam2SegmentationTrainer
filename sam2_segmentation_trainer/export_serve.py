@@ -27,6 +27,26 @@ def _looks_like_state_dict(payload: dict[str, Any]) -> bool:
     return any(isinstance(key, str) and key.startswith("image_encoder") for key in payload)
 
 
+def load_finetuned_model(
+    finetuned: Path,
+    base_ckpt: Path,
+    model_cfg: str,
+    device: str,
+):
+    """Eval-mode SAM2 with fine-tuned weights from a raw state dict or ``{"model": ...}``."""
+    import torch
+
+    from sam2_segmentation_trainer.model import build_em_sam2
+
+    torch_device = torch.device(device)
+    payload = torch.load(finetuned, map_location=torch_device, weights_only=True)
+    state = finetuned_state_dict(payload)
+    model = build_em_sam2(model_cfg, str(base_ckpt), torch_device, train=False)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
 def export_serve_checkpoint(
     *,
     finetuned: Path,
@@ -38,12 +58,7 @@ def export_serve_checkpoint(
     """Load base SAM2, overlay fine-tuned weights, write a build_sam2 checkpoint."""
     import torch
 
-    from sam2_segmentation_trainer.model import build_em_sam2
-
-    payload = torch.load(finetuned, map_location="cpu", weights_only=True)
-    state = finetuned_state_dict(payload)
-    model = build_em_sam2(model_cfg, str(base_ckpt), torch.device(device), train=False)
-    model.load_state_dict(state)
+    model = load_finetuned_model(finetuned, base_ckpt, model_cfg, device)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict()}, out)
     return out

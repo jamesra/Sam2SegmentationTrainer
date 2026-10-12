@@ -22,6 +22,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import crops_path  # noqa: F401
+from annotation_crops.maskname import MaskName
 from PIL import Image
 
 THUMB_SIZES = frozenset({512, 384, 256})
@@ -58,12 +60,10 @@ def parse_thumb_request(relative: str) -> tuple[int, str] | None:
 
 def image_key_from_mask_name(name: str) -> str | None:
     """Image key from ``{imageKey}_{locationId}.png``. Other names are skipped."""
-    if not name.endswith(".png"):
+    parsed = MaskName.parse(name)
+    if parsed is None or IMAGE_KEY.fullmatch(parsed.image_key) is None:
         return None
-    key, separator, suffix = name[:-4].rpartition("_")
-    if not separator or not suffix.isdigit() or IMAGE_KEY.fullmatch(key) is None:
-        return None
-    return key
+    return parsed.image_key
 
 
 def scan_mask_reference_ns(crops: Path) -> dict[str, int]:

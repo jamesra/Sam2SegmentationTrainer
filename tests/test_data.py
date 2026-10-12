@@ -5,9 +5,20 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sam2_segmentation_trainer.data.manifest import index_volumes, summarize_index
+from sam2_segmentation_trainer.data.manifest import (
+    ignore_list_stamps,
+    ignore_lists_newer,
+    index_volumes,
+    move_ignored_masks,
+    summarize_index,
+)
 from sam2_segmentation_trainer.data.rle import decode_coco_rle
-from sam2_segmentation_trainer.data.splits import load_split, make_location_split, save_split
+from sam2_segmentation_trainer.data.splits import (
+    include_new_keys,
+    load_split,
+    make_location_split,
+    save_split,
+)
 from sam2_segmentation_trainer.validate import build_report
 
 try:
@@ -149,6 +160,9 @@ class ManifestSplitTests(unittest.TestCase):
             self.assertTrue(target.mask_path.is_file())
             after = index_volumes(volumes=["RC1"], root=root)
             self.assertFalse(any(ex.location_id == target.location_id for ex in after))
+            self.assertTrue(target.mask_path.is_file())
+            moved_count = move_ignored_masks(crops, {target.location_id})
+            self.assertEqual(moved_count, 1)
             self.assertFalse(target.mask_path.is_file())
             moved = crops / "ignored" / target.mask_path.name
             self.assertTrue(moved.is_file())
@@ -171,6 +185,45 @@ class ManifestSplitTests(unittest.TestCase):
             self.assertEqual(len(usable), len(examples) - 1)
             summary = summarize_index(all_ex)
             self.assertEqual(summary["missing_raster_mask"], 1)
+
+    def test_ignore_list_rebuilds_only_when_the_file_is_newer(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_crops(root, "RC1", n=2)
+            before = ignore_list_stamps(["RC1"], root)
+            self.assertIsNone(before["RC1"])
+            self.assertFalse(ignore_lists_newer(before, before))
+            crops = root / "RC1" / "AnnotationCrops"
+            (crops / "ignore.json").write_text("[1]", encoding="utf-8")
+            created = ignore_list_stamps(["RC1"], root)
+            self.assertTrue(ignore_lists_newer(before, created))
+            self.assertFalse(ignore_lists_newer(created, created))
+            (crops / "ignore.json").write_text("[1, 2]", encoding="utf-8")
+            os_utime = created["RC1"]
+            assert os_utime is not None
+            later = dict(created)
+            later["RC1"] = os_utime + 1
+            self.assertTrue(ignore_lists_newer(created, later))
+            older = dict(created)
+            older["RC1"] = os_utime - 1
+            self.assertFalse(ignore_lists_newer(created, older))
+
+    def test_restored_location_joins_the_existing_split(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_crops(root, "RC1", n=4)
+            examples = index_volumes(volumes=["RC1"], root=root)
+            held = examples[0]
+            split = make_location_split(
+                [ex for ex in examples if ex.split_key != held.split_key],
+                train_fraction=0.9,
+                seed=1,
+            )
+            grown = include_new_keys(split, examples, train_fraction=0.9, seed=1)
+            self.assertIn(held.split_key, grown.train_keys + grown.val_keys)
+            self.assertEqual(set(split.train_keys), set(grown.train_keys) & set(split.train_keys))
+            again = include_new_keys(grown, examples, train_fraction=0.9, seed=1)
+            self.assertEqual(again, grown)
 
 
 if __name__ == "__main__":

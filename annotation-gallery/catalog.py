@@ -10,6 +10,11 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
+import crops_path  # noqa: F401
+from annotation_crops.ignore import load_ignore_ids as _load_ignore_ids
+from annotation_crops.ignore import save_ignore_ids as _save_ignore_ids
+from annotation_crops.scores import ensure_location_scores_schema
+
 SAM2_COLUMNS = (
     "sam2PredIou",
     "sam2ObjectScore",
@@ -41,17 +46,6 @@ CREATE TABLE IF NOT EXISTS locations (
 )
 """
 
-_CREATE_SCORES_SQL = """
-CREATE TABLE IF NOT EXISTS location_scores (
-    location_id INTEGER NOT NULL,
-    image_key TEXT NOT NULL,
-    epoch INTEGER NOT NULL,
-    score REAL NOT NULL,
-    PRIMARY KEY (location_id, image_key, epoch)
-)
-"""
-
-
 def sqlite_path(crops: str | os.PathLike[str]) -> Path:
     """Return `{AnnotationCrops}/annotation_crops.sqlite`."""
     return Path(crops) / "annotation_crops.sqlite"
@@ -75,34 +69,8 @@ def connect(crops: str | os.PathLike[str]) -> sqlite3.Connection:
 
 
 def _ensure_score_schema(connection: sqlite3.Connection) -> None:
-    """Create per-window scores, or keep a location-only table under an empty image key.
-
-    Older catalogs stored one score per location per epoch. Those rows stay
-    readable as a fallback until a later epoch writes a score for the window.
-    """
-    connection.execute(_CREATE_SCORES_SQL)
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(location_scores)")}
-    if "image_key" in columns:
-        return
-    connection.execute(
-        """
-        CREATE TABLE location_scores_window (
-            location_id INTEGER NOT NULL,
-            image_key TEXT NOT NULL,
-            epoch INTEGER NOT NULL,
-            score REAL NOT NULL,
-            PRIMARY KEY (location_id, image_key, epoch)
-        )
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO location_scores_window (location_id, image_key, epoch, score)
-        SELECT location_id, '', epoch, score FROM location_scores
-        """
-    )
-    connection.execute("DROP TABLE location_scores")
-    connection.execute("ALTER TABLE location_scores_window RENAME TO location_scores")
+    """Create per-window scores, or keep a location-only table under an empty image key."""
+    ensure_location_scores_schema(connection)
 
 
 def _ensure_locations_schema(connection: sqlite3.Connection) -> None:
@@ -121,25 +89,12 @@ def _ensure_locations_schema(connection: sqlite3.Connection) -> None:
 
 def load_ignore_ids(crops: str | os.PathLike[str]) -> set[int]:
     """Load ignored location ids from `ignore.json` (a JSON array)."""
-    path = ignore_path(crops)
-    if not path.is_file():
-        return set()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        return set()
-    ids: set[int] = set()
-    for item in payload:
-        try:
-            ids.add(int(item))
-        except (TypeError, ValueError):
-            continue
-    return ids
+    return _load_ignore_ids(crops)
 
 
 def save_ignore_ids(crops: str | os.PathLike[str], ids: Iterable[int]) -> None:
     """Write `ignore.json` as a sorted JSON array of location ids."""
-    ordered = sorted({int(item) for item in ids})
-    ignore_path(crops).write_text(json.dumps(ordered), encoding="utf-8")
+    _save_ignore_ids(crops, ids)
 
 
 def approved_path(crops: str | os.PathLike[str]) -> Path:

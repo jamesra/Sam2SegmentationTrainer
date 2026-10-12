@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 
-from sam2_segmentation_trainer.data.dataset import EMSegDataset, collate_em
+from sam2_segmentation_trainer.data.dataset import EMSegDataset, MissingTileFlag, collate_em
 from sam2_segmentation_trainer.data.manifest import index_volumes, take_model_sized
 
 try:
@@ -55,6 +55,20 @@ class DatasetTests(unittest.TestCase):
             kept32, rejected32 = take_model_sized(examples, 32)
             self.assertEqual(len(kept32), len(examples))
             self.assertEqual(rejected32, [])
+
+    def test_missing_tile_sets_the_inventory_flag(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_crops(root, "RC1", n=3)
+            examples = index_volumes(volumes=["RC1"], root=root)
+            missing = examples[0]
+            missing.mask_path.unlink()
+            flag = MissingTileFlag()
+            ds = EMSegDataset(examples, split="val", image_size=32, missing_tiles=flag)
+            item = ds[0]
+            self.assertTrue(flag.take())
+            self.assertFalse(flag.take())
+            self.assertNotEqual(item["location_id"], missing.location_id)
 
 
 if __name__ == "__main__":

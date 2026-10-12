@@ -84,8 +84,8 @@ services:
 
   annotation-gallery:
     build:
-      context: ../annotation-gallery
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: annotation-gallery/Dockerfile
     image: nornir-annotation-gallery:latest
     restart: unless-stopped
     user: "${SAM2_DATA_UID:-1000}:${SAM2_DATA_GID:-1000}"

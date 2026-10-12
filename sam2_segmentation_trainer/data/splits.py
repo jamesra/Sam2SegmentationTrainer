@@ -26,6 +26,20 @@ class SplitLists:
         return train, val
 
 
+def _train_count(n: int, fraction: float) -> int:
+    """How many of *n* keys go to train.
+
+    A group of two or more keeps at least one train key and one val key.
+    """
+    n_train = int(round(n * fraction))
+    n_train = min(max(n_train, 0), n)
+    if n >= 2 and n_train == n:
+        n_train = n - 1
+    if n >= 2 and n_train == 0:
+        n_train = 1
+    return n_train
+
+
 def make_location_split(
     examples: Sequence[CropExample],
     *,
@@ -47,13 +61,7 @@ def make_location_split(
         rng.shuffle(keys)
         if not keys:
             continue
-        n_train = int(round(len(keys) * train_fraction))
-        n_train = min(max(n_train, 0), len(keys))
-        # Keep at least one val example when a volume has two or more keys.
-        if len(keys) >= 2 and n_train == len(keys):
-            n_train = len(keys) - 1
-        if len(keys) >= 2 and n_train == 0:
-            n_train = 1
+        n_train = _train_count(len(keys), train_fraction)
         per_train[volume] = keys[:n_train]
         per_val[volume] = keys[n_train:]
 
@@ -77,6 +85,37 @@ def make_location_split(
         train_keys.extend(per_train[volume])
         val_keys.extend(per_val[volume])
     return SplitLists(train_keys=tuple(train_keys), val_keys=tuple(val_keys))
+
+
+def include_new_keys(
+    split: SplitLists,
+    examples: Sequence[CropExample],
+    *,
+    train_fraction: float,
+    seed: int,
+) -> SplitLists:
+    """Add location keys that were not in *split* when the inventory was first built.
+
+    Existing train and val membership stays put. New keys are assigned with *seed*
+    so a location restored after startup joins the same side on later epochs.
+    """
+    known = set(split.train_keys) | set(split.val_keys)
+    fresh: list[str] = []
+    seen: set[str] = set()
+    for example in examples:
+        if example.split_key in known or example.split_key in seen:
+            continue
+        seen.add(example.split_key)
+        fresh.append(example.split_key)
+    if not fresh:
+        return split
+    rng = random.Random(seed)
+    rng.shuffle(fresh)
+    n_train = _train_count(len(fresh), train_fraction)
+    return SplitLists(
+        train_keys=split.train_keys + tuple(fresh[:n_train]),
+        val_keys=split.val_keys + tuple(fresh[n_train:]),
+    )
 
 
 def save_split(split: SplitLists, path: Path) -> None:

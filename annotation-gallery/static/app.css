@@ -39,6 +39,22 @@ h1 {
   font-size: 1.1rem;
 }
 
+.title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.site-link {
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.site-link:hover {
+  text-decoration: underline;
+}
+
 .who { margin: 0; color: var(--muted); }
 
 .filters {
@@ -311,47 +327,76 @@ button.reverse.active,
   border-bottom-left-radius: 0;
 }
 
+.grid .card.link-hot {
+  background: hsl(var(--link-h) var(--link-s) calc(var(--link-l) + 7%));
+  border-color: hsl(var(--link-h) calc(var(--link-s) + 10%) calc(var(--link-l) + 16%));
+  --ring: hsl(var(--link-h) 85% 72%);
+  filter: brightness(1.12);
+}
+
+/* A location that occupies one cell has no shared perimeter, so it stays unboxed. */
+.card.solo,
+.grid .card.solo.link-hot {
+  border-color: transparent;
+}
+
+.card.solo::after {
+  content: none;
+}
+
 .card[hidden] {
   display: none;
 }
 
 .card button.refresh,
 #viewer-refresh {
-  display: none;
+  display: inline-flex;
   border-radius: 50%;
   z-index: 4;
 }
 
-body.can-refresh .card button.refresh,
-body.can-refresh #viewer-refresh {
-  display: inline-flex;
-}
-
 .meta button.refresh {
   flex: none;
-  width: 22px;
-  height: 22px;
-  margin-left: 6px;
-  padding: 2px;
+  width: 18px;
+  height: 18px;
+  margin-left: auto;
+  padding: 0;
+  background: transparent;
+  color: #f8fafc;
 }
 
 .meta button.refresh svg {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+}
+
+button.refresh .mark { display: none; }
+
+button.refresh.busy .arrow {
+  animation: refresh-spin 0.8s linear infinite;
+}
+
+button.refresh.done {
+  color: #3dd68c;
+}
+
+button.refresh.done .arrow { display: none; }
+
+button.refresh.done .mark { display: block; }
+
+@keyframes refresh-spin {
+  to { transform: rotate(-360deg); }
 }
 
 #viewer-refresh {
-  position: absolute;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 40px;
-  height: 40px;
-}
-
-#viewer-refresh svg {
-  width: 22px;
-  height: 22px;
+  align-self: flex-start;
+  flex: 0 0 auto;
+  width: 112px;
+  height: 112px;
+  margin-top: 4px;
+  padding: 0;
+  border-radius: 4px;
+  background: rgba(35, 40, 51, 0.25);
 }
 
 #settings-dialog label {
@@ -399,8 +444,9 @@ body.can-refresh #viewer-refresh {
   position: relative;
 }
 
-/* Card corner buttons stay 75% transparent. Do not change this without explicit permission.
-   #232833 and the approved green are drawn at 25% opacity. Zoom-viewer buttons stay opaque. */
+/* Card corner buttons and the zoom approve, reject, refresh, and close buttons stay 75% transparent.
+   Do not change this without explicit permission.
+   #232833 and the approved green are drawn at 25% opacity. */
 .card > .icon.check,
 .card > .icon.trash,
 .card > .icon.plus {
@@ -479,7 +525,7 @@ body[data-card-size="small"] .card > .icon.plus {
 }
 
 .viewer-act.check.on {
-  background: #14532d;
+  background: rgba(20, 83, 45, 0.25);
   color: #bbf7d0;
 }
 
@@ -525,6 +571,10 @@ body[data-card-size="small"] .card > .icon.plus {
   transition: opacity 120ms ease;
 }
 
+body.grid-hide-masks .grid canvas.tint {
+  opacity: 0;
+}
+
 .meta {
   padding: 1px 6px 2px;
   font-size: 12px;
@@ -554,6 +604,7 @@ body[data-card-size="small"] .card > .icon.plus {
 }
 
 .meta-row > div {
+  flex: 1 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -668,10 +719,22 @@ button.plus { color: var(--ok); }
 }
 
 #viewer-close {
-  font-size: 1.875rem;
-  line-height: 1;
-  padding: 6px 14px;
   align-self: flex-start;
+  flex: 0 0 auto;
+  width: 112px;
+  height: 112px;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(35, 40, 51, 0.25);
+  color: var(--ink);
+  font-size: 4rem;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .viewer-stage {
@@ -702,7 +765,7 @@ button.plus { color: var(--ok); }
   position: relative;
 }
 
-.viewer-act {
+button.viewer-act {
   position: relative;
   z-index: 4;
   flex: 0 0 auto;
@@ -710,10 +773,13 @@ button.plus { color: var(--ok); }
   width: 112px;
   height: 112px;
   margin-top: 4px;
+  padding: 0;
   font-size: 4rem;
+  background: rgba(35, 40, 51, 0.25);
 }
 
-#viewer-reject svg {
+#viewer-reject svg,
+#viewer-refresh svg {
   width: 4rem;
   height: 4rem;
 }
@@ -766,7 +832,7 @@ button.plus { color: var(--ok); }
 }
 
 #viewer-approve.on {
-  background: #14532d;
+  background: rgba(20, 83, 45, 0.25);
   color: #bbf7d0;
 }
 

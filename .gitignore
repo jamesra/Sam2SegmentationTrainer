@@ -25,3 +25,17 @@ venv/
 *.swp
 Thumbs.db
 Desktop.ini
+
+# Cursor IDE
+.cursor/
+
+# Hypothesis test cache
+.hypothesis/
+
+# Temporary analysis scripts
+.tmp_*
+_tmp_*
+_window_span_scan.py
+
+# Generated crop data
+annotation_crops/

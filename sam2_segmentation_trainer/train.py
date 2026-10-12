@@ -34,11 +34,25 @@ from sam2_segmentation_trainer.checkpoint import (
     migrate_run_artifacts,
     remaining_epoch_indices,
 )
-from sam2_segmentation_trainer.data.dataset import EMSegDataset, collate_em
-from sam2_segmentation_trainer.data.manifest import index_volumes, take_model_sized
-from sam2_segmentation_trainer.data.splits import load_split, make_location_split, save_split
-from sam2_segmentation_trainer.metrics import iou_dice_pr
-from sam2_segmentation_trainer.mqtt_progress import StepAnomalyMonitor, TrainingProgress
+from sam2_segmentation_trainer.data.dataset import EMSegDataset, MissingTileFlag, collate_em
+from annotation_crops.scores import ensure_location_scores_schema
+
+from sam2_segmentation_trainer.data.manifest import (
+    ignore_list_stamps,
+    ignore_lists_newer,
+    index_volumes,
+    load_ignore_ids,
+    move_ignored_masks,
+    take_model_sized,
+    volume_counts,
+)
+from sam2_segmentation_trainer.data.splits import (
+    include_new_keys,
+    load_split,
+    make_location_split,
+    save_split,
+)
+from sam2_segmentation_trainer.metrics import iou_dice_pr, mean_iou_by_volume
 from sam2_segmentation_trainer.model import (
     build_em_sam2,
     combined_loss,
@@ -47,6 +61,9 @@ from sam2_segmentation_trainer.model import (
     param_groups,
     predict_masks,
 )
+from sam2_segmentation_trainer.mqtt_progress import StepAnomalyMonitor, TrainingProgress
+from sam2_segmentation_trainer.overlays import denorm_preview, overlay_panel
+from sam2_segmentation_trainer.records import RunInputs, TrainerRoots, TrainSnapshot
 from sam2_segmentation_trainer.paths import (
     annotation_crops_root,
     checkpoint_root,
@@ -58,6 +75,7 @@ from sam2_segmentation_trainer.paths import (
     pretrained_checkpoint,
     run_dir_for,
 )
+from sam2_segmentation_trainer.tb_profiler import TbStepProfiler
 
 
 class StopFlag:
@@ -95,14 +113,14 @@ def restore_rng(state: dict) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _resolve_paths(cfg: DictConfig) -> tuple[Path, Path, Path, Path]:
+def _resolve_paths(cfg: DictConfig) -> TrainerRoots:
     root = data_root(cfg.data.root)
     out = output_root(cfg.training.output_dir)
     ckpt_root_cfg = cfg.training.get("checkpoint_dir")
     ckpt_root = checkpoint_root(None if ckpt_root_cfg in (None, "") else ckpt_root_cfg)
     ckpt = cfg.model.checkpoint
     checkpoint = Path(ckpt) if ckpt else pretrained_checkpoint(out)
-    return root, out, ckpt_root, checkpoint
+    return TrainerRoots(data=root, output=out, checkpoint=ckpt_root, pretrained=checkpoint)
 
 
 def cosine_warmup_lambdas(optimizer, warmup_steps: int, total_steps: int, min_lr: float):
@@ -133,6 +151,14 @@ def _amp_setup(device: torch.device, enabled: bool):
     dtype = torch.bfloat16 if use_bf16 else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=bool(enabled and use_cuda and not use_bf16))
     return dtype, scaler
+
+
+def enable_cudnn_benchmark(device: torch.device) -> bool:
+    """Let cuDNN pick convolution algorithms for a fixed tile size (always 1024×1024)."""
+    if device.type != "cuda":
+        return False
+    torch.backends.cudnn.benchmark = True
+    return True
 
 
 def format_duration(seconds: float) -> str:
@@ -277,6 +303,10 @@ def run_throughput_benchmark(
                 focal_weight=float(cfg.loss.focal_weight),
                 dice_weight=float(cfg.loss.dice_weight),
                 iou_weight=float(cfg.loss.iou_weight),
+                points=points,
+                labels=labels,
+                containment_weight=float(cfg.loss.get("containment_weight", 0.0)),
+                containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
             )
             loss = loss / accum
         scaler.scale(loss).backward()
@@ -441,10 +471,42 @@ def _make_loader(
     )
 
 
+def due_for_val_images(global_step: int, last_step: int | None, every_n_steps: int) -> bool:
+    """Whether this validation pass should write TensorBoard overlay images.
+
+    The first pass of a process logs. Later passes log once at least
+    ``every_n_steps`` training steps have elapsed. ``every_n_steps <= 0``
+    leaves images off.
+    """
+    if every_n_steps <= 0:
+        return False
+    if last_step is None:
+        return True
+    return int(global_step) - int(last_step) >= int(every_n_steps)
+
+
 @torch.no_grad()
-def run_validation(model, loader, device, image_size: int, threshold: float) -> float:
+def run_validation(
+    model,
+    loader,
+    device,
+    image_size: int,
+    threshold: float,
+    *,
+    overlays_per_volume: int = 0,
+) -> tuple[float, dict[str, float], list[tuple[str, np.ndarray]]]:
+    """Mean IoU, per-volume means, and a few overlay strips.
+
+    Volume names come from the examples in the loader. ``overlays_per_volume``
+    keeps that many strips per name (input | ground truth | prediction) from
+    the start of the loader. The prediction is the mask decoder output after
+    ``sigmoid > threshold`` (0.5 in the default config).
+    """
     model.eval()
-    ious = []
+    samples: list[tuple[str, float]] = []
+    overlays: list[tuple[str, np.ndarray]] = []
+    overlay_counts: dict[str, int] = {}
+    keep_overlays = max(0, int(overlays_per_volume))
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
@@ -454,16 +516,26 @@ def run_validation(model, loader, device, image_size: int, threshold: float) -> 
             model, images, points, labels, image_size=image_size
         )
         pred_bin = (torch.sigmoid(pred) > threshold).to(torch.int64)
-        for pred_i, mask_i in zip(pred_bin, masks, strict=True):
-            stats = iou_dice_pr(
-                pred_i.detach().cpu().numpy(),
-                mask_i.detach().cpu().numpy(),
-            )
-            ious.append(stats["iou"])
+        meta = batch.get("meta") or []
+        for index, (pred_i, mask_i, item) in enumerate(
+            zip(pred_bin, masks, meta, strict=True)
+        ):
+            pred_np = pred_i.detach().cpu().numpy()
+            gt_np = mask_i.detach().cpu().numpy()
+            stats = iou_dice_pr(pred_np, gt_np)
+            volume = "" if item is None else str(item.get("volume", "")).strip()
+            samples.append((volume, stats["iou"]))
+            if not volume or keep_overlays <= 0:
+                continue
+            seen = overlay_counts.get(volume, 0)
+            if seen >= keep_overlays:
+                continue
+            panel = overlay_panel(denorm_preview(batch["image"][index]), gt_np, pred_np)
+            overlays.append((volume, panel))
+            overlay_counts[volume] = seen + 1
     model.train()
-    if not ious:
-        return 0.0
-    return float(np.mean(ious))
+    overall, by_volume = mean_iou_by_volume(samples)
+    return overall, by_volume, overlays
 
 
 class _LossWindow:
@@ -472,6 +544,7 @@ class _LossWindow:
     def __init__(self) -> None:
         self._rows: list[torch.Tensor] = []
         self._meta: list[tuple[int, int, int, float, list]] = []
+        self._has_containment = False
 
     def add(
         self,
@@ -483,80 +556,51 @@ class _LossWindow:
         duration_s: float,
         meta: list,
     ) -> None:
-        packed = torch.cat(
-            [
-                stats["loss"].reshape(1),
-                stats["loss_focal"].reshape(1),
-                stats["loss_dice"].reshape(1),
-                stats["loss_iou"].reshape(1),
-                stats["sample_losses"].reshape(-1),
-            ]
-        )
+        self._has_containment = "loss_containment" in stats
+        head = [
+            stats["loss"].reshape(1),
+            stats["loss_focal"].reshape(1),
+            stats["loss_dice"].reshape(1),
+            stats["loss_iou"].reshape(1),
+        ]
+        if self._has_containment:
+            head.append(stats["loss_containment"].reshape(1))
+        packed = torch.cat(head + [stats["sample_losses"].reshape(-1)])
         self._rows.append(packed.detach())
         self._meta.append((epoch, step, global_step, duration_s, meta))
 
     def drain(self) -> list[dict]:
         if not self._rows:
             return []
+        has_containment = self._has_containment
+        head_len = 5 if has_containment else 4
         packed = torch.stack(self._rows).float().cpu()
         records = []
         for i, (epoch, step, global_step, duration_s, meta) in enumerate(self._meta):
             row = packed[i].tolist()
-            records.append(
-                {
-                    "epoch": epoch,
-                    "step": step,
-                    "global_step": global_step,
-                    "duration_s": duration_s,
-                    "meta": meta,
-                    "loss": row[0],
-                    "loss_focal": row[1],
-                    "loss_dice": row[2],
-                    "loss_iou": row[3],
-                    "sample_losses": row[4:],
-                }
-            )
+            record = {
+                "epoch": epoch,
+                "step": step,
+                "global_step": global_step,
+                "duration_s": duration_s,
+                "meta": meta,
+                "loss": row[0],
+                "loss_focal": row[1],
+                "loss_dice": row[2],
+                "loss_iou": row[3],
+                "sample_losses": row[head_len:],
+            }
+            if has_containment:
+                record["loss_containment"] = row[4]
+            records.append(record)
         self._rows.clear()
         self._meta.clear()
         return records
 
 
-_SCORE_SQL = """
-CREATE TABLE IF NOT EXISTS location_scores (
-    location_id INTEGER NOT NULL,
-    image_key TEXT NOT NULL,
-    epoch INTEGER NOT NULL,
-    score REAL NOT NULL,
-    PRIMARY KEY (location_id, image_key, epoch)
-)
-"""
-
-
 def _ensure_score_schema(connection: sqlite3.Connection) -> None:
     """Create per-window scores, or keep a location-only table under an empty image key."""
-    connection.execute(_SCORE_SQL)
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(location_scores)")}
-    if "image_key" in columns:
-        return
-    connection.execute(
-        """
-        CREATE TABLE location_scores_window (
-            location_id INTEGER NOT NULL,
-            image_key TEXT NOT NULL,
-            epoch INTEGER NOT NULL,
-            score REAL NOT NULL,
-            PRIMARY KEY (location_id, image_key, epoch)
-        )
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO location_scores_window (location_id, image_key, epoch, score)
-        SELECT location_id, '', epoch, score FROM location_scores
-        """
-    )
-    connection.execute("DROP TABLE location_scores")
-    connection.execute("ALTER TABLE location_scores_window RENAME TO location_scores")
+    ensure_location_scores_schema(connection)
 
 
 def record_location_scores(data_dir: Path, rows: list[dict]) -> None:
@@ -614,21 +658,20 @@ def _snapshot(
     epochs_without_improve: int,
     freeze_mode: str,
 ) -> dict:
-    return {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(),
-        "epoch": epoch,
-        "step_in_epoch": step_in_epoch,
-        "global_step": global_step,
-        "opt_step": opt_step,
-        "best_val_iou": best_val_iou,
-        "epochs_without_improve": epochs_without_improve,
-        "freeze_mode": freeze_mode,
-        "n_param_groups": len(optimizer.param_groups),
-        "rng": capture_rng(),
-    }
+    return TrainSnapshot(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        epoch=epoch,
+        step_in_epoch=step_in_epoch,
+        global_step=global_step,
+        opt_step=opt_step,
+        best_val_iou=best_val_iou,
+        epochs_without_improve=epochs_without_improve,
+        freeze_mode=freeze_mode,
+        rng=capture_rng(),
+    ).as_checkpoint()
 
 
 def _save_last(run_dir: Path, payload: dict) -> None:
@@ -651,55 +694,23 @@ def _resolve_run_name(cfg: DictConfig, ckpt_root: Path, out_dir: Path) -> str:
 
 
 def _counts_by_volume(examples) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for ex in examples:
-        counts[ex.volume] = counts.get(ex.volume, 0) + 1
-    return dict(sorted(counts.items()))
+    return volume_counts(examples)
 
 
-def _write_run_inputs(
-    path: Path,
-    *,
-    run_name: str,
-    data_dir: Path,
-    volumes: list[str],
-    even_per_volume: bool,
-    split_path: Path,
-    usable_counts: dict[str, int],
-    train_counts: dict[str, int],
-    val_counts: dict[str, int],
-    seed: int,
-    train_fraction: float,
-    image_size: int,
-    batch_size: int,
-    num_epochs: int,
-    model_config: str,
-    pretrained: Path,
-) -> None:
+def _move_ignored_masks(volumes: list[str], data_dir: Path) -> None:
+    """Move rejected masks before a training index. A read-only index does not."""
+    for volume in volumes:
+        crops = annotation_crops_root(volume, data_dir)
+        moved = move_ignored_masks(crops, load_ignore_ids(crops))
+        if moved:
+            print(f"index {volume}: {moved} ignored mask(s) moved")
+
+
+def _write_run_inputs(path: Path, inputs: RunInputs) -> None:
     if path.is_file():
         return
-    payload = {
-        "run_name": run_name,
-        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "data_root": str(data_dir),
-        "volumes_requested": volumes,
-        "even_per_volume": even_per_volume,
-        "split_file": str(split_path),
-        "usable_per_volume": usable_counts,
-        "train_per_volume": train_counts,
-        "val_per_volume": val_counts,
-        "n_usable": sum(usable_counts.values()),
-        "n_train": sum(train_counts.values()),
-        "n_val": sum(val_counts.values()),
-        "seed": seed,
-        "train_fraction": train_fraction,
-        "image_size": image_size,
-        "batch_size": batch_size,
-        "num_epochs": num_epochs,
-        "model_config": model_config,
-        "pretrained_checkpoint": str(pretrained),
-    }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.write_text(json.dumps(inputs.as_json(created_utc=created), indent=2) + "\n", encoding="utf-8")
 
 
 def train_from_cfg(cfg: DictConfig) -> Path:
@@ -721,7 +732,13 @@ def train_from_cfg(cfg: DictConfig) -> Path:
 
 def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     set_seed(int(cfg.training.seed))
-    data_dir, out_dir, ckpt_root, checkpoint = _resolve_paths(cfg)
+    roots = _resolve_paths(cfg)
+    data_dir, out_dir, ckpt_root, checkpoint = (
+        roots.data,
+        roots.output,
+        roots.checkpoint,
+        roots.pretrained,
+    )
     run_name = _resolve_run_name(cfg, ckpt_root, out_dir)
     cfg.training.run_name = run_name
     run_dir = run_dir_for(run_name, ckpt_root=ckpt_root)
@@ -737,7 +754,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
 
     volumes = list(cfg.data.volumes)
     image_size = int(cfg.data.image_size)
+    _move_ignored_masks(volumes, data_dir)
     examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
+    ignore_stamps = ignore_list_stamps(volumes, data_dir)
+    missing_tiles = MissingTileFlag()
     examples, rejected_tiles = take_model_sized(examples, image_size)
     for ex in rejected_tiles:
         recorded = (
@@ -797,21 +817,23 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     print(f"val per volume: {val_counts}")
     _write_run_inputs(
         run_dir / "inputs.json",
-        run_name=run_name,
-        data_dir=data_dir,
-        volumes=volumes,
-        even_per_volume=even_applied,
-        split_path=split_path,
-        usable_counts=_counts_by_volume(examples),
-        train_counts=train_counts,
-        val_counts=val_counts,
-        seed=int(cfg.training.seed),
-        train_fraction=float(cfg.data.train_split),
-        image_size=int(cfg.data.image_size),
-        batch_size=int(cfg.training.batch_size),
-        num_epochs=int(cfg.training.num_epochs),
-        model_config=str(cfg.model.config),
-        pretrained=checkpoint,
+        RunInputs(
+            run_name=run_name,
+            data_dir=data_dir,
+            volumes=volumes,
+            even_per_volume=even_applied,
+            split_path=split_path,
+            usable_counts=_counts_by_volume(examples),
+            train_counts=train_counts,
+            val_counts=val_counts,
+            seed=int(cfg.training.seed),
+            train_fraction=float(cfg.data.train_split),
+            image_size=int(cfg.data.image_size),
+            batch_size=int(cfg.training.batch_size),
+            num_epochs=int(cfg.training.num_epochs),
+            model_config=str(cfg.model.config),
+            pretrained=checkpoint,
+        ),
     )
 
     batch_size = int(cfg.training.batch_size)
@@ -820,8 +842,12 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     persistent_workers = bool(cfg.training.persistent_workers)
     seed = int(cfg.training.seed)
     freeze_mode = str(cfg.model.freeze_mode)
-    train_ds = EMSegDataset(train_ex, split="train", image_size=image_size)
-    val_ds = EMSegDataset(val_ex, split="val", image_size=image_size)
+    train_ds = EMSegDataset(
+        train_ex, split="train", image_size=image_size, missing_tiles=missing_tiles
+    )
+    val_ds = EMSegDataset(
+        val_ex, split="val", image_size=image_size, missing_tiles=missing_tiles
+    )
 
     n_train = len(train_ds)
     batches_per_epoch = max(1, n_train // batch_size)
@@ -831,6 +857,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     warmup_steps = steps_per_epoch * int(cfg.lr_schedule.warmup_epochs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if enable_cudnn_benchmark(device):
+        print("cuDNN benchmark on (fixed image size)")
     model = build_em_sam2(cfg.model.config, str(checkpoint), device, train=True)
     configure_trainable_params(model, freeze_mode=freeze_mode)
     if bool(cfg.model.get("activation_checkpointing", True)):
@@ -881,6 +909,12 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         return run_dir
 
     writer = SummaryWriter(log_dir=str(run_dir / "tb"))
+    profiler = TbStepProfiler(
+        cfg,
+        run_dir / "tb",
+        device,
+        worker_name=run_name,
+    )
     val_dl = DataLoader(
         val_ds,
         batch_size=1,
@@ -956,6 +990,9 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         )
 
     num_epochs = int(cfg.training.num_epochs)
+    val_images_every = int(cfg.training.get("val_images_every_n_steps", 2500))
+    val_images_per_volume = max(0, int(cfg.training.get("val_images_per_volume", 3)))
+    last_val_image_step: int | None = None
     anomaly = StepAnomalyMonitor(
         warmup=int(OmegaConf.select(cfg, "training.warn_anomaly_warmup", default=30)),
         window=int(OmegaConf.select(cfg, "training.warn_anomaly_window", default=100)),
@@ -969,6 +1006,42 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         ),
     )
     for epoch in range(start_epoch, num_epochs):
+        stamps = ignore_list_stamps(volumes, data_dir)
+        if missing_tiles.take() or ignore_lists_newer(ignore_stamps, stamps):
+            _move_ignored_masks(volumes, data_dir)
+            examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
+            examples, rejected_tiles = take_model_sized(examples, image_size)
+            grown = include_new_keys(
+                split,
+                examples,
+                train_fraction=float(cfg.data.train_split),
+                seed=seed,
+            )
+            if grown != split:
+                split = grown
+                save_split(split, run_split)
+            train_ex, val_ex = split.partition(examples)
+            if not train_ex:
+                raise RuntimeError(
+                    f"inventory refresh left no training examples under {data_dir}"
+                )
+            train_ds.replace_examples(train_ex)
+            val_ds.replace_examples(val_ex)
+            n_train = len(train_ds)
+            batches_per_epoch = max(1, n_train // batch_size)
+            val_dl = DataLoader(
+                val_ds,
+                batch_size=1,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                collate_fn=collate_em,
+            )
+            ignore_stamps = ignore_list_stamps(volumes, data_dir)
+            print(
+                f"epoch {epoch}: inventory rebuilt, "
+                f"train={len(train_ex)} val={len(val_ex)}"
+            )
         step0 = start_step if epoch == start_epoch else 0
         indices = remaining_epoch_indices(
             n_train,
@@ -1027,6 +1100,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 writer.add_scalar("train/loss_focal", row["loss_focal"], row["global_step"])
                 writer.add_scalar("train/loss_dice", row["loss_dice"], row["global_step"])
                 writer.add_scalar("train/loss_iou", row["loss_iou"], row["global_step"])
+                if "loss_containment" in row:
+                    writer.add_scalar(
+                        "train/loss_containment", row["loss_containment"], row["global_step"]
+                    )
                 writer.add_scalar(
                     "train/lr", optimizer.param_groups[0]["lr"], row["global_step"]
                 )
@@ -1063,6 +1140,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     focal_weight=float(cfg.loss.focal_weight),
                     dice_weight=float(cfg.loss.dice_weight),
                     iou_weight=float(cfg.loss.iou_weight),
+                    points=points,
+                    labels=labels,
+                    containment_weight=float(cfg.loss.get("containment_weight", 0.0)),
+                    containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
                 )
                 loss = loss / accum
             scaler.scale(loss).backward()
@@ -1096,6 +1177,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             if (global_step + 1) % log_every == 0:
                 flush_losses()
             global_step += 1
+            profiler.step()
             if stop.stop:
                 save_now(epoch, step + 1)
                 progress.mark_stopped()
@@ -1108,24 +1190,60 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         flush_losses()
 
         if interrupted:
+            profiler.close()
             writer.close()
             print(f"Run directory: {run_dir}")
             return run_dir
 
-        if epoch % int(cfg.training.val_every_n_epochs) == 0:
+        if epoch % int(cfg.training.val_every_n_epochs) == 0 and len(val_ds) == 0:
+            progress.transcript(f"epoch {epoch}: no validation examples after inventory refresh")
+        elif epoch % int(cfg.training.val_every_n_epochs) == 0:
             progress.stage("validate", "start")
+            capture_overlays = (
+                val_images_per_volume
+                if due_for_val_images(global_step, last_val_image_step, val_images_every)
+                else 0
+            )
             try:
-                val_iou = run_validation(
+                val_iou, val_by_volume, overlays = run_validation(
                     model,
                     val_dl,
                     device,
                     image_size,
                     float(cfg.data.mask_threshold),
+                    overlays_per_volume=capture_overlays,
                 )
             finally:
                 progress.stage("validate", "end")
             writer.add_scalar("val/iou", val_iou, epoch)
-            progress.transcript(f"epoch {epoch} val IoU {val_iou:.4f}")
+            for volume, score in val_by_volume.items():
+                writer.add_scalar(f"val_iou/{volume}", score, epoch)
+            if overlays:
+                slots: dict[str, int] = {}
+                for volume, panel in overlays:
+                    slot = slots.get(volume, 0)
+                    slots[volume] = slot + 1
+                    writer.add_image(
+                        f"val_overlay/{volume}/{slot}",
+                        panel,
+                        global_step,
+                        dataformats="HWC",
+                    )
+                last_val_image_step = global_step
+                writer.flush()
+                progress.transcript(
+                    f"logged {len(overlays)} val overlays at step {global_step} "
+                    f"({', '.join(sorted(slots))})"
+                )
+            per_volume = ", ".join(
+                f"{name} {score:.4f}" for name, score in val_by_volume.items()
+            )
+            if per_volume:
+                progress.transcript(
+                    f"epoch {epoch} val IoU {val_iou:.4f} ({per_volume})"
+                )
+            else:
+                progress.transcript(f"epoch {epoch} val IoU {val_iou:.4f}")
             if val_iou > best_val_iou + min_delta:
                 best_val_iou = val_iou
                 epochs_without_improve = 0
@@ -1151,6 +1269,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             progress.transcript("stop requested after epoch save")
             break
 
+    profiler.close()
     writer.close()
     if progress.status == "stopped":
         print(f"Run directory: {run_dir}")
