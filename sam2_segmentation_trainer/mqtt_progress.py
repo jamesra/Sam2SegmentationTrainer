@@ -15,16 +15,21 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from sam2_segmentation_trainer.data.meta import SampleMeta, format_sample_label
+
 PIPELINE = "sam2-em-train"
 _RUN_ID_ENV = "NORNIR_RUN_ID"
 _LOAD_PUBLISHERS = object()
 
 
-def _sample_label(item: Mapping[str, Any]) -> str:
-    volume = item.get("volume", "?")
-    image_key = item.get("image_key", "?")
-    location_id = item.get("location_id", "?")
-    return f"{volume}/{image_key}#{location_id}"
+def _sample_label(item: Mapping[str, Any] | SampleMeta) -> str:
+    if isinstance(item, SampleMeta):
+        return item.label
+    return format_sample_label(
+        item.get("volume", "?"),
+        item.get("image_key", "?"),
+        item.get("location_id", "?"),
+    )
 
 
 def format_batch_samples(

@@ -18,6 +18,8 @@
   const HUE_KEY = "galleryOverlayHue";
   const VIS_KEY = "galleryOverlayVisibility";
   const SIZE_KEY = "galleryCardSize";
+  // Last training set, and the volume last opened inside each set.
+  const VIEW_KEY = "galleryView";
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
   const CACHE_MAX = 80;
 
@@ -35,8 +37,9 @@
     cropSize: 1024,
     cardSize: "large",
     settings: null,
-    maskGeneration: 0,
   };
+
+  const locationGenerations = new Map();
 
   const els = {
     who: document.getElementById("who"),
@@ -68,10 +71,126 @@
     viewerCues: document.getElementById("viewer-cues"),
   };
 
-  const GRID_GAP = 12;
+  const GRID_GAP = 4;
+  // Dark, low-saturation tones. Same location shares one; neighbors take another.
+  const LINK_TONES = [
+    [215, 18, 11],
+    [198, 20, 12],
+    [172, 16, 11],
+    [142, 14, 11],
+    [88, 12, 12],
+    [42, 16, 12],
+    [18, 18, 12],
+    [350, 14, 12],
+    [322, 14, 11],
+    [276, 16, 12],
+    [246, 14, 11],
+    [230, 10, 14],
+  ];
+
+  function linkToneIndex(locationId, used) {
+    const palette = LINK_TONES.length;
+    const hashed = Math.abs(Math.imul(Number(locationId) | 0, 2654435761) >>> 0) % palette;
+    if (!used.has(hashed)) {
+      return hashed;
+    }
+    for (let step = 1; step < palette; step += 1) {
+      const candidate = (hashed + step) % palette;
+      if (!used.has(candidate)) {
+        return candidate;
+      }
+    }
+    return hashed;
+  }
+
+  function assignLinkHues(cells) {
+    const at = new Map();
+    for (const cell of cells) {
+      at.set(`${cell.gr},${cell.gc}`, Number(cell.row.location_id));
+    }
+    const neighbors = new Map();
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    const order = [];
+    const seen = new Set();
+    for (const cell of cells) {
+      const id = Number(cell.row.location_id);
+      if (!neighbors.has(id)) {
+        neighbors.set(id, new Set());
+      }
+      if (!seen.has(id)) {
+        seen.add(id);
+        order.push(id);
+      }
+      for (const [dr, dc] of dirs) {
+        const other = at.get(`${cell.gr + dr},${cell.gc + dc}`);
+        if (other != null && other !== id) {
+          neighbors.get(id).add(other);
+        }
+      }
+    }
+    const assigned = new Map();
+    for (const id of order) {
+      const used = new Set();
+      for (const other of neighbors.get(id) || []) {
+        if (assigned.has(other)) {
+          used.add(assigned.get(other));
+        }
+      }
+      assigned.set(id, linkToneIndex(id, used));
+    }
+    for (const cell of cells) {
+      const tone = LINK_TONES[assigned.get(Number(cell.row.location_id))];
+      cell.linkH = tone[0];
+      cell.linkS = tone[1];
+      cell.linkL = tone[2];
+    }
+  }
+
+  // A shared grid edge of one location stays open so the ring is the group's perimeter.
+  function assignJoins(cells) {
+    const at = new Map();
+    for (const cell of cells) {
+      at.set(`${cell.gr},${cell.gc}`, Number(cell.row.location_id));
+    }
+    for (const cell of cells) {
+      const id = Number(cell.row.location_id);
+      cell.joinN = at.get(`${cell.gr - 1},${cell.gc}`) === id;
+      cell.joinE = at.get(`${cell.gr},${cell.gc + 1}`) === id;
+      cell.joinS = at.get(`${cell.gr + 1},${cell.gc}`) === id;
+      cell.joinW = at.get(`${cell.gr},${cell.gc - 1}`) === id;
+    }
+  }
+
+  function joinClasses(cell) {
+    const names = [];
+    if (cell.joinN) {
+      names.push("join-n");
+    }
+    if (cell.joinE) {
+      names.push("join-e");
+    }
+    if (cell.joinS) {
+      names.push("join-s");
+    }
+    if (cell.joinW) {
+      names.push("join-w");
+    }
+    if (!names.length) {
+      names.push("solo");
+    }
+    return names.join(" ");
+  }
   let rowStride = 0;
   let windowTop = -1;
-  let packMemo = { key: null, packed: null };
+  let packMemo = { packed: null, repackFrom: null };
+  let catalogEpoch = 0;
+  let tagEpoch = 0;
+  const catalogIndex = {
+    byLocation: new Map(),
+    visibleCards: [],
+    cardAt: new Map(),
+    stamp: "",
+  };
   let windowBottom = -1;
   let measuringRow = false;
   const overlayCache = new Map();
@@ -411,6 +530,16 @@
     return withSet(`/api/volumes/${encodeURIComponent(volume)}/file?path=${encodeURIComponent(rel)}`);
   }
 
+  function locationGen(locationId) {
+    return locationGenerations.get(Number(locationId)) || 0;
+  }
+
+  function mediaUrl(volume, rel, locationId) {
+    const url = fileUrl(volume, rel);
+    const gen = locationGen(locationId);
+    return gen ? `${url}&v=${gen}` : url;
+  }
+
   function vikingHref(row) {
     let template = state.config.vikingUrl || "";
     if (!template || template.includes("connectomes.utah.edu/connectome")) {
@@ -460,11 +589,41 @@
   }
 
   function syncCardSizeButtons() {
+    document.body.dataset.cardSize = state.cardSize;
     document.querySelectorAll("[data-card-size]").forEach((button) => {
       const on = button.dataset.cardSize === state.cardSize;
       button.classList.toggle("active", on);
       button.setAttribute("aria-pressed", on ? "true" : "false");
     });
+  }
+
+  function readView() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(VIEW_KEY) || "");
+      if (!parsed || typeof parsed !== "object") {
+        return { set: "", volumes: {} };
+      }
+      const volumes = {};
+      if (parsed.volumes && typeof parsed.volumes === "object") {
+        for (const [key, value] of Object.entries(parsed.volumes)) {
+          if (typeof value === "string") {
+            volumes[key] = value;
+          }
+        }
+      }
+      return { set: typeof parsed.set === "string" ? parsed.set : "", volumes };
+    } catch {
+      return { set: "", volumes: {} };
+    }
+  }
+
+  function rememberView(keepVolume) {
+    const view = readView();
+    view.set = state.trainingSet || "current";
+    if (keepVolume && state.volume) {
+      view.volumes[view.set] = state.volume;
+    }
+    localStorage.setItem(VIEW_KEY, JSON.stringify(view));
   }
 
   function loadCardSizePref() {
@@ -705,14 +864,14 @@
   }
 
   function windowHtml(row) {
-    const image = fileUrl(state.volume, tissueRelpath(row));
-    const mask = fileUrl(state.volume, row.mask_relpath);
+    const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+    const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
     const hue = overlayHue();
     const visibility = overlayVisibility();
     const status = row.ignored ? "rejected" : (row.approved ? "approved" : "");
     return `
       <div class="window">
-        <div class="composite waiting" data-loc="${row.location_id}" data-key="${row.image_key || ""}" data-size="${state.cardSize}" data-status="${status}" data-gen="${state.maskGeneration}" data-image="${image}" data-mask="${mask}" data-hue="${hue}" data-visibility="${visibility}">
+        <div class="composite waiting" data-loc="${row.location_id}" data-key="${row.image_key || ""}" data-size="${state.cardSize}" data-status="${status}" data-gen="${locationGen(row.location_id)}" data-image="${image}" data-mask="${mask}" data-hue="${hue}" data-visibility="${visibility}">
           <img class="jpeg pending" alt="" src="${image}">
           <canvas class="tint" aria-hidden="true"></canvas>
           <span class="media-state" aria-hidden="true"></span>
@@ -805,17 +964,23 @@
   function cellHtml(cell, rowOffset) {
     const row = cell.row;
     return `
-      <article class="card" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
+      <article class="card ${joinClasses(cell)}" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="--link-h:${cell.linkH};--link-s:${cell.linkS}%;--link-l:${cell.linkL}%;grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
         ${windowHtml(row)}
         ${windowActions(row)}
-        <div class="meta"><div class="meta-row"><div>${captionHtml(row)}</div></div></div>
-        ${refreshButton(row)}
+        <div class="meta"><div class="meta-row"><div>${captionHtml(row)}</div>${refreshButton(row)}</div></div>
       </article>`;
   }
 
+  const refreshMarks = new Map();
+
+  function refreshMarkClass(locationId) {
+    const mark = refreshMarks.get(Number(locationId));
+    return mark ? ` ${mark}` : "";
+  }
+
   function refreshButton(row) {
-    const icon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 6V3L8 7l4 4V8a4 4 0 1 1-4 4H6a6 6 0 1 0 6-6z"/></svg>`;
-    return `<button type="button" class="icon refresh review-only" data-act="refresh" data-id="${row.location_id}" title="Refresh mask from OData" aria-label="Refresh mask">${icon}</button>`;
+    const icon = `<svg class="arrow" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08a5.99 5.99 0 0 1-5.65 4c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>`;
+    return `<button type="button" class="icon refresh review-only${refreshMarkClass(row.location_id)}" data-act="refresh" data-id="${row.location_id}" title="Refresh mask from OData" aria-label="Refresh mask">${icon}</button>`;
   }
 
   function cardsFrom(rows) {
@@ -838,21 +1003,102 @@
   }
 
   function windowsForLocation(locationId) {
-    return state.rows.filter((row) => row.location_id === locationId);
+    return catalogIndex.byLocation.get(locationId)
+      || catalogIndex.byLocation.get(Number(locationId))
+      || [];
   }
 
-  function packGrid(cards, columns) {
+  function indexCatalog() {
+    const byLocation = new Map();
+    for (const row of state.rows) {
+      const list = byLocation.get(row.location_id);
+      if (list) {
+        list.push(row);
+      } else {
+        byLocation.set(row.location_id, [row]);
+      }
+    }
+    catalogEpoch += 1;
+    catalogIndex.byLocation = byLocation;
+    catalogIndex.stamp = "";
+    packMemo.packed = null;
+    packMemo.repackFrom = null;
+  }
+
+  function viewStamp() {
+    const views = [];
+    document.querySelectorAll("#view-classes input").forEach((input) => {
+      views.push(`${input.dataset.view}${input.checked ? 1 : 0}`);
+    });
+    return [
+      catalogEpoch,
+      tagEpoch,
+      els.type.value,
+      els.label.value,
+      els.z.value,
+      els.radius.value,
+      views.join(""),
+      state.sorts.map((item) => `${item.key}:${item.desc ? 1 : 0}`).join(","),
+      state.cropSize || 0,
+    ].join("\n");
+  }
+
+  function ensureVisibleCards() {
+    const stamp = viewStamp();
+    if (catalogIndex.stamp === stamp) {
+      return catalogIndex.visibleCards;
+    }
+    catalogIndex.visibleCards = cardsFrom(filtered());
+    catalogIndex.cardAt = new Map();
+    catalogIndex.visibleCards.forEach((windows, index) => {
+      catalogIndex.cardAt.set(windows[0].location_id, index);
+    });
+    catalogIndex.stamp = stamp;
+    packMemo.packed = null;
+    packMemo.repackFrom = null;
+    return catalogIndex.visibleCards;
+  }
+
+  function forgetVisibleLocation(locationId) {
+    const index = catalogIndex.cardAt.get(locationId) ?? catalogIndex.cardAt.get(Number(locationId));
+    if (index == null) {
+      return null;
+    }
+    catalogIndex.visibleCards.splice(index, 1);
+    catalogIndex.cardAt.delete(locationId);
+    catalogIndex.cardAt.delete(Number(locationId));
+    for (let cursor = index; cursor < catalogIndex.visibleCards.length; cursor += 1) {
+      catalogIndex.cardAt.set(catalogIndex.visibleCards[cursor][0].location_id, cursor);
+    }
+    packMemo.repackFrom = index;
+    return index;
+  }
+
+  function resetVisibleCards() {
+    catalogIndex.stamp = "";
+    packMemo.packed = null;
+    packMemo.repackFrom = null;
+  }
+
+  function packGrid(cards, columns, resume) {
+    const byLocation = catalogIndex.byLocation;
     const occupied = new Set();
     const cells = [];
+    const anchors = [];
     let scanFrom = 0;
     let maxRow = 0;
+    let starts = [0];
+    let anchorStarts = [0];
+    let startCard = 0;
 
     function isFree(row, col) {
       return col >= 0 && col < columns && row >= 0 && !occupied.has(row * columns + col);
     }
 
     function reserve(row, col) {
-      occupied.add(row * columns + col);
+      const slot = row * columns + col;
+      occupied.add(slot);
+      anchors.push(slot);
       if (row + 1 > maxRow) {
         maxRow = row + 1;
       }
@@ -873,78 +1119,107 @@
       }
     }
 
-    for (const visible of cards) {
-      const all = windowsForLocation(visible[0].location_id);
+    if (
+      resume
+      && resume.columns === columns
+      && resume.startCard > 0
+      && resume.anchors
+      && resume.anchorStarts
+      && resume.starts
+      && resume.cells
+    ) {
+      startCard = resume.startCard;
+      const keepAnchors = resume.anchorStarts[startCard] || 0;
+      for (let index = 0; index < keepAnchors; index += 1) {
+        const slot = resume.anchors[index];
+        anchors.push(slot);
+        occupied.add(slot);
+        const row = Math.floor(slot / columns);
+        if (row + 1 > maxRow) {
+          maxRow = row + 1;
+        }
+      }
+      scanFrom = 0;
+      while (occupied.has(scanFrom)) {
+        scanFrom += 1;
+      }
+      const keepCells = resume.starts[startCard] || 0;
+      for (let index = 0; index < keepCells; index += 1) {
+        cells.push(resume.cells[index]);
+      }
+      starts = resume.starts.slice(0, startCard + 1);
+      anchorStarts = resume.anchorStarts.slice(0, startCard + 1);
+    }
+
+    for (let index = startCard; index < cards.length; index += 1) {
+      const visible = cards[index];
+      const all = byLocation.get(visible[0].location_id) || visible;
       const offsets = shapeOffsets(all.length ? all : visible, columns);
       if (!offsets) {
         placeSingles(visible);
-        continue;
-      }
-      // Hide one window by leaving its cell empty. Sibling windows keep the
-      // shape, including a pair that would otherwise collapse into one tile.
-      const visibleKeys = new Set(visible.map((row) => row.image_key || ""));
-      const height = Math.max(...offsets.map((cell) => cell.dr)) + 1;
-      const limit = scanFrom + columns * (maxRow + height + 2);
-      let placed = false;
-      for (let anchor = scanFrom; anchor < limit; anchor += 1) {
-        const row = Math.floor(anchor / columns);
-        const col = anchor % columns;
-        if (!offsets.every((cell) => isFree(row + cell.dr, col + cell.dc))) {
-          continue;
-        }
-        for (const cell of offsets) {
-          const atRow = row + cell.dr;
-          const atCol = col + cell.dc;
-          if (visibleKeys.has(cell.row.image_key || "")) {
-            take(atRow, atCol, cell.row);
-          } else {
-            reserve(atRow, atCol);
+      } else {
+        // Hide one window by leaving its cell empty. Sibling windows keep the
+        // shape, including a pair that would otherwise collapse into one tile.
+        const visibleKeys = new Set(visible.map((row) => row.image_key || ""));
+        const height = Math.max(...offsets.map((cell) => cell.dr)) + 1;
+        const limit = scanFrom + columns * (maxRow + height + 2);
+        let placed = false;
+        for (let anchor = scanFrom; anchor < limit; anchor += 1) {
+          const row = Math.floor(anchor / columns);
+          const col = anchor % columns;
+          if (!offsets.every((cell) => isFree(row + cell.dr, col + cell.dc))) {
+            continue;
           }
+          for (const cell of offsets) {
+            const atRow = row + cell.dr;
+            const atCol = col + cell.dc;
+            if (visibleKeys.has(cell.row.image_key || "")) {
+              take(atRow, atCol, cell.row);
+            } else {
+              reserve(atRow, atCol);
+            }
+          }
+          placed = true;
+          break;
         }
-        placed = true;
-        break;
+        if (!placed) {
+          placeSingles(visible);
+        }
       }
-      if (!placed) {
-        placeSingles(visible);
-      }
+      starts.push(cells.length);
+      anchorStarts.push(anchors.length);
     }
-    return { columns, totalRows: Math.max(maxRow, 1), cells };
-  }
-
-  function packKey(cards, columns) {
-    let hash = 2166136261;
-    const mix = (value) => {
-      hash ^= value;
-      hash = Math.imul(hash, 16777619);
-    };
-    mix(columns);
-    mix(state.cropSize || 0);
-    mix(cards.length);
-    for (const windows of cards) {
-      mix(Number(windows[0].location_id));
-      for (const row of windows) {
-        const origin = windowOrigin(row);
-        mix(origin ? origin.x : 0);
-        mix(origin ? origin.y : 0);
-      }
-    }
-    return hash >>> 0;
+    const packed = { columns, totalRows: Math.max(maxRow, 1), cells, starts, anchors, anchorStarts };
+    assignLinkHues(packed.cells);
+    assignJoins(packed.cells);
+    return packed;
   }
 
   function layoutCards(cards) {
     const cardPx = cardPixelSize();
     const columns = columnCount(els.grid.clientWidth);
-    const key = packKey(cards, columns);
-    if (!packMemo.packed || packMemo.key !== key) {
-      packMemo = { key, packed: packGrid(cards, columns) };
-    }
     const packed = packMemo.packed;
-    const baseHeight = rowStride || (cardPx + 72);
+    const from = packMemo.repackFrom;
+    if (!packed || packed.columns !== columns || from === 0) {
+      packMemo.packed = packGrid(cards, columns, null);
+    } else if (from != null) {
+      packMemo.packed = packGrid(cards, columns, {
+        columns,
+        cells: packed.cells,
+        starts: packed.starts,
+        anchors: packed.anchors,
+        anchorStarts: packed.anchorStarts,
+        startCard: from,
+      });
+    }
+    packMemo.repackFrom = null;
+    const laid = packMemo.packed;
+    const baseHeight = rowStride || (cardPx + 20);
     const rowOffsets = [0];
-    for (let index = 0; index < packed.totalRows; index += 1) {
+    for (let index = 0; index < laid.totalRows; index += 1) {
       rowOffsets.push((index + 1) * baseHeight);
     }
-    return { cardPx, baseHeight, rowOffsets, ...packed };
+    return { cardPx, baseHeight, rowOffsets, ...laid };
   }
 
   function scrollToLocation() {
@@ -952,7 +1227,7 @@
     if (!text) {
       return;
     }
-    const cards = cardsFrom(filtered());
+    const cards = ensureVisibleCards();
     const layout = layoutCards(cards);
     const cell = layout.cells.find((item) => String(item.row.location_id) === text);
     if (!cell) {
@@ -962,12 +1237,6 @@
     }
     els.scroller.scrollTop = layout.rowOffsets[cell.gr] || 0;
     render(true);
-    els.grid.querySelectorAll(".card.located").forEach((node) => node.classList.remove("located"));
-    els.grid.querySelectorAll(".card").forEach((node) => {
-      if (node.dataset.id === text) {
-        node.classList.add("located");
-      }
-    });
     els.status.textContent = `Location ${text}.`;
   }
 
@@ -1012,9 +1281,18 @@
         continue;
       }
       node.hidden = false;
+      node.classList.toggle("join-n", Boolean(cell.joinN));
+      node.classList.toggle("join-e", Boolean(cell.joinE));
+      node.classList.toggle("join-s", Boolean(cell.joinS));
+      node.classList.toggle("join-w", Boolean(cell.joinW));
+      node.classList.toggle("solo", !(cell.joinN || cell.joinE || cell.joinS || cell.joinW));
       node.style.gridColumn = column;
       node.style.gridRow = row;
+      node.style.setProperty("--link-h", String(cell.linkH));
+      node.style.setProperty("--link-s", `${cell.linkS}%`);
+      node.style.setProperty("--link-l", `${cell.linkL}%`);
     }
+    applyLinkHot(linkHotId);
     if (!fresh.length) {
       return;
     }
@@ -1038,10 +1316,10 @@
     if (covers) {
       return;
     }
-    const rows = filtered();
-    const cards = cardsFrom(rows);
+    const cards = ensureVisibleCards();
     const layout = layoutCards(cards);
     const { cardPx, columns, baseHeight, totalRows, rowOffsets, cells } = layout;
+    els.grid.style.setProperty("--grid-gap", `${GRID_GAP}px`);
     els.grid.style.gridTemplateColumns = `repeat(${columns}, ${cardPx}px)`;
     els.grid.style.gridAutoRows = `${Math.max(1, baseHeight - GRID_GAP)}px`;
     els.spacer.style.height = `${rowOffsets[rowOffsets.length - 1] || baseHeight}px`;
@@ -1068,6 +1346,7 @@
       els.grid.innerHTML = visible.map((cell) => cellHtml(cell, first)).join("");
       paintVisible();
     }
+    applyLinkHot(linkHotId);
     const card = els.grid.querySelector(".card");
     if (!card) {
       return;
@@ -1077,7 +1356,7 @@
       measuringRow = true;
       rowStride = measured;
       windowTop = -1;
-      render(true);
+      render(true, reuse);
       measuringRow = false;
     }
   }
@@ -1090,11 +1369,13 @@
   async function loadCatalog(applyDefaultSort = false, preserveViewer = false) {
     if (!state.volume) {
       state.rows = [];
+      indexCatalog();
       render();
       return;
     }
     const payload = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/catalog`));
     state.rows = payload.rows || [];
+    indexCatalog();
     if (!preserveViewer && viewer.locationId && !state.rows.some((row) => String(row.location_id) === viewer.locationId && visibleClasses().has(reviewClass(row)))) {
       closeViewer();
     }
@@ -1121,9 +1402,7 @@
   const undoStack = [];
 
   function findStatusRow(locationId, imageKey) {
-    return state.rows.find((row) =>
-      Number(row.location_id) === Number(locationId) && (row.image_key || "") === (imageKey || "")
-    );
+    return windowsForLocation(locationId).find((row) => (row.image_key || "") === (imageKey || ""));
   }
 
   function applyLocalReview(row, act) {
@@ -1152,8 +1431,7 @@
   }
 
   function rowsForLocation(locationId) {
-    const id = Number(locationId);
-    return state.rows.filter((row) => Number(row.location_id) === id);
+    return windowsForLocation(locationId);
   }
 
   function rememberLocation(locationId) {
@@ -1174,6 +1452,38 @@
     }
   }
 
+  function paintReviewNow(locationId) {
+    const id = String(locationId);
+    const classes = visibleClasses();
+    els.grid.querySelectorAll(".card").forEach((node) => {
+      if (node.dataset.id !== id) {
+        return;
+      }
+      const row = findStatusRow(locationId, node.dataset.key || "");
+      if (!row || !classes.has(reviewClass(row))) {
+        node.remove();
+        return;
+      }
+      const approved = Boolean(row.approved) && !row.ignored;
+      const check = node.querySelector("button.icon.check");
+      if (!check) {
+        return;
+      }
+      check.classList.toggle("on", approved);
+      check.dataset.act = approved ? "unapprove" : "approve";
+      const label = approved ? "Approved" : "Approve";
+      check.title = label;
+      check.setAttribute("aria-label", label);
+      check.setAttribute("aria-pressed", approved ? "true" : "false");
+    });
+  }
+
+  function afterPaint() {
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    });
+  }
+
   async function mutate(act, locationId) {
     const rows = rowsForLocation(locationId);
     rememberLocation(locationId);
@@ -1185,9 +1495,19 @@
     for (const row of rows) {
       applyLocalReview(row, act);
     }
-    render(true, true);
+    const classes = visibleClasses();
+    const stays = rows.some((row) => classes.has(reviewClass(row)));
+    if (!stays) {
+      forgetVisibleLocation(locationId);
+    }
+    paintReviewNow(locationId);
+    const save = postReview(act, locationId, "");
+    if (!stays) {
+      await afterPaint();
+      render(true, true);
+    }
     try {
-      await postReview(act, locationId, "");
+      await save;
     } catch (error) {
       if (rows.length) {
         undoStack.pop();
@@ -1199,6 +1519,7 @@
           row.ignored = item.ignored;
         }
       }
+      resetVisibleCards();
       render(true, true);
       throw error;
     }
@@ -1237,6 +1558,7 @@
         row.approved = item.approved ? 1 : 0;
       }
     }
+    resetVisibleCards();
     render(true, true);
   }
 
@@ -1320,7 +1642,7 @@
   }
 
   function viewerCells() {
-    return layoutCards(cardsFrom(filtered())).cells;
+    return layoutCards(ensureVisibleCards()).cells;
   }
 
   function viewerCellIndex(cells) {
@@ -1601,19 +1923,59 @@
       dataset: {
         loc: String(row.location_id),
         key: row.image_key || "",
-        mask: fileUrl(state.volume, row.mask_relpath),
+        mask: mediaUrl(state.volume, row.mask_relpath, row.location_id),
         hue: overlayHue(),
         visibility: String(overlayVisibility()),
-        image: fileUrl(state.volume, tissueRelpath(row)),
+        image: mediaUrl(state.volume, tissueRelpath(row), row.location_id),
       },
     };
     return openViewer(node);
   }
 
+  let linkHotId = "";
+
+  function applyLinkHot(locationId) {
+    if (!locationId) {
+      return;
+    }
+    linkHotId = String(locationId);
+    els.grid.querySelectorAll(".card").forEach((node) => {
+      node.classList.toggle("link-hot", node.dataset.id === linkHotId);
+    });
+  }
+
+  function clearLinkHot() {
+    linkHotId = "";
+    els.grid.querySelectorAll(".card.link-hot").forEach((node) => node.classList.remove("link-hot"));
+  }
+
+  els.grid.addEventListener("pointerover", (event) => {
+    const card = event.target.closest(".card");
+    if (!card || card.dataset.id === linkHotId) {
+      return;
+    }
+    applyLinkHot(card.dataset.id);
+  });
+
+  els.grid.addEventListener("pointerout", (event) => {
+    const card = event.target.closest(".card");
+    if (!card) {
+      return;
+    }
+    const next = event.relatedTarget;
+    const nextCard = next && next.closest ? next.closest(".card") : null;
+    if (nextCard && nextCard.dataset.id === card.dataset.id && els.grid.contains(nextCard)) {
+      return;
+    }
+    clearLinkHot();
+  });
+
   els.grid.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-act]");
     if (button) {
       if (button.dataset.act === "refresh") {
+        event.preventDefault();
+        event.stopPropagation();
         refreshLocation(Number(button.dataset.id)).catch((error) => {
           els.status.textContent = error.message;
         });
@@ -1714,36 +2076,55 @@
     return event.code === "Space" || event.key === " ";
   }
 
+  let gridSpaceHidesMask = false;
+
+  function setGridMasksHidden(hidden) {
+    gridSpaceHidesMask = hidden;
+    document.body.classList.toggle("grid-hide-masks", hidden);
+  }
+
   window.addEventListener("keydown", (event) => {
     if (!els.viewer.hidden && (event.key === "Escape" || event.key === "Esc" || event.code === "Escape")) {
       event.preventDefault();
       closeViewer();
       return;
     }
-    if (els.viewer.hidden || !isSpaceKey(event) || zoomKeyTarget(event)) {
+    if (!isSpaceKey(event) || zoomKeyTarget(event)) {
+      return;
+    }
+    if (els.viewer.hidden) {
+      event.preventDefault();
+      if (!event.repeat) {
+        setGridMasksHidden(true);
+      }
       return;
     }
     event.preventDefault();
-    if (event.repeat || spaceHidesMask) {
+    if (event.repeat) {
       return;
     }
-    spaceHidesMask = true;
+    // A tap used to hide the mask only until keyup, which fired before the
+    // change was visible. Space toggles and stays until the next press.
+    spaceHidesMask = !spaceHidesMask;
     applyMaskVisibility();
   }, true);
   window.addEventListener("keyup", (event) => {
     if (!isSpaceKey(event)) {
       return;
     }
-    if (!els.viewer.hidden) {
+    if (gridSpaceHidesMask) {
       event.preventDefault();
+      setGridMasksHidden(false);
+      return;
     }
-    spaceHidesMask = false;
-    if (!els.viewer.hidden) {
-      applyMaskVisibility();
+    if (els.viewer.hidden) {
+      return;
     }
+    event.preventDefault();
   }, true);
   window.addEventListener("blur", () => {
     spaceHidesMask = false;
+    setGridMasksHidden(false);
     if (!els.viewer.hidden) {
       applyMaskVisibility();
     }
@@ -1867,6 +2248,7 @@
     tagTimer = window.setTimeout(() => {
       lookupTags().catch((error) => {
         state.filterNote = error.message.startsWith("tag") ? error.message : `tag lookup failed: ${error.message}`;
+        tagEpoch += 1;
         state.tagIds = new Set();
         render();
       });
@@ -1876,6 +2258,7 @@
   async function lookupTags() {
     const query = els.tags.value.trim();
     if (!query || !state.volume) {
+      tagEpoch += 1;
       state.tagIds = null;
       if (state.filterNote.startsWith("tag")) {
         state.filterNote = "";
@@ -1890,6 +2273,7 @@
       return;
     }
     state.filterNote = "";
+    tagEpoch += 1;
     state.tagIds = new Set(payload.structureIds || []);
     render();
   }
@@ -1907,6 +2291,7 @@
   });
   els.trainingSet.addEventListener("change", () => {
     state.trainingSet = els.trainingSet.value || "current";
+    rememberView(false);
     undoStack.length = 0;
     closeViewer();
     loadVolumes().catch((error) => {
@@ -1916,6 +2301,8 @@
   els.volume.addEventListener("change", () => {
     undoStack.length = 0;
     state.volume = els.volume.value;
+    rememberView(true);
+    tagEpoch += 1;
     state.tagIds = null;
     if (els.tags) {
       els.tags.value = "";
@@ -2018,6 +2405,11 @@
     els.volume.innerHTML = volumes
       .map((item) => `<option value="${item.name}">${item.name} · ${item.permission}</option>`)
       .join("");
+    const names = volumes.map((item) => item.name);
+    const preferred = readView().volumes[state.trainingSet];
+    state.volume = names.includes(preferred) ? preferred : (names[0] || "");
+    els.volume.value = state.volume;
+    rememberView(true);
     const volumeWrap = els.volume.closest(".filter");
     if (volumes.length <= 1) {
       els.volume.style.display = volumes.length ? "none" : "";
@@ -2026,7 +2418,6 @@
         volumeLabel.style.display = volumes.length ? "none" : "";
       }
     }
-    state.volume = volumes[0] ? volumes[0].name : "";
     if (!volumes.length) {
       state.rows = [];
       els.status.textContent = "No volumes with Read access in this training set.";
@@ -2056,8 +2447,9 @@
     const endpoint = document.getElementById("settings-odata");
     const exporter = document.getElementById("settings-exporter");
     const current = state.settings || {};
-    endpoint.value = current.odata || "";
-    endpoint.placeholder = current.placeholder || `https://websvc.codepharm.net/${state.volume}/OData`;
+    const fallback = current.placeholder || `https://websvc.codepharm.net/${state.volume}/OData`;
+    endpoint.value = (current.odata || fallback).trim();
+    endpoint.placeholder = fallback;
     exporter.value = current.exporter === "legacy" ? "legacy" : "tiled";
     dialog.hidden = false;
   }
@@ -2077,27 +2469,94 @@
       : "Cleared the endpoint for this volume.";
   }
 
+  function paintRefreshMark(locationId) {
+    const mark = refreshMarks.get(Number(locationId)) || "";
+    const id = String(locationId);
+    document.querySelectorAll(`button.refresh[data-id="${id}"]`).forEach((button) => {
+      button.classList.toggle("busy", mark === "busy");
+      button.classList.toggle("done", mark === "done");
+      button.disabled = mark === "busy";
+      button.title = mark === "busy" ? "Refreshing mask" : (mark === "done" ? "Mask refreshed" : "Refresh mask from OData");
+    });
+    const viewerButton = document.getElementById("viewer-refresh");
+    if (viewerButton && String(viewer.locationId) === id) {
+      viewerButton.classList.toggle("busy", mark === "busy");
+      viewerButton.classList.toggle("done", mark === "done");
+      viewerButton.disabled = mark === "busy";
+    }
+  }
+
+  function setRefreshMark(locationId, mark) {
+    const id = Number(locationId);
+    if (mark) {
+      refreshMarks.set(id, mark);
+    } else {
+      refreshMarks.delete(id);
+    }
+    paintRefreshMark(id);
+  }
+
+  function repaintLocation(locationId) {
+    const id = String(locationId);
+    const gen = String(locationGen(locationId));
+    const rows = state.rows.filter((row) => String(row.location_id) === id);
+    els.grid.querySelectorAll(`.composite[data-loc="${id}"]`).forEach((node) => {
+      const row = rows.find((item) => (item.image_key || "") === (node.dataset.key || ""));
+      if (!row) {
+        return;
+      }
+      const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+      const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
+      node.dataset.gen = gen;
+      node.dataset.image = image;
+      node.dataset.mask = mask;
+      node.classList.add("waiting");
+      const photo = node.querySelector("img.jpeg");
+      if (photo) {
+        photo.classList.add("pending");
+        photo.src = image;
+      }
+      paintComposite(node, paintToken);
+    });
+  }
+
   async function refreshLocation(locationId) {
+    const id = Number(locationId);
+    if (refreshMarks.get(id) === "busy") {
+      return;
+    }
     const openId = viewer.locationId;
     const openKey = viewer.imageKey;
-    const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/refresh-location`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ location_id: locationId }),
-    });
-    state.maskGeneration += 1;
-    await loadCatalog(false, true);
-    const count = (result.imageKeys || []).length;
-    els.status.textContent = count
-      ? `Refreshed ${count} crop mask${count === 1 ? "" : "s"}.`
-      : "No existing crop for that location.";
-    if (!els.viewer.hidden && String(openId) === String(locationId)) {
-      const row = state.rows.find((item) =>
-        String(item.location_id) === String(openId) && (item.image_key || "") === (openKey || "")
-      );
-      if (row) {
-        await openViewerFromRow(row);
+    setRefreshMark(id, "busy");
+    try {
+      const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/refresh-location`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ location_id: locationId }),
+      });
+      locationGenerations.set(id, locationGen(id) + 1);
+      setRefreshMark(id, "done");
+      repaintLocation(id);
+      const count = (result.imageKeys || []).length;
+      els.status.textContent = count
+        ? `Refreshed ${count} crop mask${count === 1 ? "" : "s"}.`
+        : "No existing crop for that location.";
+      if (!els.viewer.hidden && String(openId) === String(locationId)) {
+        const row = state.rows.find((item) =>
+          String(item.location_id) === String(openId) && (item.image_key || "") === (openKey || "")
+        );
+        if (row) {
+          await openViewerFromRow(row);
+        }
       }
+      window.setTimeout(() => {
+        if (refreshMarks.get(id) === "done") {
+          setRefreshMark(id, "");
+        }
+      }, 2500);
+    } catch (error) {
+      setRefreshMark(id, "");
+      throw error;
     }
   }
 
@@ -2120,7 +2579,10 @@
     state.config = await getJson("/api/config");
     const setsPayload = await getJson("/api/training-sets");
     const sets = setsPayload.sets && setsPayload.sets.length ? setsPayload.sets : ["current"];
-    state.trainingSet = sets.includes("current") ? "current" : sets[0];
+    const rememberedSet = readView().set;
+    state.trainingSet = sets.includes(rememberedSet)
+      ? rememberedSet
+      : (sets.includes("current") ? "current" : sets[0]);
     els.trainingSet.innerHTML = sets
       .map((name) => `<option value="${name}">${name}</option>`)
       .join("");

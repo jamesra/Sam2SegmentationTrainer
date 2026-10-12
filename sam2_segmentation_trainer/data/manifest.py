@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from annotation_crops.ignore import load_ignore_ids as _load_ignore_ids
+from annotation_crops.maskname import MaskName
+
 from sam2_segmentation_trainer.paths import DEFAULT_VOLUMES, annotation_crops_root, data_root
 
 
@@ -27,6 +30,82 @@ class CropExample:
     @property
     def image_ext(self) -> str:
         return self.image_path.suffix.lower()
+
+
+def ignore_list_stamps(
+    volumes: Sequence[str],
+    root: Path | None = None,
+) -> dict[str, int | None]:
+    """Nanosecond mtime of each volume's ``ignore.json``. None when the file is absent."""
+    base = root if root is not None else data_root()
+    stamps: dict[str, int | None] = {}
+    for volume in volumes:
+        path = annotation_crops_root(volume, base) / "ignore.json"
+        try:
+            stamps[volume] = path.stat().st_mtime_ns
+        except OSError:
+            stamps[volume] = None
+    return stamps
+
+
+def ignore_lists_newer(
+    previous: dict[str, int | None],
+    current: dict[str, int | None],
+) -> bool:
+    """True when an ``ignore.json`` mtime is newer than the last inventory read.
+
+    A missing list is not newer. A list that appears after the last read is.
+    """
+    for volume, stamp in current.items():
+        if stamp is None:
+            continue
+        prior = previous.get(volume)
+        if prior is None or stamp > prior:
+            return True
+    return False
+
+
+def load_ignore_ids(crops: Path) -> set[int]:
+    """Location ids in ``AnnotationCrops/ignore.json``. Missing or unreadable is none."""
+    return _load_ignore_ids(crops)
+
+
+def mask_location_id(name: str) -> int | None:
+    """Location id from ``{imageKey}_{locationId}.png``, or None."""
+    parsed = MaskName.parse(name)
+    if parsed is None:
+        return None
+    return parsed.location_id
+
+
+def move_ignored_masks(crops: Path, ignored_ids: set[int]) -> int:
+    """Move ``masks/*_{locationId}.png`` into ``ignored/`` for each listed id.
+
+    Training reads only ``masks/``. A later sync can put a rejected mask back
+    there; this puts it back beside the gallery's reject folder.
+    """
+    if not ignored_ids:
+        return 0
+    masks = crops / "masks"
+    if not masks.is_dir():
+        return 0
+    pending = [
+        entry
+        for entry in masks.iterdir()
+        if entry.is_file() and mask_location_id(entry.name) in ignored_ids
+    ]
+    if not pending:
+        return 0
+    ignored = crops / "ignored"
+    ignored.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for source in pending:
+        target = ignored / source.name
+        if target.is_file():
+            target.unlink()
+        source.replace(target)
+        moved += 1
+    return moved
 
 
 def list_filenames(folder: Path) -> set[str]:
@@ -53,12 +132,6 @@ def sidecar_ids_and_size(json_path: Path) -> tuple[set[int] | None, tuple[int, i
         except (TypeError, ValueError):
             size = None
     return ids, size
-
-
-def annotation_ids_in_json(json_path: Path) -> set[int] | None:
-    """Return annotation ids in a sidecar JSON, or None if unreadable."""
-    ids, _size = sidecar_ids_and_size(json_path)
-    return ids
 
 
 def take_model_sized(
@@ -94,17 +167,24 @@ def index_volumes(
         manifest = crops / "manifest.jsonl"
         if not manifest.is_file():
             raise FileNotFoundError(f"missing manifest: {manifest}")
-        vol_examples, n_skip_ann, n_skip_mask = _index_manifest(
-            volume, crops, manifest, skip_missing=skip_missing
+        ignored_ids = load_ignore_ids(crops)
+        vol_examples, n_skip_ann, n_skip_mask, n_skip_ignored = _index_manifest(
+            volume,
+            crops,
+            manifest,
+            skip_missing=skip_missing,
+            ignored_ids=ignored_ids,
         )
         examples.extend(vol_examples)
-        if skip_missing and (n_skip_ann or n_skip_mask):
-            parts: list[str] = []
-            if n_skip_ann:
-                parts.append(f"{n_skip_ann} missing from sidecar JSON")
-            if n_skip_mask:
-                parts.append(f"{n_skip_mask} missing raster mask")
-            print(f"index {volume}: skipped {'; '.join(parts)}")
+        parts: list[str] = []
+        if n_skip_ignored:
+            parts.append(f"{n_skip_ignored} ignored location(s)")
+        if skip_missing and n_skip_ann:
+            parts.append(f"{n_skip_ann} missing from sidecar JSON")
+        if skip_missing and n_skip_mask:
+            parts.append(f"{n_skip_mask} missing raster mask")
+        if parts:
+            print(f"index {volume}: {'; '.join(parts)}")
     return examples
 
 
@@ -114,12 +194,15 @@ def _index_manifest(
     manifest: Path,
     *,
     skip_missing: bool,
-) -> tuple[list[CropExample], int, int]:
+    ignored_ids: set[int] | None = None,
+) -> tuple[list[CropExample], int, int, int]:
     image_names = list_filenames(crops / "images") if skip_missing else None
     mask_names = list_filenames(crops / "masks") if skip_missing else None
     examples: list[CropExample] = []
     skipped_missing_ann = 0
     skipped_missing_mask = 0
+    skipped_ignored = 0
+    rejected = ignored_ids or set()
     with manifest.open(encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             text = line.strip()
@@ -153,6 +236,9 @@ def _index_manifest(
             height = None if tile_size is None else tile_size[1]
             for loc_id in location_ids:
                 loc_i = int(loc_id)
+                if loc_i in rejected:
+                    skipped_ignored += 1
+                    continue
                 if present_ids is not None and loc_i not in present_ids:
                     skipped_missing_ann += 1
                     continue
@@ -175,11 +261,18 @@ def _index_manifest(
                         height=height,
                     )
                 )
-    return examples, skipped_missing_ann, skipped_missing_mask
+    return examples, skipped_missing_ann, skipped_missing_mask, skipped_ignored
+
+
+def volume_counts(examples: Sequence[CropExample]) -> dict[str, int]:
+    """Example counts keyed by volume, sorted by volume name."""
+    counts: dict[str, int] = {}
+    for ex in examples:
+        counts[ex.volume] = counts.get(ex.volume, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def summarize_index(examples: Sequence[CropExample]) -> dict[str, object]:
-    by_volume: dict[str, int] = {}
     by_downsample: dict[int, int] = {}
     by_ext: dict[str, int] = {}
     tiles: dict[tuple[str, str], int] = {}
@@ -196,7 +289,6 @@ def summarize_index(examples: Sequence[CropExample]) -> dict[str, object]:
     missing_json = 0
     missing_raster = 0
     for ex in examples:
-        by_volume[ex.volume] = by_volume.get(ex.volume, 0) + 1
         by_downsample[ex.downsample] = by_downsample.get(ex.downsample, 0) + 1
         by_ext[ex.image_ext] = by_ext.get(ex.image_ext, 0) + 1
         tiles[(ex.volume, ex.image_key)] = tiles.get((ex.volume, ex.image_key), 0) + 1
@@ -213,10 +305,42 @@ def summarize_index(examples: Sequence[CropExample]) -> dict[str, object]:
         "n_examples": len(examples),
         "n_tiles": len(tiles),
         "multi_id_tiles": multi_id_tiles,
-        "by_volume": dict(sorted(by_volume.items())),
+        "by_volume": volume_counts(examples),
         "by_downsample": {str(k): v for k, v in sorted(by_downsample.items())},
         "by_image_ext": dict(sorted(by_ext.items())),
         "missing_image": missing_image,
         "missing_json": missing_json,
         "missing_raster_mask": missing_raster,
     }
+
+
+def examples_usable(examples: Sequence[CropExample]) -> list[CropExample]:
+    """Examples ``index_volumes(..., skip_missing=True)`` would keep.
+
+    *examples* is the skip-missing-false index, so this does not read the
+    manifest a second time. Ignored ids are already absent from that index.
+    """
+    listed: dict[Path, set[str]] = {}
+    sidecars: dict[Path, tuple[set[int] | None, tuple[int, int] | None]] = {}
+
+    def names(folder: Path) -> set[str]:
+        cached = listed.get(folder)
+        if cached is None:
+            cached = list_filenames(folder)
+            listed[folder] = cached
+        return cached
+
+    usable: list[CropExample] = []
+    for ex in examples:
+        image_names = names(ex.image_path.parent)
+        if ex.image_path.name not in image_names or ex.json_path.name not in image_names:
+            continue
+        if ex.json_path not in sidecars:
+            sidecars[ex.json_path] = sidecar_ids_and_size(ex.json_path)
+        present_ids, _tile_size = sidecars[ex.json_path]
+        if present_ids is None or ex.location_id not in present_ids:
+            continue
+        if ex.mask_path.name not in names(ex.mask_path.parent):
+            continue
+        usable.append(ex)
+    return usable

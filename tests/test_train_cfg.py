@@ -15,9 +15,16 @@ class TrainCfgTests(unittest.TestCase):
         self.assertTrue(bool(cfg.model.activation_checkpointing))
         self.assertTrue(bool(cfg.training.resume))
         self.assertEqual(int(cfg.training.save_every_n_steps), 200)
+        self.assertEqual(float(cfg.training.early_stopping_min_delta), 0.0)
         self.assertIsNone(cfg.training.checkpoint_dir)
         self.assertEqual(str(cfg.training.run_name), "auto")
         self.assertFalse(bool(cfg.data.even_per_volume))
+        self.assertTrue(bool(cfg.training.profiler.enabled))
+        self.assertEqual(int(cfg.training.profiler.active), 3)
+        self.assertEqual(int(cfg.training.profiler.repeat), 1)
+        self.assertFalse(bool(cfg.training.profiler.with_stack))
+        self.assertEqual(int(cfg.training.val_images_every_n_steps), 2500)
+        self.assertEqual(int(cfg.training.val_images_per_volume), 3)
 
     def test_next_run_name_increments(self) -> None:
         from tempfile import TemporaryDirectory
@@ -82,6 +89,14 @@ class TrainCfgTests(unittest.TestCase):
         self.assertTrue(bool(cfg.training.benchmark))
         self.assertEqual(int(cfg.training.benchmark_steps), 50)
 
+    def test_val_image_cadence(self) -> None:
+        from sam2_segmentation_trainer.train import due_for_val_images
+
+        self.assertFalse(due_for_val_images(10_000, None, 0))
+        self.assertTrue(due_for_val_images(100, None, 2500))
+        self.assertFalse(due_for_val_images(3000, 1000, 2500))
+        self.assertTrue(due_for_val_images(3500, 1000, 2500))
+
     def test_project_full_run(self) -> None:
         from sam2_segmentation_trainer.train import format_duration, project_full_run
 
@@ -97,6 +112,22 @@ class TrainCfgTests(unittest.TestCase):
         self.assertEqual(projected["val_pass_s"], 10.0)
         self.assertEqual(projected["full_run_s"], 15 * 100.0 + 15 * 10.0)
         self.assertEqual(format_duration(3661), "1h 1m 1s")
+
+    def test_cudnn_benchmark_skips_cpu(self) -> None:
+        import torch
+
+        from sam2_segmentation_trainer.train import enable_cudnn_benchmark
+
+        previous = bool(torch.backends.cudnn.benchmark)
+        try:
+            torch.backends.cudnn.benchmark = False
+            self.assertFalse(enable_cudnn_benchmark(torch.device("cpu")))
+            self.assertFalse(bool(torch.backends.cudnn.benchmark))
+            if torch.cuda.is_available():
+                self.assertTrue(enable_cudnn_benchmark(torch.device("cuda")))
+                self.assertTrue(bool(torch.backends.cudnn.benchmark))
+        finally:
+            torch.backends.cudnn.benchmark = previous
 
     def test_activation_checkpointing_wraps_blocks(self) -> None:
         import torch

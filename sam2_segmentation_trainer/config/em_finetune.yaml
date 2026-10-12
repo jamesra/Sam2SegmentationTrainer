@@ -18,11 +18,34 @@ training:
   gradient_accumulation_steps: 4
   gradient_clip: 1.0
   log_every_n_steps: 50
+  # torch.profiler traces for the TensorBoard PYTORCH_PROFILER tab.
+  # One short window per process, then the profiler stays idle.
+  # The trace appears after skip_first + wait + warmup + active batches.
+  # repeat is the number of windows per process; 0 turns the profiler off.
+  profiler:
+    enabled: true
+    skip_first: 5
+    wait: 1
+    warmup: 1
+    active: 3
+    repeat: 1
+    record_shapes: true
+    profile_memory: true
+    with_stack: false
+    with_modules: true
   val_every_n_epochs: 1
+  # TensorBoard Images: a few val samples per volume present in the loader.
+  # Strip is input | ground truth | prediction (red = extra, blue = missed).
+  # First validation of a process logs, then again after this many train steps.
+  # 0 disables.
+  val_images_every_n_steps: 2500
+  val_images_per_volume: 3
   save_every_n_epochs: 3
   save_every_n_steps: 200
   resume: true
   early_stopping_patience: 5
+  # 0: any val IoU increase resets patience. Pass training.early_stopping_min_delta=0.0005 to require a larger gain.
+  early_stopping_min_delta: 0
   # MQTT warn when a step is much slower / higher-loss than the recent median.
   warn_anomaly_warmup: 30
   warn_anomaly_window: 100
@@ -49,6 +72,11 @@ loss:
   focal_weight: 20.0
   dice_weight: 1.0
   iou_weight: 1.0
+  # Penalizes predicting background at prompted point locations (BCE toward 1
+  # inside a disk of containment_radius pixels around each positive point).
+  # 0 disables the term.
+  containment_weight: 0.0
+  containment_radius: 8.0
 
 data:
   root: null

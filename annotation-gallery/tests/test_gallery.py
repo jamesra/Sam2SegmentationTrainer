@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import zipfile
@@ -151,8 +152,11 @@ def test_catalog_loss_is_latest_score_or_null(httpd: tuple[str, int], registry: 
         "'images/RC2_18_D1_X0_Y0.png', 'masks/RC2_18_D1_X0_Y0_99.png', 0)"
     )
     connection.executemany(
-        "INSERT INTO location_scores (location_id, epoch, score) VALUES (?, ?, ?)",
-        [(42, 1, 1.5), (42, 3, 0.25)],
+        "INSERT INTO location_scores (location_id, image_key, epoch, score) VALUES (?, ?, ?, ?)",
+        [
+            (42, "RC2_17_D1_X0_Y0", 1, 1.5),
+            (42, "RC2_17_D1_X0_Y0", 3, 0.25),
+        ],
     )
     connection.commit()
     connection.close()
@@ -161,6 +165,50 @@ def test_catalog_loss_is_latest_score_or_null(httpd: tuple[str, int], registry: 
     by_id = {row["location_id"]: row for row in catalog["rows"]}
     assert by_id[42]["loss"] == 0.25
     assert by_id[99]["loss"] is None
+
+
+def test_catalog_loss_is_per_window_with_legacy_fallback(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE locations ("
+        "location_id INTEGER NOT NULL, z INTEGER NOT NULL, structure_id INTEGER, "
+        "structure_label TEXT, type_id INTEGER, type_name TEXT, radius REAL, "
+        "image_key TEXT NOT NULL, image_relpath TEXT, mask_relpath TEXT, "
+        "ignored INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (location_id, image_key))"
+    )
+    connection.execute(
+        "CREATE TABLE location_scores ("
+        "location_id INTEGER NOT NULL, epoch INTEGER NOT NULL, score REAL NOT NULL, "
+        "PRIMARY KEY (location_id, epoch))"
+    )
+    connection.executemany(
+        "INSERT INTO locations (location_id, z, structure_id, structure_label, "
+        "type_id, type_name, radius, image_key, image_relpath, mask_relpath, ignored) "
+        "VALUES (?, 17, 7, 'soma', 1, 'Cell', 12.5, ?, ?, ?, 0)",
+        [
+            (42, "win-a", "images/a.png", "masks/a_42.png"),
+            (42, "win-b", "images/b.png", "masks/b_42.png"),
+            (99, "win-c", "images/c.png", "masks/c_99.png"),
+        ],
+    )
+    connection.execute(
+        "INSERT INTO location_scores (location_id, epoch, score) VALUES (42, 3, 0.25)"
+    )
+    connection.commit()
+    connection.close()
+    connection = connect(crops)
+    connection.execute(
+        "INSERT INTO location_scores (location_id, image_key, epoch, score) "
+        "VALUES (42, 'win-a', 4, 1.5)"
+    )
+    connection.commit()
+    connection.close()
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key["win-a"]["loss"] == 1.5
+    assert by_key["win-b"]["loss"] == 0.25
+    assert by_key["win-c"]["loss"] is None
 
 
 def test_training_sets_defaults_to_current_outside_a_version_tree(httpd: tuple[str, int]) -> None:
@@ -219,6 +267,7 @@ def test_location_search_scrolls_and_sort_stacks() -> None:
     html = (GALLERY_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert 'id="locate"' in html
+    assert 'href="https://tensor.codepharm.net"' in html
     assert "Other cards stay in the list." in html
     assert "scrollToLocation" in js
     assert '["structure_id", "Structure ID"]' in js
@@ -239,12 +288,18 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "function windowsForLocation" in js
     mutate = js.split("async function mutate", 1)[1].split("async function applyRememberedStatus", 1)[0]
     assert "loadCatalog(" not in mutate
+    assert "paintReviewNow(locationId)" in mutate
+    assert "forgetVisibleLocation(locationId)" in mutate
+    assert "await afterPaint()" in mutate
     assert "render(true, true)" in mutate
     assert "function reconcileGrid" in js
     assert 'postReview(act, locationId, "")' in mutate
     assert ".card[hidden]" in css
     assert "visibleKeys" in js
-    pack = js.split("function packGrid", 1)[1].split("function packKey", 1)[0]
+    pack = js.split("function packGrid", 1)[1].split("function layoutCards", 1)[0]
+    assert "byLocation" in pack
+    assert "anchorStarts" in pack
+    assert "windowsForLocation(" not in pack
     assert "windows[0]" not in pack
     assert "function windowOrigin" in js
     assert "Math.floor(dc / columns)" in js
@@ -253,8 +308,92 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "loadParts" not in opener
     assert 'closest(".card")' in js
     assert "width: 32px" in css
+    assert "rgba(35, 40, 51, 0.25)" in css
+    assert "rgba(20, 83, 45, 0.25)" in css
+    assert "Do not change this without explicit permission" in css
+    assert 'document.body.dataset.cardSize = state.cardSize' in js
+    assert 'const VIEW_KEY = "galleryView"' in js
+    assert "sets.includes(rememberedSet)" in js
+    assert "readView().volumes[state.trainingSet]" in js
+    assert 'body[data-card-size="small"] .card > .icon.check' in css
+    assert "scale(0.75)" in css
+    assert "const GRID_GAP = 4" in js
+    assert "setGridMasksHidden" in js
+    assert "grid-hide-masks" in css
+    assert "function assignLinkHues" in js
+    assert "function assignJoins" in js
+    assert "join-n" in js
+    assert "join-n" in css
+    assert "border-top-width: 0" in css
+    assert 'names.push("solo")' in js
+    assert ".card.solo::after" in css
+    assert "content: none" in css.split(".card.solo::after", 1)[1].split("}", 1)[0]
+    assert "function linkToneIndex" in js
+    assert "link-hot" in js
+    assert "link-hot" in css
+    assert "refreshMarks" in js
+    refresh = js.split("async function refreshLocation", 1)[1].split('document.getElementById("volume-settings")', 1)[0]
+    assert "loadCatalog(" not in refresh
+    assert "maskGeneration" not in js
+    assert "locationGenerations.set" in refresh
+    assert "repaintLocation(id)" in refresh
+    assert "button.refresh.busy" in css
+    assert "cardPx + 20" in js
+    assert "align-self: start" in css
     assert 'content: "Generating thumbnail"' in css
     assert 'content: "Image missing"' in css
+
+
+def test_ignore_keeps_a_mask_for_every_window(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    keys = [
+        "RC2_17_D1_X0-1024_Y0-1024",
+        "RC2_17_D1_X1024-2048_Y0-1024",
+    ]
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE locations ("
+        "location_id INTEGER NOT NULL, z INTEGER NOT NULL, structure_id INTEGER, "
+        "structure_label TEXT, type_id INTEGER, type_name TEXT, radius REAL, "
+        "image_key TEXT NOT NULL, image_relpath TEXT, mask_relpath TEXT, "
+        "ignored INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (location_id, image_key))"
+    )
+    connection.executemany(
+        "INSERT INTO locations (location_id, z, structure_id, structure_label, "
+        "type_id, type_name, radius, image_key, image_relpath, mask_relpath, ignored) "
+        "VALUES (?, 17, 7, 'soma', 1, 'Cell', 12.5, ?, ?, ?, 0)",
+        [
+            (7, key, f"images/{key}.png", f"masks/{key}_7.png")
+            for key in keys
+        ],
+    )
+    connection.commit()
+    connection.close()
+    masks = crops / "masks"
+    masks.mkdir()
+    for key in keys:
+        (masks / f"{key}_7.png").write_bytes(b"png")
+    ignore_location(crops, 7)
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key[keys[0]]["mask_relpath"] == f"ignored/{keys[0]}_7.png"
+    assert by_key[keys[1]]["mask_relpath"] == f"ignored/{keys[1]}_7.png"
+    assert (crops / "ignored" / f"{keys[0]}_7.png").is_file()
+    assert (crops / "ignored" / f"{keys[1]}_7.png").is_file()
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "UPDATE locations SET mask_relpath = ? WHERE location_id = 7",
+        [f"ignored/{keys[0]}_7.png"],
+    )
+    connection.commit()
+    connection.close()
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key[keys[1]]["mask_relpath"] == f"ignored/{keys[1]}_7.png"
+    restore_location(crops, 7)
+    by_key = {row["image_key"]: row for row in list_catalog_rows(crops)}
+    assert by_key[keys[0]]["mask_relpath"] == f"masks/{keys[0]}_7.png"
+    assert by_key[keys[1]]["mask_relpath"] == f"masks/{keys[1]}_7.png"
+    assert (crops / "masks" / f"{keys[1]}_7.png").is_file()
 
 
 def test_location_review_covers_every_window(tmp_path: Path) -> None:
@@ -561,6 +700,69 @@ def test_refresh_drops_thumbnails_for_existing_crops(
     assert payload["imageKeys"] == ["RC2_17_D1_X0_Y0"]
     assert not thumb.is_file()
     assert image.read_bytes() == image_before
+
+
+def test_refresh_uses_the_default_odata_endpoint(
+    httpd: tuple[str, int],
+    registry: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("server.nornir_buildmanager_root", lambda: registry)
+    seen: list[str] = []
+
+    def fake_fetch(url: str, location_id: int) -> dict:
+        seen.append(url)
+        return {"ID": location_id, "MosaicShape": {}, "LastModified": "2022-01-01T00:00:00Z"}
+
+    monkeypatch.setattr("server.fetch_odata_location", fake_fetch)
+    monkeypatch.setattr("server.refresh_location", lambda *_args, **_kwargs: ["RC2_17_D1_X0_Y0"])
+    status, payload = _request(
+        httpd,
+        "POST",
+        "/api/volumes/RC2/refresh-location",
+        body=json.dumps({"location_id": 42}).encode(),
+        bearer="review",
+    )
+    assert status == 200
+    assert payload["imageKeys"] == ["RC2_17_D1_X0_Y0"]
+    assert seen == ["https://websvc.codepharm.net/RC2/OData"]
+
+
+def test_mask_refresh_import_skips_the_export_pipeline() -> None:
+    root = Path(r"D:\src\git\nornir\nornir-buildmanager")
+    if not (root / "nornir_buildmanager" / "operations" / "segmentationtraining" / "maskrefresh.py").is_file():
+        pytest.skip("nornir-buildmanager checkout is not available")
+    gallery = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from refresh import load_mask_refresh
+before = set(sys.modules)
+load_mask_refresh(Path(sys.argv[2]))
+added = set(sys.modules) - before
+forbidden = (
+    "nornir_imageregistration",
+    "nornir_pools",
+    "nornir_shared",
+    "nornir_buildmanager.build",
+    "nornir_buildmanager.operations.segmentationtraining.pipeline",
+    "nornir_buildmanager.operations.segmentationtraining.update",
+    "nornir_buildmanager.operations.segmentationtraining.stitch",
+    "nornir_buildmanager.operations.segmentationtraining.ingest",
+    "nornir_buildmanager.operations.segmentationtraining.catalog",
+)
+bad = [name for name in sorted(added) if name in forbidden or any(name.startswith(item + ".") for item in forbidden)]
+if bad:
+    raise SystemExit("imported " + ", ".join(bad))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(gallery), str(root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 def test_path_traversal_rejected(httpd: tuple[str, int], registry: Path) -> None:

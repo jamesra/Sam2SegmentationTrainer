@@ -39,6 +39,22 @@ h1 {
   font-size: 1.1rem;
 }
 
+.title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.site-link {
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.site-link:hover {
+  text-decoration: underline;
+}
+
 .who { margin: 0; color: var(--muted); }
 
 .filters {
@@ -155,8 +171,28 @@ button.reverse.active,
   align-self: flex-start;
 }
 
-.card.located {
-  outline: 2px solid var(--accent);
+.card.join-n {
+  border-top-color: transparent;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.card.join-e {
+  border-right-color: transparent;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-s {
+  border-bottom-color: transparent;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-w {
+  border-left-color: transparent;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
 }
 
 .status {
@@ -224,59 +260,143 @@ button.reverse.active,
 .spacer { width: 100%; }
 
 .grid {
+  --ring-width: 2px;
+  --grid-gap: 4px;
   position: absolute;
   left: 16px;
   right: 16px;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(512px, 512px));
-  gap: 12px;
+  gap: var(--grid-gap);
 }
 
 .card {
+  --link-h: 216;
+  --link-s: 18%;
+  --link-l: 8%;
+  --ring: hsl(var(--link-h) 78% 62%);
   position: relative;
-  background: var(--card);
-  border: 1px solid #2a313c;
+  align-self: start;
+  background: hsl(var(--link-h) var(--link-s) var(--link-l));
+  border: 1px solid hsl(var(--link-h) calc(var(--link-s) + 6%) calc(var(--link-l) + 8%));
   border-radius: 8px;
-  overflow: hidden;
+  overflow: visible;
   cursor: pointer;
+  transition: background 80ms linear, border-color 80ms linear, filter 80ms linear;
+}
+
+/* Side borders run across the grid gap so tiles of one location share one perimeter. */
+.card::after {
+  content: "";
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  top: calc(-1 * var(--ring-width));
+  right: calc(-1 * var(--ring-width));
+  bottom: calc(-1 * var(--ring-width));
+  left: calc(-1 * var(--ring-width));
+  border: var(--ring-width) solid var(--ring);
+  border-radius: calc(8px + var(--ring-width));
+}
+
+.card.join-n::after {
+  top: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-top-width: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.card.join-e::after {
+  right: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-right-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-s::after {
+  bottom: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-bottom-width: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.card.join-w::after {
+  left: calc(-1 * (var(--ring-width) + var(--grid-gap)));
+  border-left-width: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.grid .card.link-hot {
+  background: hsl(var(--link-h) var(--link-s) calc(var(--link-l) + 7%));
+  border-color: hsl(var(--link-h) calc(var(--link-s) + 10%) calc(var(--link-l) + 16%));
+  --ring: hsl(var(--link-h) 85% 72%);
+  filter: brightness(1.12);
+}
+
+/* A location that occupies one cell has no shared perimeter, so it stays unboxed. */
+.card.solo,
+.grid .card.solo.link-hot {
+  border-color: transparent;
+}
+
+.card.solo::after {
+  content: none;
 }
 
 .card[hidden] {
   display: none;
 }
 
-.card > button.refresh,
+.card button.refresh,
 #viewer-refresh {
-  display: none;
-  width: 32px;
-  height: 32px;
+  display: inline-flex;
   border-radius: 50%;
   z-index: 4;
 }
 
-body.can-refresh .card > button.refresh,
-body.can-refresh #viewer-refresh {
-  display: inline-flex;
+.meta button.refresh {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-left: auto;
+  padding: 0;
+  background: transparent;
+  color: #f8fafc;
 }
 
-.card > button.refresh {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
+.meta button.refresh svg {
+  width: 16px;
+  height: 16px;
+}
+
+button.refresh .mark { display: none; }
+
+button.refresh.busy .arrow {
+  animation: refresh-spin 0.8s linear infinite;
+}
+
+button.refresh.done {
+  color: #3dd68c;
+}
+
+button.refresh.done .arrow { display: none; }
+
+button.refresh.done .mark { display: block; }
+
+@keyframes refresh-spin {
+  to { transform: rotate(-360deg); }
 }
 
 #viewer-refresh {
-  position: absolute;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 40px;
-  height: 40px;
-}
-
-#viewer-refresh svg {
-  width: 22px;
-  height: 22px;
+  align-self: flex-start;
+  flex: 0 0 auto;
+  width: 112px;
+  height: 112px;
+  margin-top: 4px;
+  padding: 0;
+  border-radius: 4px;
+  background: rgba(35, 40, 51, 0.25);
 }
 
 #settings-dialog label {
@@ -296,6 +416,19 @@ body.can-refresh #viewer-refresh {
   aspect-ratio: 1;
   background: #808080;
   cursor: pointer;
+  overflow: hidden;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+
+.card.join-n .composite,
+.card.join-w .composite {
+  border-top-left-radius: 0;
+}
+
+.card.join-n .composite,
+.card.join-e .composite {
+  border-top-right-radius: 0;
 }
 
 .assembly-grid {
@@ -311,6 +444,9 @@ body.can-refresh #viewer-refresh {
   position: relative;
 }
 
+/* Card corner buttons and the zoom approve, reject, refresh, and close buttons stay 75% transparent.
+   Do not change this without explicit permission.
+   #232833 and the approved green are drawn at 25% opacity. */
 .card > .icon.check,
 .card > .icon.trash,
 .card > .icon.plus {
@@ -320,6 +456,7 @@ body.can-refresh #viewer-refresh {
   padding: 8px;
   font-size: 32px;
   line-height: 1;
+  background: rgba(35, 40, 51, 0.25);
 }
 
 .card > .icon.check {
@@ -336,6 +473,17 @@ body.can-refresh #viewer-refresh {
 .card > .icon.plus svg {
   width: 32px;
   height: 32px;
+}
+
+body[data-card-size="small"] .card > .icon.check {
+  transform: scale(0.75);
+  transform-origin: top left;
+}
+
+body[data-card-size="small"] .card > .icon.trash,
+body[data-card-size="small"] .card > .icon.plus {
+  transform: scale(0.75);
+  transform-origin: top right;
 }
 
 .composite .media-state {
@@ -371,9 +519,13 @@ body.can-refresh #viewer-refresh {
   content: "Image missing";
 }
 
-.card > .icon.check.on,
+.card > .icon.check.on {
+  background: rgba(20, 83, 45, 0.25);
+  color: #bbf7d0;
+}
+
 .viewer-act.check.on {
-  background: #14532d;
+  background: rgba(20, 83, 45, 0.25);
   color: #bbf7d0;
 }
 
@@ -419,10 +571,27 @@ body.can-refresh #viewer-refresh {
   transition: opacity 120ms ease;
 }
 
+body.grid-hide-masks .grid canvas.tint {
+  opacity: 0;
+}
+
 .meta {
-  padding: 8px;
-  display: grid;
-  gap: 4px;
+  padding: 1px 6px 2px;
+  font-size: 12px;
+  line-height: 1.2;
+  overflow: hidden;
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+}
+
+.card.join-s .meta,
+.card.join-w .meta {
+  border-bottom-left-radius: 0;
+}
+
+.card.join-s .meta,
+.card.join-e .meta {
+  border-bottom-right-radius: 0;
 }
 
 .meta a { color: var(--accent); }
@@ -435,6 +604,7 @@ body.can-refresh #viewer-refresh {
 }
 
 .meta-row > div {
+  flex: 1 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -549,10 +719,22 @@ button.plus { color: var(--ok); }
 }
 
 #viewer-close {
-  font-size: 1.875rem;
-  line-height: 1;
-  padding: 6px 14px;
   align-self: flex-start;
+  flex: 0 0 auto;
+  width: 112px;
+  height: 112px;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(35, 40, 51, 0.25);
+  color: var(--ink);
+  font-size: 4rem;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .viewer-stage {
@@ -583,7 +765,7 @@ button.plus { color: var(--ok); }
   position: relative;
 }
 
-.viewer-act {
+button.viewer-act {
   position: relative;
   z-index: 4;
   flex: 0 0 auto;
@@ -591,10 +773,13 @@ button.plus { color: var(--ok); }
   width: 112px;
   height: 112px;
   margin-top: 4px;
+  padding: 0;
   font-size: 4rem;
+  background: rgba(35, 40, 51, 0.25);
 }
 
-#viewer-reject svg {
+#viewer-reject svg,
+#viewer-refresh svg {
   width: 4rem;
   height: 4rem;
 }
@@ -647,7 +832,7 @@ button.plus { color: var(--ok); }
 }
 
 #viewer-approve.on {
-  background: #14532d;
+  background: rgba(20, 83, 45, 0.25);
   color: #bbf7d0;
 }
 
@@ -712,15 +897,15 @@ button.plus { color: var(--ok); }
 body.no-review button.trash,
 body.no-review button.plus,
 body.no-review button.check,
-body.no-review .card > button.refresh,
+body.no-review .card button.refresh,
 body.no-review #viewer-refresh,
 body.no-review .review-only {
   display: none;
 }
 
 .badge {
-  display: inline-block;
-  padding: 1px 6px;
+  display: inline;
+  padding: 0 4px;
   border-radius: 999px;
   background: #232833;
   color: var(--muted);

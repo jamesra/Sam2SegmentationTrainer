@@ -10,6 +10,11 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
+import crops_path  # noqa: F401
+from annotation_crops.ignore import load_ignore_ids as _load_ignore_ids
+from annotation_crops.ignore import save_ignore_ids as _save_ignore_ids
+from annotation_crops.scores import ensure_location_scores_schema
+
 SAM2_COLUMNS = (
     "sam2PredIou",
     "sam2ObjectScore",
@@ -41,16 +46,6 @@ CREATE TABLE IF NOT EXISTS locations (
 )
 """
 
-_CREATE_SCORES_SQL = """
-CREATE TABLE IF NOT EXISTS location_scores (
-    location_id INTEGER NOT NULL,
-    epoch INTEGER NOT NULL,
-    score REAL NOT NULL,
-    PRIMARY KEY (location_id, epoch)
-)
-"""
-
-
 def sqlite_path(crops: str | os.PathLike[str]) -> Path:
     """Return `{AnnotationCrops}/annotation_crops.sqlite`."""
     return Path(crops) / "annotation_crops.sqlite"
@@ -73,10 +68,15 @@ def connect(crops: str | os.PathLike[str]) -> sqlite3.Connection:
     return connection
 
 
+def _ensure_score_schema(connection: sqlite3.Connection) -> None:
+    """Create per-window scores, or keep a location-only table under an empty image key."""
+    ensure_location_scores_schema(connection)
+
+
 def _ensure_locations_schema(connection: sqlite3.Connection) -> None:
     """Create locations and rename jpeg_relpath on catalogs from JPEG-era exports."""
     connection.execute(_CREATE_SQL)
-    connection.execute(_CREATE_SCORES_SQL)
+    _ensure_score_schema(connection)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(locations)")}
     if "jpeg_relpath" in columns and "image_relpath" not in columns:
         connection.execute("ALTER TABLE locations RENAME COLUMN jpeg_relpath TO image_relpath")
@@ -89,25 +89,12 @@ def _ensure_locations_schema(connection: sqlite3.Connection) -> None:
 
 def load_ignore_ids(crops: str | os.PathLike[str]) -> set[int]:
     """Load ignored location ids from `ignore.json` (a JSON array)."""
-    path = ignore_path(crops)
-    if not path.is_file():
-        return set()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        return set()
-    ids: set[int] = set()
-    for item in payload:
-        try:
-            ids.add(int(item))
-        except (TypeError, ValueError):
-            continue
-    return ids
+    return _load_ignore_ids(crops)
 
 
 def save_ignore_ids(crops: str | os.PathLike[str], ids: Iterable[int]) -> None:
     """Write `ignore.json` as a sorted JSON array of location ids."""
-    ordered = sorted({int(item) for item in ids})
-    ignore_path(crops).write_text(json.dumps(ordered), encoding="utf-8")
+    _save_ignore_ids(crops, ids)
 
 
 def approved_path(crops: str | os.PathLike[str]) -> Path:
@@ -217,21 +204,34 @@ def read_crop_size(crops: str | os.PathLike[str]) -> int | None:
     return int(row[0])
 
 
-def _latest_loss_by_location(connection: sqlite3.Connection) -> dict[int, float]:
-    """Latest trainer loss for each location. Locations never scored are absent."""
+def _latest_losses(
+    connection: sqlite3.Connection,
+) -> tuple[dict[tuple[int, str], float], dict[int, float]]:
+    """Latest score per window, plus location-wide scores stored with an empty image key."""
     try:
         rows = connection.execute(
             """
-            SELECT location_id, score FROM location_scores
+            SELECT location_id, image_key, score FROM location_scores
             WHERE epoch = (
                 SELECT MAX(later.epoch) FROM location_scores AS later
                 WHERE later.location_id = location_scores.location_id
+                  AND later.image_key = location_scores.image_key
             )
             """
         ).fetchall()
     except sqlite3.OperationalError:
-        return {}
-    return {int(row["location_id"]): float(row["score"]) for row in rows}
+        return {}, {}
+    by_window: dict[tuple[int, str], float] = {}
+    legacy: dict[int, float] = {}
+    for row in rows:
+        location_id = int(row["location_id"])
+        image_key = str(row["image_key"] or "")
+        score = float(row["score"])
+        if image_key:
+            by_window[(location_id, image_key)] = score
+        else:
+            legacy[location_id] = score
+    return by_window, legacy
 
 
 def list_catalog_rows(crops: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -239,22 +239,29 @@ def list_catalog_rows(crops: str | os.PathLike[str]) -> list[dict[str, Any]]:
     path = sqlite_path(crops)
     if not path.is_file():
         return []
+    crops_path = Path(crops)
     connection = connect(crops)
     try:
         rows = connection.execute(
             "SELECT * FROM locations ORDER BY z, location_id"
         ).fetchall()
         result = [dict(row) for row in rows]
-        losses = _latest_loss_by_location(connection)
+        by_window, legacy = _latest_losses(connection)
     finally:
         connection.close()
     approved = load_approved(crops)
     for row in result:
         location_id = int(row["location_id"])
-        row["loss"] = losses.get(location_id)
+        image_key = str(row.get("image_key") or "")
+        row["loss"] = by_window.get((location_id, image_key), legacy.get(location_id))
         row["approved"] = int(_approval_key(location_id, row.get("image_key") or "") in approved)
         if row.get("ignored"):
             row["approved"] = 0
+            # Older rejects stored the first window's mask on every row. Prefer
+            # the file named for this window so each tile keeps its own mask.
+            named = f"ignored/{image_key}_{location_id}.png"
+            if image_key and (crops_path / named).is_file():
+                row["mask_relpath"] = named
     return result
 
 
@@ -295,9 +302,8 @@ def restore_location(
     ids = load_ignore_ids(crops)
     ids.discard(location_id)
     save_ignore_ids(crops, ids)
-    source = _find_mask(Path(crops) / "ignored", location_id)
-    if source is not None:
-        masks = Path(crops) / "masks"
+    masks = Path(crops) / "masks"
+    for source in _masks_named_for(Path(crops) / "ignored", location_id):
         masks.mkdir(parents=True, exist_ok=True)
         destination = masks / source.name
         if destination.is_file():
@@ -562,20 +568,23 @@ def parse_review_import(payload: Any) -> tuple[list[int], list[tuple[int, str]],
 
 
 def apply_ignore_moves(crops: str | os.PathLike[str]) -> int:
-    """Move ignored masks into `ignored/`, replacing any file already there."""
+    """Move every ignored window mask into `ignored/`, replacing a file already there.
+
+    A location is one mask per crop window. Moving only the first file left the
+    other windows pointing at that single mask, so the gallery could not show
+    the location as a group of tiles.
+    """
     output = Path(crops)
     ignored_dir = output / "ignored"
     moved = 0
     for location_id in load_ignore_ids(output):
-        source = _find_mask(output / "masks", location_id)
-        if source is None:
-            continue
-        ignored_dir.mkdir(parents=True, exist_ok=True)
-        destination = ignored_dir / source.name
-        if destination.is_file():
-            destination.unlink()
-        source.replace(destination)
-        moved += 1
+        for source in _masks_named_for(output / "masks", location_id):
+            ignored_dir.mkdir(parents=True, exist_ok=True)
+            destination = ignored_dir / source.name
+            if destination.is_file():
+                destination.unlink()
+            source.replace(destination)
+            moved += 1
     return moved
 
 
@@ -591,21 +600,38 @@ def _set_ignored_flag(
         return
     connection = connect(crops)
     try:
-        mask_rel = _mask_relpath_for_id(crops, location_id, ignored=ignored)
+        flag = 1 if ignored else 0
+        folder = "ignored" if ignored else "masks"
+        root = Path(crops)
         if image_key:
-            named = f"{'ignored' if ignored else 'masks'}/{image_key}_{int(location_id)}.png"
-            if (Path(crops) / named).is_file():
+            mask_rel = _mask_relpath_for_id(crops, location_id, ignored=ignored)
+            named = f"{folder}/{image_key}_{int(location_id)}.png"
+            if (root / named).is_file():
                 mask_rel = named
             connection.execute(
                 "UPDATE locations SET ignored = ?, mask_relpath = ? "
                 "WHERE location_id = ? AND image_key = ?",
-                [1 if ignored else 0, mask_rel, location_id, image_key],
+                [flag, mask_rel, location_id, image_key],
             )
         else:
-            connection.execute(
-                "UPDATE locations SET ignored = ?, mask_relpath = ? WHERE location_id = ?",
-                [1 if ignored else 0, mask_rel, location_id],
-            )
+            # One path for the whole location paints the first window's mask on
+            # every tile. Each window keeps the file named for its image key.
+            windows = connection.execute(
+                "SELECT image_key, mask_relpath FROM locations WHERE location_id = ?",
+                [location_id],
+            ).fetchall()
+            for window in windows:
+                key = str(window["image_key"] or "")
+                rel = str(window["mask_relpath"] or "")
+                if key:
+                    named = f"{folder}/{key}_{int(location_id)}.png"
+                    if (root / named).is_file():
+                        rel = named
+                connection.execute(
+                    "UPDATE locations SET ignored = ?, mask_relpath = ? "
+                    "WHERE location_id = ? AND image_key = ?",
+                    [flag, rel, location_id, key],
+                )
         connection.commit()
     finally:
         connection.close()
@@ -619,11 +645,16 @@ def _mask_relpath_for_id(crops: str | os.PathLike[str], location_id: int, *, ign
     return f"{'ignored' if ignored else 'masks'}/{location_id}.png"
 
 
-def _find_mask(folder: Path, location_id: int) -> Path | None:
+def _masks_named_for(folder: Path, location_id: int) -> list[Path]:
+    """Return every ``*_{location_id}.png`` in *folder*, in name order."""
     if not folder.is_dir():
-        return None
+        return []
     suffix = f"_{int(location_id)}.png"
-    matches = sorted(folder.glob(f"*{suffix}"))
+    return sorted(path for path in folder.glob(f"*{suffix}") if path.is_file())
+
+
+def _find_mask(folder: Path, location_id: int) -> Path | None:
+    matches = _masks_named_for(folder, location_id)
     if not matches:
         return None
     return matches[0]

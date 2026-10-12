@@ -6,11 +6,11 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import torch
 from PIL import Image
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-from sam2_segmentation_trainer.model import build_em_sam2
+from sam2_segmentation_trainer.data.augment import to_rgb_uint8
+from sam2_segmentation_trainer.export_serve import load_finetuned_model
 from sam2_segmentation_trainer.paths import pretrained_checkpoint
 
 
@@ -21,11 +21,15 @@ def normalise_em(arr: np.ndarray) -> np.ndarray:
     return ((clipped - lo) / (hi - lo + 1e-6) * 255.0).astype(np.uint8)
 
 
+def em_rgb_from_gray(gray: np.ndarray) -> np.ndarray:
+    """Percentile-stretch one gray plane, then stack it to HxWx3 uint8."""
+    return to_rgb_uint8(normalise_em(gray))
+
+
 def load_em_rgb(image_path: str | Path) -> np.ndarray:
     with Image.open(image_path) as img:
         arr = np.array(img.convert("L"))
-    stretched = normalise_em(arr)
-    return np.stack([stretched, stretched, stretched], axis=-1)
+    return em_rgb_from_gray(arr)
 
 
 class EMPredictor:
@@ -42,10 +46,7 @@ class EMPredictor:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         base = Path(base_ckpt) if base_ckpt is not None else pretrained_checkpoint()
-        model = build_em_sam2(model_cfg, str(base), torch.device(device), train=False)
-        state = torch.load(checkpoint, map_location=device, weights_only=True)
-        model.load_state_dict(state)
-        model.eval()
+        model = load_finetuned_model(checkpoint, base, model_cfg, device)
         self.predictor = SAM2ImagePredictor(model)
 
     def set_image(self, image_path: str | Path) -> None:
@@ -54,8 +55,7 @@ class EMPredictor:
 
     def set_image_array(self, gray_or_rgb: np.ndarray) -> None:
         if gray_or_rgb.ndim == 2:
-            stretched = normalise_em(gray_or_rgb)
-            rgb = np.stack([stretched, stretched, stretched], axis=-1)
+            rgb = em_rgb_from_gray(gray_or_rgb)
         else:
             rgb = gray_or_rgb
         self.predictor.set_image(rgb)

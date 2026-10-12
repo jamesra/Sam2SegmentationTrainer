@@ -44,6 +44,7 @@ from identity import (
     OidcIdentity,
     Principal,
     StubIdentity,
+    intersect_grants,
 )
 from refresh import (
     RefreshUnavailable,
@@ -136,6 +137,14 @@ def odata_base(volume: str, environ: dict[str, str] | None = None) -> str:
     mapping = environ or env_map()
     template = mapping.get("GALLERY_ODATA_TEMPLATE") or "https://websvc.codepharm.net/{volume}/OData"
     return template.replace("{volume}", quote(volume, safe="")).rstrip("/")
+
+
+def odata_endpoint(volume: str, source: dict[str, Any], environ: dict[str, str] | None = None) -> str:
+    """Saved volume URL, or the default service root when none is stored."""
+    url = source.get("odata")
+    if isinstance(url, str) and url.strip():
+        return url.strip().rstrip("/")
+    return odata_base(volume, environ)
 
 
 def tag_tokens(raw: str | None) -> list[str]:
@@ -812,10 +821,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
             return
         source = load_source_document(crops)
-        url = source.get("odata")
-        if not isinstance(url, str) or not url.strip():
-            self._send_json({"error": "Set an OData endpoint for this volume before refreshing"}, status=400)
-            return
+        url = odata_endpoint(volume, source)
         if nornir_buildmanager_root() is None:
             self._send_json({
                 "error": "Mask refresh needs the nornir-buildmanager mount. No masks were changed.",
@@ -926,7 +932,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         cookie = self._cookie(SESSION_COOKIE)
         principal = decode_session(cookie, session_secret())
         if principal is not None:
-            grants = intersect_keep(principal.grants, names)
+            grants = intersect_grants(principal.grants, names)
             return Principal(principal.subject, principal.display_name, grants)
         if mode == "stub":
             return StubIdentity(env_map()).principal_for_registry(names)
@@ -995,11 +1001,6 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; Max-Age=0")
         self.end_headers()
-
-
-def intersect_keep(grants: dict[str, str], names: list[str]) -> dict[str, str]:
-    allowed = set(names)
-    return {name: role for name, role in grants.items() if name in allowed}
 
 
 def make_server(

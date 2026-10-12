@@ -45,6 +45,28 @@ def boundary_f1(pred_bin: np.ndarray, gt_bin: np.ndarray, tolerance: int = 2) ->
     return float(2 * prec * rec / (prec + rec + 1e-6))
 
 
+def mean_iou_by_volume(samples: Iterable[tuple[str, float]]) -> tuple[float, dict[str, float]]:
+    """Overall mean IoU and the mean IoU for each volume name.
+
+    Names are the ones on the validation examples (the training-data folder,
+    unless that example's manifest sets ``volume``). A blank name stays in the
+    overall mean and does not get its own entry. An empty sample list returns
+    ``0.0`` and an empty map.
+    """
+    rows = [(str(volume), float(iou)) for volume, iou in samples]
+    if not rows:
+        return 0.0, {}
+    buckets: dict[str, list[float]] = {}
+    for volume, iou in rows:
+        name = volume.strip()
+        if not name:
+            continue
+        buckets.setdefault(name, []).append(iou)
+    by_volume = {name: float(np.mean(buckets[name])) for name in sorted(buckets)}
+    overall = float(np.mean([iou for _volume, iou in rows]))
+    return overall, by_volume
+
+
 def summarize_records(records: Iterable[dict]) -> dict[str, object]:
     recs = list(records)
     if not recs:

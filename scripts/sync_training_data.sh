@@ -11,6 +11,10 @@
 # Default: after a successful mirror, point ~/sam2-training/current at that version.
 # -noselect: mirror only; leave current unchanged.
 #
+# approved.json and ignore.json are written on this SSD by the gallery. They are
+# excluded from the mirror, and rejected masks are moved back to ignored/ after
+# the copy so --delete cannot clear a volume's review lists.
+#
 # Env:
 #   TRAINING_DATA_SRC=/mnt/d/TrainingData
 #   SAM2_TRAINING_DEST=$HOME/sam2-training
@@ -81,10 +85,17 @@ if [[ "$noselect" -eq 1 ]]; then
 else
   echo "will select ${ver} as current"
 fi
+echo "keeping AnnotationCrops approved.json, ignore.json, and ignored/"
 
 rsync -a --delete --info=stats2 \
   --exclude Thumbs.db --exclude .DS_Store \
+  --exclude '**/AnnotationCrops/approved.json' \
+  --exclude '**/AnnotationCrops/ignore.json' \
+  --exclude '**/AnnotationCrops/ignored/***' \
+  --exclude '_review/***' \
   "${src}/" "${dest}/"
+
+reapply_rejected_masks "$dest"
 
 if [[ "$noselect" -eq 0 ]]; then
   link_current "$SAM2_TRAINING_DEST" "$ver"

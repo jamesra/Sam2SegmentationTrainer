@@ -214,6 +214,43 @@ def iou_prediction_loss(
     return iou_prediction_loss_per_sample(pred, target, iou_preds).mean()
 
 
+def build_prompt_region(
+    points: torch.Tensor, labels: torch.Tensor, shape: tuple[int, int], radius: float
+) -> torch.Tensor:
+    """Boolean disk mask (shape ``[B, H, W]``) around positive prompt points.
+
+    ``points`` is ``[B, N, 2]`` xy pixel coords in the same space as ``shape``;
+    ``labels`` is ``[B, N]`` with positive prompts marked ``> 0``.
+    """
+    height, width = shape
+    device = points.device
+    dtype = points.dtype
+    ys = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1)
+    xs = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width)
+    px = points[..., 0].view(*points.shape[:2], 1, 1)
+    py = points[..., 1].view(*points.shape[:2], 1, 1)
+    dist2 = (xs - px) ** 2 + (ys - py) ** 2
+    within = dist2 <= (float(radius) ** 2)
+    positive = (labels > 0).view(*labels.shape, 1, 1)
+    return (within & positive).any(dim=1)
+
+
+def prompt_containment_loss_per_sample(
+    pred: torch.Tensor,
+    points: torch.Tensor,
+    labels: torch.Tensor,
+    radius: float,
+) -> torch.Tensor:
+    """Per-sample BCE pushing logits at prompted locations toward foreground (shape ``[B]``)."""
+    region = build_prompt_region(points, labels, pred.shape[-2:], radius)
+    region_f = region.to(dtype=pred.dtype)
+    bce = F.binary_cross_entropy_with_logits(
+        pred, torch.ones_like(pred), reduction="none"
+    )
+    denom = region_f.flatten(1).sum(1).clamp_min(1.0)
+    return (bce * region_f).flatten(1).sum(1) / denom
+
+
 def combined_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -222,6 +259,10 @@ def combined_loss(
     focal_weight: float,
     dice_weight: float,
     iou_weight: float,
+    points: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
+    containment_weight: float = 0.0,
+    containment_radius: float = 8.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return the batch loss and detached GPU stats. Callers sync when they log."""
     loss_focal_ps = focal_loss_per_sample(pred, target)
@@ -232,12 +273,20 @@ def combined_loss(
         + float(dice_weight) * loss_dice_ps
         + float(iou_weight) * loss_iou_ps
     )
-    loss = sample_losses.mean()
     stats = {
-        "loss": loss.detach(),
         "loss_focal": loss_focal_ps.mean().detach(),
         "loss_dice": loss_dice_ps.mean().detach(),
         "loss_iou": loss_iou_ps.mean().detach(),
-        "sample_losses": sample_losses.detach(),
     }
+    if float(containment_weight) > 0.0 and points is not None and labels is not None:
+        # "In this domain, prompts are ground truth": punish background predicted
+        # at prompted locations so the model internalizes grow-outward behavior.
+        loss_containment_ps = prompt_containment_loss_per_sample(
+            pred, points, labels, containment_radius
+        )
+        sample_losses = sample_losses + float(containment_weight) * loss_containment_ps
+        stats["loss_containment"] = loss_containment_ps.mean().detach()
+    loss = sample_losses.mean()
+    stats["loss"] = loss.detach()
+    stats["sample_losses"] = sample_losses.detach()
     return loss, stats

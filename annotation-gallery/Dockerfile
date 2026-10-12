@@ -1,5 +1,5 @@
-# Slim AnnotationCrops gallery. Stdlib plus Pillow for card thumbnails.
-# No nornir-buildmanager, imageregistration, CuPy, or torch.
+# Slim AnnotationCrops gallery. Stdlib, Pillow, and NumPy.
+# Mask refresh loads mounted mask modules only: no imageregistration, CuPy, or torch.
 FROM python:3.14-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -11,10 +11,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY server.py identity.py catalog.py thumbs.py refresh.py /app/
-COPY static /app/static
+COPY annotation-gallery/server.py annotation-gallery/identity.py annotation-gallery/catalog.py annotation-gallery/thumbs.py annotation-gallery/refresh.py annotation-gallery/crops_path.py /app/
+COPY annotation-gallery/static /app/static
+COPY annotation_crops /app/annotation_crops
 
-RUN pip install --no-cache-dir pillow \
+RUN pip install --no-cache-dir "numpy>=2.2" pillow \
     && groupadd --gid 10001 gallery \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin gallery
 

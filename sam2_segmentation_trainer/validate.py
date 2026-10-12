@@ -7,7 +7,11 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from sam2_segmentation_trainer.data.manifest import index_volumes, summarize_index
+from sam2_segmentation_trainer.data.manifest import (
+    examples_usable,
+    index_volumes,
+    summarize_index,
+)
 from sam2_segmentation_trainer.paths import DEFAULT_VOLUMES, data_root
 
 
@@ -55,7 +59,7 @@ def build_report(
 ) -> dict[str, object]:
     examples = index_volumes(volumes=volumes, root=root, skip_missing=False)
     summary = summarize_index(examples)
-    present = index_volumes(volumes=volumes, root=root, skip_missing=True)
+    present = examples_usable(examples)
     report: dict[str, object] = {
         "root": str(root),
         "volumes": volumes,

@@ -1,4 +1,4 @@
-"""Per-epoch location scores written into the volume catalog."""
+"""Per-window training scores written into the volume catalog."""
 
 from __future__ import annotations
 
@@ -20,10 +20,11 @@ class LocationScoreTests(unittest.TestCase):
             db.write_bytes(b"")
             row = {
                 "epoch": 2,
-                "sample_losses": [1.5, 0.25],
+                "sample_losses": [1.5, 0.25, 0.1],
                 "meta": [
-                    {"volume": "RC1", "location_id": 10},
-                    {"volume": "RC1", "location_id": 11},
+                    {"volume": "RC1", "location_id": 10, "image_key": "win-a"},
+                    {"volume": "RC1", "location_id": 10, "image_key": "win-b"},
+                    {"volume": "RC1", "location_id": 11, "image_key": "win-c"},
                 ],
             }
             record_location_scores(root, [row])
@@ -32,25 +33,73 @@ class LocationScoreTests(unittest.TestCase):
                 [
                     {
                         "epoch": 2,
-                        "sample_losses": [9.0],
-                        "meta": [{"volume": "RC1", "location_id": 10}],
+                        "sample_losses": [9.0, 4.0],
+                        "meta": [
+                            {"volume": "RC1", "location_id": 10, "image_key": "win-a"},
+                            {"volume": "RC1", "location_id": 10},
+                        ],
                     },
                     {
                         "epoch": 3,
                         "sample_losses": [0.5],
-                        "meta": [{"volume": "RC1", "location_id": 10}],
+                        "meta": [{"volume": "RC1", "location_id": 10, "image_key": "win-a"}],
                     },
                 ],
             )
             connection = sqlite3.connect(db)
             try:
                 stored = connection.execute(
-                    "SELECT location_id, epoch, score FROM location_scores "
-                    "ORDER BY location_id, epoch"
+                    "SELECT location_id, image_key, epoch, score FROM location_scores "
+                    "ORDER BY location_id, image_key, epoch"
                 ).fetchall()
             finally:
                 connection.close()
-        self.assertEqual(stored, [(10, 2, 9.0), (10, 3, 0.5), (11, 2, 0.25)])
+        self.assertEqual(
+            stored,
+            [
+                (10, "win-a", 2, 9.0),
+                (10, "win-a", 3, 0.5),
+                (10, "win-b", 2, 0.25),
+                (11, "win-c", 2, 0.1),
+            ],
+        )
+
+    def test_migrates_location_only_scores(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crops = root / "RC1" / "AnnotationCrops"
+            crops.mkdir(parents=True)
+            db = crops / "annotation_crops.sqlite"
+            connection = sqlite3.connect(db)
+            connection.execute(
+                "CREATE TABLE location_scores ("
+                "location_id INTEGER NOT NULL, epoch INTEGER NOT NULL, "
+                "score REAL NOT NULL, PRIMARY KEY (location_id, epoch))"
+            )
+            connection.execute(
+                "INSERT INTO location_scores (location_id, epoch, score) VALUES (10, 1, 1.25)"
+            )
+            connection.commit()
+            connection.close()
+            record_location_scores(
+                root,
+                [
+                    {
+                        "epoch": 2,
+                        "sample_losses": [0.4],
+                        "meta": [{"volume": "RC1", "location_id": 10, "image_key": "win-a"}],
+                    }
+                ],
+            )
+            connection = sqlite3.connect(db)
+            try:
+                stored = connection.execute(
+                    "SELECT location_id, image_key, epoch, score FROM location_scores "
+                    "ORDER BY epoch"
+                ).fetchall()
+            finally:
+                connection.close()
+        self.assertEqual(stored, [(10, "", 1, 1.25), (10, "win-a", 2, 0.4)])
 
 
 if __name__ == "__main__":
