@@ -52,6 +52,7 @@ from refresh import (
     nornir_buildmanager_root,
     refresh_location,
 )
+from negatives_view import negative_bitmask
 from thumbs import ensure_thumbnail, parse_thumb_request, start_thumbnail_watch, thumb_parts_allowed
 
 VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -512,6 +513,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
             rel = (query.get("path") or [""])[0]
             self._handle_file(match.group(1), rel)
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/negatives", path)
+        if match:
+            self._handle_negatives(
+                match.group(1), (query.get("key") or [""])[0], (query.get("loc") or [""])[0]
+            )
+            return
         self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self) -> None:
@@ -882,6 +889,30 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"tag lookup failed: {exc}"}, status=502)
             return
         self._send_json({"structureIds": ids})
+
+    def _handle_negatives(self, volume: str, image_key: str, location_id: str) -> None:
+        """PNG bitmask of the other annotations in a tile, with their count in ``X-Negative-Count``.
+
+        These are the areas the trainer marks as background for this location, drawn by the viewer as a
+        red overlay. Same grants as the file route; ``no-cache`` so a changed mask or circle file shows up.
+        """
+        principal = self._principal()
+        if volume not in principal.grants:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            location = int(location_id)
+            data, count = negative_bitmask(crops_dir(self._registry(), volume), image_key, location)
+        except (ValueError, OSError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Negative-Count", str(count))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_file(self, volume: str, relative: str) -> None:
         principal = self._principal()
