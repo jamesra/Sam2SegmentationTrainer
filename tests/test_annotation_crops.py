@@ -67,3 +67,19 @@ def test_rle_round_trip_and_bbox() -> None:
     foreground[0, 0] = 1
     leading = encode_coco_rle(foreground)
     assert leading["counts"][0] == 0
+
+
+def test_bbox_area_from_rle_matches_pixel_scan_for_multi_column_runs() -> None:
+    mask = np.zeros((5, 6), dtype=np.uint8)
+    mask.ravel(order="F")[8:19] = 1  # starts mid-column 1, spans columns 1-3
+    mask[4, 5] = 1
+    bbox, area = bbox_area_from_rle(encode_coco_rle(mask))
+    rows, cols = np.nonzero(mask)
+    assert bbox == [
+        int(cols.min()),
+        int(rows.min()),
+        int(cols.max() - cols.min() + 1),
+        int(rows.max() - rows.min() + 1),
+    ]
+    assert area == int(mask.sum())
+    assert bbox_area_from_rle({"counts": [0, 4], "size": [0, 0]}) == ([0, 0, 0, 0], 0)

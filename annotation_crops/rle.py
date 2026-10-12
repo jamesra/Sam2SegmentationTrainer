@@ -58,20 +58,29 @@ def bbox_area_from_rle(rle: dict[str, Any]) -> tuple[list[int], int]:
     area = 0
     value = 0
     offset = 0
-    xs: list[int] = []
-    ys: list[int] = []
+    x0 = y0 = x1 = y1 = 0
+    found = False
     for run in counts:
-        if value == 1 and height:
+        if value == 1 and height and run > 0:
             area += run
-            for index in range(offset, offset + run):
-                ys.append(index % height)
-                xs.append(index // height)
+            first, last = offset, offset + run - 1
+            col_first, col_last = first // height, last // height
+            # A run crossing a column boundary covers every row; otherwise
+            # it stays inside one column and only its own rows count.
+            if col_last > col_first:
+                row_lo, row_hi = 0, height - 1
+            else:
+                row_lo, row_hi = first % height, last % height
+            if found:
+                x0, x1 = min(x0, col_first), max(x1, col_last + 1)
+                y0, y1 = min(y0, row_lo), max(y1, row_hi + 1)
+            else:
+                x0, x1, y0, y1 = col_first, col_last + 1, row_lo, row_hi + 1
+                found = True
         offset += run
         value = 1 - value
-    if not xs:
+    if not found:
         return [0, 0, 0, 0], 0
-    x0, x1 = min(xs), max(xs) + 1
-    y0, y1 = min(ys), max(ys) + 1
     return [x0, y0, x1 - x0, y1 - y0], area
 
 
