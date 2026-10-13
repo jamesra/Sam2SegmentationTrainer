@@ -18,12 +18,17 @@ Scripts (run ON the NAS, over ssh)
       Refuses if <v-next> exists unless -f, which deletes <v-next> and re-clones it
       (anything only in <v-next> is lost). -n for dry run.
 
-  version-sync [-n] [-d] <version> [VOLUME_NAME ...]
+  version-sync [-n] [-d] [-j N] <version> [VOLUME_NAME ...]
       rsync from Volumes/<VOL>/AnnotationCrops into SAM2TrainingData/<version>/<VOL>,
       writing only files whose bytes differ (checksum, not timestamp). Default is all
-      volumes already in <version>. -n lists changes only. -d deletes files from <version>
+      volumes already in <version>. Work is split into one rsync job per top-level subfolder of each volume, run in parallel (-j N sets the job count; default is the number of CPUs; -j 1 is sequential). -n lists changes only. -d deletes files from <version>
       that were removed from the source (otherwise they are kept).
       A volume not present in <v-previous> can be added by naming it explicitly.
+
+  version-flatten [-n] <version> [VOLUME_NAME ...]
+      For volumes stored as <version>/<VOL>/AnnotationCrops/<stuff>: moves <stuff> up into
+      <VOL>/ and removes AnnotationCrops. Renames only (keeps shared blocks). Skips a
+      volume on name collisions. version-sync refuses to run on such a volume.
 
 Typical workflow
 ----------------

@@ -1,0 +1,88 @@
+#!/bin/sh
+# version-flatten [-n] <version> [VOLUME_NAME ...]
+#
+# Fix volumes laid out as SAM2TrainingData/<version>/<VOL>/AnnotationCrops/<stuff>:
+# move <stuff> up into <VOL>/ and remove the empty AnnotationCrops folder.
+# With no VOLUME_NAME, every volume folder in <version> is checked.
+# Moves are renames within one volume, so shared blocks are preserved and no space is used.
+# Volumes without an AnnotationCrops subfolder are left alone. A volume is skipped
+# (nothing moved) if an item inside AnnotationCrops has the same name as something already
+# in <VOL>/.
+#
+#   -n   dry run (print the moves)
+#
+# Env: TRAIN_ROOT (default /volume1/Data/SAM2TrainingData)
+# See training.README.
+
+set -eu
+
+TRAIN_ROOT="${TRAIN_ROOT:-/volume1/Data/SAM2TrainingData}"
+DRY=0
+
+usage() { sed '/^#/!q' "$0" | sed 1d | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+while getopts "nh" opt; do
+    case "$opt" in
+        n) DRY=1 ;;
+        h) usage 0 ;;
+        *) usage 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage 1
+
+VERSION=$1
+shift
+case "$VERSION" in
+    v[0-9]*) ;;
+    *) echo "error: version should look like v1, v2, ... (got '$VERSION')" >&2; exit 1 ;;
+esac
+VDIR="$TRAIN_ROOT/$VERSION"
+[ -d "$VDIR" ] || { echo "error: not found: $VDIR" >&2; exit 1; }
+
+if [ $# -eq 0 ]; then
+    set -- $(cd "$VDIR" && for d in */; do [ -d "$d" ] && echo "${d%/}"; done)
+fi
+
+rc=0
+for VOL in "$@"; do
+    V="$VDIR/$VOL"
+    A="$V/AnnotationCrops"
+    if [ ! -d "$A" ]; then
+        echo "$VOL: no AnnotationCrops subfolder, skipping"
+        continue
+    fi
+
+    # Pass 1: look for name collisions before moving anything.
+    clash=0
+    for p in "$A"/* "$A"/.[!.]* "$A"/..?*; do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        name=$(basename "$p")
+        if [ -e "$V/$name" ] || [ -L "$V/$name" ]; then
+            echo "$VOL: collision: '$name' exists in both $VOL/ and $VOL/AnnotationCrops/" >&2
+            clash=1
+        fi
+    done
+    if [ "$clash" -eq 1 ]; then
+        echo "$VOL: skipped, nothing moved" >&2; rc=1; continue
+    fi
+
+    # Pass 2: move.
+    n=0
+    for p in "$A"/* "$A"/.[!.]* "$A"/..?*; do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        name=$(basename "$p")
+        echo "$VOL: $VOL/AnnotationCrops/$name -> $VOL/$name"
+        [ "$DRY" -eq 1 ] || mv -- "$p" "$V/$name"
+        n=$((n + 1))
+    done
+    if [ "$DRY" -eq 1 ]; then
+        echo "$VOL: $n item(s) would move; AnnotationCrops would be removed (dry run)"
+    elif rmdir "$A"; then
+        echo "$VOL: moved $n item(s), removed AnnotationCrops"
+    else
+        echo "$VOL: moved $n item(s) but could not remove $A (not empty?)" >&2; rc=1
+    fi
+done
+
+exit "$rc"

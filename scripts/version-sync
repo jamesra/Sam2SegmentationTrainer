@@ -1,5 +1,5 @@
 #!/bin/sh
-# version-sync [-n] [-d] <version> [VOLUME_NAME ...]
+# version-sync [-n] [-d] [-j N] <version> [VOLUME_NAME ...]
 #
 # Bring SAM2TrainingData/<version>/<VOLUME_NAME> up to date with
 # Volumes/<VOLUME_NAME>/AnnotationCrops, writing only files whose CONTENT differs
@@ -8,8 +8,12 @@
 # With no VOLUME_NAME, every volume folder already in SAM2TrainingData/<version> is synced.
 # Run ON the Synology, normally right after version-bump.
 #
+# Work is split into one rsync job per top-level subfolder of each volume's AnnotationCrops
+# (plus one job per volume for files directly in AnnotationCrops), run in parallel.
+#
 #   -n   dry run (list what would change)
 #   -d   also delete files in <version> that no longer exist in the source
+#   -j N number of parallel rsync jobs (default: number of CPUs; -j 1 = sequential)
 #
 # Env: DATA_ROOT (default /volume1/Data)
 # See training.README.
@@ -18,15 +22,64 @@ set -eu
 
 DATA_ROOT="${DATA_ROOT:-/volume1/Data}"
 TRAIN_ROOT="${TRAIN_ROOT:-$DATA_ROOT/SAM2TrainingData}"
+
+# rsync flags: -r recurse, -t keep mtimes, -c decide by checksum (not size+mtime).
+# No --inplace: rsync writes a temp file and renames, so shared blocks are never rewritten.
+rsync_flags() {
+    f="-rtc --itemize-changes"
+    [ "$DRY" -eq 1 ] && f="$f -n"
+    [ "$DELETE" -eq 1 ] && f="$f --delete"
+    echo "$f"
+}
+
+# ---------------------------------------------------------------------------------------
+# Worker mode: sync one task ("VOL<TAB>SUBFOLDER"; empty SUBFOLDER = top-level files only).
+# Invoked by the parent via xargs with VS_TASK set. Prints changed paths and a "@@" summary.
+# ---------------------------------------------------------------------------------------
+if [ -n "${VS_TASK:-}" ]; then
+    TAB=$(printf '\t')
+    VOL=${VS_TASK%%"$TAB"*}
+    SUB=${VS_TASK#*"$TAB"}
+    SRC="$DATA_ROOT/Volumes/$VOL/AnnotationCrops"
+    DST="$TRAIN_ROOT/$VS_VERSION/$VOL"
+    if [ -n "$SUB" ]; then
+        S="$SRC/$SUB/"; D="$DST/$SUB/"; PFX="$VOL/$SUB/"; X=""
+    else
+        S="$SRC/"; D="$DST/"; PFX="$VOL/"; X="--exclude=/*/"   # top-level files only
+    fi
+    DRY=$VS_DRY
+    DELETE=$VS_DELETE
+    [ "$DRY" -eq 1 ] || mkdir -p "$D"
+    # shellcheck disable=SC2046,SC2086
+    if ! OUT=$(rsync $(rsync_flags) $X "$S" "$D" 2>&1); then
+        echo "@@ERR $PFX"
+        echo "$OUT" | sed 's/^/@@ERR   /'
+        exit 1
+    fi
+    CH=$(echo "$OUT" | grep -E '^(>f|\*deleting)' || true)
+    if [ -n "$CH" ]; then
+        echo "$CH" | awk -v p="$PFX" '{ match($0, /^(>f[^ ]*|\*deleting) +/); print substr($0, 1, RLENGTH) p substr($0, RLENGTH + 1) }'
+    fi
+    N=$(echo "$CH" | grep -c '^>f' || true)
+    G=$(echo "$CH" | grep -c '^\*deleting' || true)
+    echo "@@ $VOL $N $G"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------------------
+# Parent
+# ---------------------------------------------------------------------------------------
 DRY=0
 DELETE=0
+JOBS=""
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+usage() { sed '/^#/!q' "$0" | sed 1d | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 
-while getopts "ndh" opt; do
+while getopts "ndj:h" opt; do
     case "$opt" in
         n) DRY=1 ;;
         d) DELETE=1 ;;
+        j) JOBS=$OPTARG ;;
         h) usage 0 ;;
         *) usage 1 ;;
     esac
@@ -40,42 +93,80 @@ case "$VERSION" in
     v[0-9]*) ;;
     *) echo "error: version should look like v1, v2, ... (got '$VERSION')" >&2; exit 1 ;;
 esac
+case "$JOBS" in *[!0-9]*|0) echo "error: -j needs a positive integer" >&2; exit 1 ;; esac
 command -v rsync >/dev/null 2>&1 || { echo "error: rsync not found" >&2; exit 1; }
 [ -d "$TRAIN_ROOT/$VERSION" ] || { echo "error: not found: $TRAIN_ROOT/$VERSION (run version-bump first)" >&2; exit 1; }
 
+# Names of subdirectories (including hidden ones) directly inside $1.
+list_dirs() {
+    for p in "$1"/*/ "$1"/.[!.]*/; do
+        [ -d "$p" ] && basename "$p"
+    done
+    return 0
+}
+
 if [ $# -eq 0 ]; then
-    set -- $(cd "$TRAIN_ROOT/$VERSION" && for d in */; do [ -d "$d" ] && echo "${d%/}"; done)
+    set -- $(list_dirs "$TRAIN_ROOT/$VERSION")
 fi
 [ $# -gt 0 ] || { echo "error: no volumes given and none found in $TRAIN_ROOT/$VERSION" >&2; exit 1; }
 
-# -r recurse, -t keep mtimes, -c decide by checksum (not size+mtime).
-# No --inplace: rsync writes a temp file and renames, so shared blocks are never rewritten.
-FLAGS="-rtc --itemize-changes"
-[ "$DRY" -eq 1 ] && FLAGS="$FLAGS -n"
-[ "$DELETE" -eq 1 ] && FLAGS="$FLAGS --delete"
-
 rc=0
+TASKS=$(mktemp)
+OUTF=$(mktemp)
+trap 'rm -f "$TASKS" "$OUTF"' EXIT
+
+# Build the task list and handle subfolders that disappeared from the source.
 for VOL in "$@"; do
     SRC="$DATA_ROOT/Volumes/$VOL/AnnotationCrops"
     DST="$TRAIN_ROOT/$VERSION/$VOL"
     if [ ! -d "$SRC" ]; then
         echo "skip $VOL: source not found: $SRC" >&2; rc=1; continue
     fi
-    echo "== $VOL: $SRC -> $DST"
-    [ "$DRY" -eq 1 ] || mkdir -p "$DST"
-    # shellcheck disable=SC2086
-    OUT=$(rsync $FLAGS "$SRC/" "$DST/") || { echo "error: rsync failed for $VOL" >&2; rc=1; continue; }
-    # Show only content changes (>f), new files, and deletions; ignore dir/time-only lines.
-    CH=$(echo "$OUT" | grep -E '^(>f|\*deleting)' || true)
-    [ -n "$CH" ] && echo "$CH" | sed 's/^/   /'
-    N=$(echo "$CH" | grep -c '^>f' || true)
-    D=$(echo "$CH" | grep -c '^\*deleting' || true)
-    echo "   $N file(s) written, $D deleted$([ "$DRY" -eq 1 ] && echo ' (dry run)')"
-    if [ "$DELETE" -eq 0 ] && [ -d "$DST" ]; then
+    if [ -d "$DST/AnnotationCrops" ] && [ ! -d "$SRC/AnnotationCrops" ]; then
+        echo "skip $VOL: $DST has a nested AnnotationCrops folder (old layout); run: version-flatten $VERSION $VOL" >&2
+        rc=1; continue
+    fi
+    printf '%s\t\0' "$VOL" >> "$TASKS"                       # top-level files
+    list_dirs "$SRC" | while IFS= read -r sub; do
+        printf '%s\t%s\0' "$VOL" "$sub" >> "$TASKS"
+    done
+    # Subfolders in the version that no longer exist in the source.
+    list_dirs "$DST" | while IFS= read -r sub; do
+        [ -d "$SRC/$sub" ] && continue
+        if [ "$DELETE" -eq 1 ]; then
+            echo "   removed folder: $VOL/$sub$([ "$DRY" -eq 1 ] && echo ' (dry run)')"
+            [ "$DRY" -eq 1 ] || rm -rf -- "${DST:?}/$sub"
+        else
+            echo "   note: $VOL/$sub exists in $VERSION but not in the source (use -d to remove)"
+        fi
+    done
+done
+
+NT=$(tr -cd '\0' < "$TASKS" | wc -c)
+[ "$NT" -gt 0 ] || { echo "nothing to do" >&2; exit 1; }
+[ -n "$JOBS" ] || JOBS=$(nproc 2>/dev/null || echo 4)
+[ "$JOBS" -le "$NT" ] || JOBS=$NT
+echo "$NT task(s), $JOBS parallel job(s)$([ "$DRY" -eq 1 ] && echo ' (dry run)')"
+
+SELF=$0
+export DATA_ROOT TRAIN_ROOT SELF VS_VERSION="$VERSION" VS_DRY="$DRY" VS_DELETE="$DELETE"
+xargs -0 -P "$JOBS" -I{} sh -c 'VS_TASK="$1" exec sh "$SELF"' _ {} < "$TASKS" > "$OUTF" || rc=1
+
+# Changed paths, then per-volume totals.
+grep -v '^@@' "$OUTF" | sed 's/^/   /' || true
+grep '^@@ERR' "$OUTF" | sed 's/^@@ERR/error:/' >&2 || true
+echo "--"
+grep '^@@ [^E]' "$OUTF" | awk '{ w[$2] += $3; d[$2] += $4 } END { for (v in w) printf "%s: %d file(s) written, %d deleted\n", v, w[v], d[v] }' | sort || true
+
+if [ "$DELETE" -eq 0 ]; then
+    for VOL in "$@"; do
+        SRC="$DATA_ROOT/Volumes/$VOL/AnnotationCrops"
+        DST="$TRAIN_ROOT/$VERSION/$VOL"
+        [ -d "$SRC" ] && [ -d "$DST" ] || continue
         # Name-only comparison (no -c), so this is cheap.
         GONE=$(rsync -rn --delete --itemize-changes "$SRC/" "$DST/" | grep -c '^\*deleting' || true)
-        [ "$GONE" -eq 0 ] || echo "   note: $GONE file(s) in $VERSION no longer exist in the source (use -d to remove)"
-    fi
-done
+        [ "$GONE" -eq 0 ] || echo "note: $VOL: $GONE file(s) in $VERSION no longer exist in the source (use -d to remove)"
+    done
+fi
 
 exit "$rc"
