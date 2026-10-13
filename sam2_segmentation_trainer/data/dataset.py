@@ -16,6 +16,7 @@ from annotation_crops.negatives import (
     MaskCache,
     NegativeRegion,
     collect_negative_regions,
+    drop_circles_over_target,
     rasterize_circle,
 )
 
@@ -29,13 +30,20 @@ from sam2_segmentation_trainer.data.meta import SampleMeta
 from sam2_segmentation_trainer.data.prompts import (
     PromptConfig,
     PromptType,
+    FULL_TILE_PROMPTS,
     build_prompt,
     choose_prompt_type,
+    inscribed_circle_xyr,
+    interior_point_xy,
 )
+from sam2_segmentation_trainer.data.fulltile import is_full_tile
 from sam2_segmentation_trainer.data.tiles import TileContext
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+VAL_PROMPTS = ("centroid", "point", "circle_mask")
+"""Validation prompts: the legacy mask centroid, the deepest interior point, and the inscribed circle (production)."""
 
 
 class MissingTileFlag:
@@ -149,7 +157,15 @@ class EMSegDataset(Dataset):
         prompt_cfg: PromptConfig | None = None,
         seed: int = 0,
         epoch: EpochCounter | None = None,
+        val_prompt: str | None = None,
+        circle_scale: float = 0.95,
+        full_tile_threshold: float | None = None,
     ):
+        if val_prompt is not None and val_prompt not in VAL_PROMPTS:
+            raise ValueError(f"val_prompt must be one of {VAL_PROMPTS}, got {val_prompt!r}")
+        self.val_prompt = val_prompt
+        self.circle_scale = float(circle_scale)
+        self.full_tile_threshold = None if full_tile_threshold is None else float(full_tile_threshold)
         self.examples = list(examples)
         self.split = split
         self.image_size = image_size
@@ -186,6 +202,10 @@ class EMSegDataset(Dataset):
             index = (int(idx) + offset) % n
             example = self.examples[index]
             try:
+                if self.val_prompt == "circle_mask":
+                    return self._mixed_item(example, index, forced=PromptType.CIRCLE_MASK)
+                if self.val_prompt is not None:
+                    return self._item_from_example(example, self.val_prompt)
                 if self.mixed_prompts:
                     return self._mixed_item(example, index)
                 return self._item_from_example(example)
@@ -197,7 +217,8 @@ class EMSegDataset(Dataset):
         assert last_err is not None
         raise last_err
 
-    def _item_from_example(self, example: CropExample) -> dict[str, Any]:
+    def _item_from_example(self, example: CropExample, point_mode: str = "centroid") -> dict[str, Any]:
+        """One sample with a single foreground point: the mask centroid (legacy) or its deepest interior pixel."""
         gray = _load_gray_uint8(example.image_path)
         rgb = to_rgb_uint8(gray)
         mask, ann = load_binary_mask(example)
@@ -216,7 +237,7 @@ class EMSegDataset(Dataset):
             mask_aug = mask_aug[:, :, 0]
         mask_bin = (np.asarray(mask_aug) > 0).astype(np.uint8)
 
-        centroid = mask_centroid_xy(mask_bin)
+        centroid = interior_point_xy(mask_bin) if point_mode == "point" else mask_centroid_xy(mask_bin)
         if centroid is None:
             h, w = mask_bin.shape
             centroid = bbox_center_xy(ann, w, h)
@@ -230,6 +251,7 @@ class EMSegDataset(Dataset):
             downsample=example.downsample,
             category_name=str(ann.get("category_name") or ann.get("structure_label") or ""),
             split_key=example.split_key,
+            full_tile=is_full_tile(example, self.full_tile_threshold),
         )
         return {
             "image": image,
@@ -239,20 +261,23 @@ class EMSegDataset(Dataset):
             "boxes": None,
             "dense_mask": None,
             "prompt_fg": None,
-            "prompt_type": "centroid",
+            "prompt_type": point_mode,
             "orig_hw": (int(mask_bin.shape[0]), int(mask_bin.shape[1])),
             "sample_meta": meta,
             **meta.as_dict(),
         }
 
-    def _mixed_item(self, example: CropExample, index: int) -> dict[str, Any]:
+    def _mixed_item(
+        self, example: CropExample, index: int, *, forced: PromptType | None = None
+    ) -> dict[str, Any]:
         """One sample with a drawn prompt type, negative context, and the matching dense mask and points.
 
         Raises KeyError for a sample that cannot form a prompt (empty target after augmentation, or a circle
         target with no other annotation), so ``__getitem__`` moves on to the next example.
         """
-        assert self.tiles is not None and self.prompt_cfg is not None
-        epoch = self.epoch.get() if self.epoch is not None else 0
+        tiles = self.tiles if self.tiles is not None else TileContext()
+        prompt_cfg = self.prompt_cfg if self.prompt_cfg is not None else PromptConfig()
+        epoch = 0 if forced is not None else (self.epoch.get() if self.epoch is not None else 0)
         rng = np.random.default_rng([self.seed, epoch, int(index)])
         key = (example.volume, example.image_key)
 
@@ -263,7 +288,7 @@ class EMSegDataset(Dataset):
         circle_mask: np.ndarray | None = None
         if example.target_circle is not None:
             target = rasterize_circle(shape, *example.target_circle)
-            own = self.tiles.circle_for(key, example.location_id)
+            own = tiles.circle_for(key, example.location_id)
             ann = {"category_name": own.structure_label if own is not None else ""}
         else:
             mask, ann = load_binary_mask(example)
@@ -273,30 +298,42 @@ class EMSegDataset(Dataset):
                 )
                 mask = (mask > 127).astype(np.uint8)
             target = mask > 0
-            own = self.tiles.circle_for(key, example.location_id)
+            own = tiles.circle_for(key, example.location_id)
             if own is not None and own.center_in(shape):
                 disc = rasterize_circle(shape, own.center_x, own.center_y, own.radius)
                 circle_mask = disc if disc.any() else None
+            if circle_mask is None and forced is PromptType.CIRCLE_MASK:
+                fitted = inscribed_circle_xyr(target, self.circle_scale)
+                if fitted is None:
+                    raise KeyError(f"{example.split_key} has no mask to fit a circle to")
+                circle_mask = rasterize_circle(shape, *fitted)
 
         regions = collect_negative_regions(
             example.image_key,
             example.location_id,
-            self.tiles.neighbor_ids(key),
-            self.tiles.circles_in(key),
+            tiles.neighbor_ids(key),
+            tiles.circles_in(key),
             example.mask_path.parent,
             shape,
             self._mask_cache,
         )
-        if example.target_circle is not None:
+        if prompt_cfg.drop_overlapping_circles:
+            regions = drop_circles_over_target(regions, target)
+        if forced is not None:
+            if example.target_circle is not None:
+                raise KeyError(f"circle-only target {example.split_key} cannot be validated with {forced.value}")
+            prompt_type = forced
+        elif example.target_circle is not None:
             if not regions:
                 raise KeyError(f"circle target {example.split_key} has no other annotation in its tile")
             prompt_type = PromptType.NEGATIVE_ONLY
         else:
             prompt_type = choose_prompt_type(
-                self.prompt_cfg,
+                prompt_cfg,
                 rng,
                 can_circle_mask=circle_mask is not None,
                 has_negatives=bool(regions),
+                allowed=FULL_TILE_PROMPTS if is_full_tile(example, self.full_tile_threshold) else None,
             )
         use_circle = prompt_type is PromptType.CIRCLE_MASK
 
@@ -318,7 +355,9 @@ class EMSegDataset(Dataset):
         ]
         circle_aug = masks_aug[-1] if use_circle and circle_mask is not None else None
         if use_circle and (circle_aug is None or not circle_aug.any()):
-            prompt_type = PromptType.FULL_MASK
+            prompt_type = (
+                PromptType.POINTS if is_full_tile(example, self.full_tile_threshold) else PromptType.FULL_MASK
+            )
             circle_aug = None
         if prompt_type is PromptType.NEGATIVE_ONLY and not regions_aug:
             raise KeyError(f"{example.split_key} lost every negative region after augmentation")
@@ -328,7 +367,7 @@ class EMSegDataset(Dataset):
             target_mask=target_aug,
             circle_mask=circle_aug,
             regions=regions_aug,
-            cfg=self.prompt_cfg,
+            cfg=prompt_cfg,
             rng=rng,
         )
         meta = SampleMeta(
@@ -338,6 +377,7 @@ class EMSegDataset(Dataset):
             downsample=example.downsample,
             category_name=str(ann.get("category_name") or ann.get("structure_label") or ""),
             split_key=example.split_key,
+            full_tile=is_full_tile(example, self.full_tile_threshold),
         )
         return {
             "image": imagenet_normalize(np.ascontiguousarray(image_aug)),

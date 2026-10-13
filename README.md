@@ -76,7 +76,7 @@ Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-
 - `images/` — tile PNG/JPEG plus COCO-RLE sidecar JSON
 - `masks/` — required raster `{imageKey}_{locationId}.png` (examples without a mask PNG are skipped; no RLE fallback)
 - `overlays/` — viewing only, not used for training
-- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (already scaled by the file's `diameter_scale`), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter (`-CircleDiameterScale`, default 0.95). Without it training still runs; other annotations in a tile then come only from their masks.
+- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (the true radius, since the exporter records `diameter_scale` 1.0; a file from an older exporter has its scale baked in), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter, which no longer takes `-CircleDiameterScale`. The trainer shrinks the radii to `prompt.circle_diameter_scale` (0.95) when it loads them, rescaling by that value over the file's own `diameter_scale`, so changing the scale needs no re-export. `sam2-em-eval` has `--circle-scale` for the same value. Training needs it while circle-mask prompts are on: with `prompt.prob_circle_mask > 0` a volume without a usable file stops the run (`data.require_circle_file`, set `false` to warn only). Crops whose key has a negative origin (`X-512-512`) are read correctly by the exporter since the key decoder accepts them.
 
 One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Validation is split by section (`data.split_mode: zslab`): within each volume, five contiguous runs of sections spaced evenly through the volume hold about 10% of its samples, and one section on each side of every run (`data.zslab.guard_sections`) is used by neither side. All crop windows of a section land on one side, so adjacent sections and overlapping windows never cross the split. `data.split_mode=location` restores the original random 90/10 over locations. An existing run keeps the split in its `split.json`; use `-refresh` to get the new one.
 
@@ -121,11 +121,21 @@ SAM2 is trained class-agnostic. Viking labels such as `MC` / `ConePR` are kept o
 
 ### Prompts in training
 
-Each training sample draws one prompt type (`prompt:` in `em_finetune.yaml`; they must sum to 1.0): points only (10%), box only (5%), box and points (5%), circle mask (45%), full mask (30%), negative only (5%). `prompt.enabled: false` goes back to one centroid point. Validation always uses one centroid point so its IoU stays comparable between runs.
+Each training sample draws one prompt type (`prompt:` in `em_finetune.yaml`; they must sum to 1.0): points only (15%), box only (5%), box and points (10%), circle mask (45%), corrupted mask (25%). Full mask and negative only are available but set to 0. `prompt.enabled: false` goes back to one centroid point.
 
 - **Circle mask:** the annotation circle is the dense mask prompt (+1), one foreground point sits at its center, and the loss compares to the full polygon. The model learns to grow from the circle to the boundary.
-- **Full mask:** the whole ground-truth mask is the dense prompt with one interior point.
-- **Negative only:** no foreground prompt; background points and the negative mask only. Needs another annotation in the tile.
+- **Corrupted mask:** the ground-truth mask degraded the way hand painting is (grown or shrunk by up to `corrupt_max_shift_px`, partly painted with strokes, or traced as a coarse polygon; `data/corrupt.py`), plus one interior point. It does not feed the mask-containment loss because it is deliberately wrong in places.
+- **Full mask (off):** the whole ground-truth mask as the prompt is a copy task: the model can lower the loss by echoing its input. Kept for experiments.
+- **Negative only (off):** no foreground prompt; background points and the negative mask only. With more than one unannotated cell in a tile nothing says which one is the target, so it trains guessing. `negative.allow_circle_targets` stays false.
+- **Fully masked tiles:** where the target covers at least `data.full_tile_threshold` (0.99) of the tile, training keeps a deterministic `data.full_tile_keep_fraction` (0.25) of the tiles per location and gives them only point or circle-mask prompts. Production still meets such tiles, so they are not removed.
+- **Corrective clicks (`iterative:`):** `iterative.batch_fraction` (0.2) of the batches predict, sample a click from where the prediction is wrong (a missed area gives a positive click, a spurious one a negative click), and re-run with the previous low-resolution logits plus the click, `rounds_min` to `rounds_max` times. Only the last pass has gradients, and the previous logits are fed back for `prev_mask_prob` of the samples (`sam2_segmentation_trainer/interactive.py`). A ground-truth mask is never the prompt.
+- **Circle negatives over the target:** a neighbor's circle that reaches into the target contradicts the ground truth. `sam2-em-validate --circle-overlap 2000` measures how often; `negative.drop_overlapping_circles` leaves such circles out (off by default).
+- **IoU head:** trained with L1 as in SAM 2 (`loss.iou_use_l1`, false for the old squared error).
+- **Prompt mix log:** each epoch prints the realized mix and writes `train/prompt_mix/<type>`, so a missing circle file or a dropped type shows at once.
+
+### Validation
+
+The validation split (see the layout section) is scored once per prompt in `eval.val_prompts`, each with a fixed, reproducible prompt: `circle_mask` (the inscribed circle, what production starts from), `point` (the deepest interior pixel) and `centroid` (the original prompt; it falls outside C-shaped cells in 2-6% of masks). `eval.primary_val_prompt` (`circle_mask`) picks `best_model.pt` and drives early stopping; `val/iou` follows it. TensorBoard also gets `val/iou/<prompt>`, `val/bf/<prompt>` (boundary F1), `val_iou/<prompt>/<volume>` and `val_iou_cat/<prompt>/<category>`. Fully masked tiles are scored apart as `val/iou_fulltile/<prompt>` and left out of the headline number.
 - **Box:** a hint that the object is most likely inside (each edge jittered outward by up to `box_jitter_frac`). Nothing penalizes predictions that leave the box.
 - **Negative context:** every other annotation in the tile (neighbor masks, plus circles that have no mask) is a -1 area of the dense mask and, with probability `negative.bg_point_prob_*`, becomes 1-9 background points. Where a +1 area and a -1 area overlap the value is 0 (unknown). With no negatives and no foreground mask the dense prompt is omitted so the encoder uses its learned no-mask embedding, not an all-zero mask.
 - **Dense mask scale:** the signed mask is downsampled (nearest) to the 256x256 `mask_input` and fed as logits of +/-10 (`data/prompts.py` `MASK_PROMPT_LOGIT`). The segmentation server does not yet turn a 1-bit mask Feature into `mask_input`; when it does it must use the same values.
@@ -184,6 +194,9 @@ sam2-em-train -benchmark --benchmark-steps 80 --benchmark-val-steps 30
 # Ctrl+C is status stopped. NORNIR_MQTT_ENABLE=0 leaves progress on the console.
 
 sam2-em-eval --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --out /outputs/eval
+# Scores every validation prompt; add --noc for clicks to reach 90% IoU, and --split <run>/split.json to
+# score the run's own validation split. The zero-shot baseline to beat (base weights only):
+sam2-em-eval --zero-shot --split /storage4/Sam2Trainer/runs/sam2_em_v1/split.json --out /outputs/eval_zero_shot
 sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --point 512,400 --out /outputs/pred.png
 
 # SegmentationServer loads Meta {"model": state_dict}, not the raw trainer file.
@@ -199,7 +212,7 @@ Unit tests (no GPU, no NAS):
 python -m unittest discover -s tests -t /workspace -v
 ```
 
-Historical implementer brief: `docs/SAM2 Fine-Tuning Plan for TEM SEM Electron Microscopy.md`. The trainer follows that brief with the confirmed API/data fixes (2.1 config, ImageNet normalize, prompt coords via SAM2 scale, val uses GT centroid, custom image loop rather than the MOSE video trainer).
+Historical implementer brief: `docs/SAM2 Fine-Tuning Plan for TEM SEM Electron Microscopy.md`. The trainer follows that brief with the confirmed API/data fixes (2.1 config, ImageNet normalize, prompt coords via SAM2 scale, validation prompts are fixed per mode (circle, interior point, centroid), custom image loop rather than the MOSE video trainer).
 
 ## Verify
 

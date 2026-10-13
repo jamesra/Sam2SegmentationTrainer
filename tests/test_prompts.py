@@ -175,7 +175,7 @@ class ChoosePromptTypeTests(unittest.TestCase):
         drawn = {
             choose_prompt_type(CFG, rng, can_circle_mask=True, has_negatives=True) for _ in range(4000)
         }
-        self.assertEqual(drawn, set(PromptType))
+        self.assertEqual(drawn, {kind for kind, share in CFG.probabilities().items() if share > 0})
 
     def test_nothing_left_falls_back_to_full_mask(self) -> None:
         only_circle = _only(PromptType.CIRCLE_MASK)

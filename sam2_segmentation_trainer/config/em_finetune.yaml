@@ -74,12 +74,26 @@ differential_lr:
 prompt:
   # false: every training sample is the original single centroid point.
   enabled: true
-  prob_points_only: 0.10
+  # Diameter of a prompt circle as a fraction of the annotated circle (and of a polygon's inscribed circle).
+  # The exporter writes true radii (diameter_scale 1.0); the trainer shrinks them to this on load, and rescales a
+  # file from an older exporter that baked a scale in, so changing it needs no re-export.
+  circle_diameter_scale: 0.95
+  # The six or seven probabilities must sum to 1.0.
+  prob_points_only: 0.15
   prob_box_only: 0.05
-  prob_box_points: 0.05
-  prob_circle_mask: 0.45  # design doc said 0.40, which left the table at 95%; the 5% goes to the production prompt
-  prob_full_mask: 0.30
-  prob_negative_only: 0.05
+  prob_box_points: 0.10
+  prob_circle_mask: 0.45  # the production prompt
+  # A mask prompt degraded the way hand painting is (too thin or fat, patchy, a coarse outline), so the model
+  # has to find the membrane instead of echoing its input. Not used by the mask containment loss.
+  prob_corrupted_mask: 0.25
+  # The ground-truth mask as the prompt is a copy task, and a negative-only prompt does not say which cell is
+  # meant. Both are off; set a probability above 0 only on purpose.
+  prob_full_mask: 0.0
+  prob_negative_only: 0.0
+  corrupt_max_shift_px: 12         # grow or shrink by 1..this many pixels
+  corrupt_stroke_keep_min: 0.40    # partial painting keeps this fraction of the mask at least ...
+  corrupt_stroke_keep_max: 0.90    # ... and at most
+  corrupt_polygon_tolerance: 0.04  # coarse outline: simplification tolerance as a fraction of sqrt(area)
   # Each box edge is pushed out by uniform(0, box_jitter_frac * edge length). A box is only a hint that the
   # object is most likely inside; nothing penalizes predictions that leave it.
   box_jitter_frac: 0.15
@@ -100,11 +114,17 @@ negative:
   allow_circle_targets: false
   # Cap on those samples as a fraction of the mask-bearing examples.
   circle_target_fraction: 0.05
+  # Leave out a neighbor's circle negative when it reaches into the target mask (it would say background
+  # about pixels the loss calls foreground). Choosing by the true mask leaks a little of its extent into the
+  # prompt, so measure first: sam2-em-validate --circle-overlap 2000.
+  drop_overlapping_circles: false
 
 loss:
   focal_weight: 20.0
   dice_weight: 1.0
   iou_weight: 1.0
+  # true: the IoU head is trained with L1 as in SAM 2 (iou_use_l1_loss). false: squared error.
+  iou_use_l1: true
   # Hinge penalty for predicting background where a dense mask prompt said foreground (the mask is a seed
   # the engine grows beyond). 0 disables. Ramps up linearly over containment_warmup_epochs.
   mask_contain_weight: 0.5
@@ -121,6 +141,14 @@ data:
   image_size: 1024
   mask_threshold: 0.5
   train_split: 0.9
+  # Fail at startup when circle-mask prompts are on but a volume has no circle_annotations.json (the prompt mix
+  # would silently shift to the other types). false: warn only.
+  require_circle_file: true
+  # Fully masked tiles: where the target covers at least full_tile_threshold of the tile (null disables), training
+  # keeps a deterministic full_tile_keep_fraction of them and gives them only point or circle-mask prompts.
+  # Validation scores them apart (val/iou_fulltile) and leaves them out of val/iou.
+  full_tile_threshold: 0.99
+  full_tile_keep_fraction: 0.25
   # zslab: validation is slab_count contiguous runs of sections spaced evenly through each volume, together about
   # (1 - train_split) of its examples, with guard_sections sections on each side of every slab used by neither
   # side. Adjacent sections and overlapping crop windows then never cross the split.
@@ -144,7 +172,23 @@ model:
   unfreeze_mask_cnn: true
   activation_checkpointing: true
 
+# Corrective-click training, as in SAM 2: a share of the batches predict, sample a click from where the
+# prediction is wrong, and re-run with the previous low-resolution logits plus the click. Only the last pass
+# has gradients. A ground-truth mask is never the prompt, so the model cannot learn to copy its input.
+iterative:
+  batch_fraction: 0.2   # share of batches that take this path; 0 turns it off
+  rounds_min: 2         # corrective clicks per such batch, drawn uniformly from rounds_min..rounds_max
+  rounds_max: 6
+  prev_mask_prob: 0.5   # per sample, chance the previous logits are fed back (muSAM: always feeding it over-relies)
+
 eval:
+  # Validation scores the validation split once per prompt, with fixed prompts:
+  #   circle_mask  the inscribed circle as the dense prompt (what production starts from)
+  #   point        one foreground point at the deepest interior pixel
+  #   centroid     one point at the mask centroid (the original prompt; can land outside C-shaped cells)
+  val_prompts: [circle_mask, point, centroid]
+  # The prompt whose IoU picks best_model.pt and drives early stopping (val/iou).
+  primary_val_prompt: circle_mask
   grid_every: 10
   max_grids: 40
 

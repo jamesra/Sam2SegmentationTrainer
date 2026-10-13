@@ -12,11 +12,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
+from sam2_segmentation_trainer.data.corrupt import corrupt_mask
 from annotation_crops.negatives import (
     KIND_CIRCLE,
     NegativeRegion,
@@ -37,6 +38,7 @@ foreground or background mask Feature into ``mask_input`` at inference must use 
 trained mask network sees a different scale than it was trained on.
 """
 
+
 _MAX_CANDIDATES = 20000
 """Interior pixels considered when placing points; larger sets are randomly thinned to keep this cheap."""
 
@@ -50,6 +52,11 @@ class PromptType(str, Enum):
     CIRCLE_MASK = "circle_mask"
     FULL_MASK = "full_mask"
     NEGATIVE_ONLY = "negative_only"
+    CORRUPTED_MASK = "corrupted_mask"
+
+
+FULL_TILE_PROMPTS = frozenset({PromptType.POINTS, PromptType.CIRCLE_MASK})
+"""Prompt types a fully masked tile may draw: nothing that hands the model the answer or a boundary to find."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +69,7 @@ class PromptConfig:
     prob_circle_mask: float = 0.45
     prob_full_mask: float = 0.30
     prob_negative_only: float = 0.05
+    prob_corrupted_mask: float = 0.0
     box_jitter_frac: float = 0.15
     box_points_max: int = 3
     min_edge_px: float = 15.0
@@ -72,6 +80,11 @@ class PromptConfig:
     cache_size: int = 64
     allow_circle_targets: bool = False
     circle_target_fraction: float = 0.05
+    drop_overlapping_circles: bool = False
+    corrupt_max_shift_px: int = 12
+    corrupt_stroke_keep_min: float = 0.40
+    corrupt_stroke_keep_max: float = 0.90
+    corrupt_polygon_tolerance: float = 0.04
 
     def probabilities(self) -> dict[PromptType, float]:
         """Draw probability of each prompt type, before availability is considered."""
@@ -82,6 +95,7 @@ class PromptConfig:
             PromptType.CIRCLE_MASK: self.prob_circle_mask,
             PromptType.FULL_MASK: self.prob_full_mask,
             PromptType.NEGATIVE_ONLY: self.prob_negative_only,
+            PromptType.CORRUPTED_MASK: self.prob_corrupted_mask,
         }
 
     def validate(self) -> None:
@@ -96,6 +110,14 @@ class PromptConfig:
             raise ValueError("prompt.line_frac_min/line_frac_max must satisfy 0 <= min <= max <= 1")
         if self.box_points_max < 1:
             raise ValueError("prompt.box_points_max must be >= 1")
+        if not 0.0 <= self.corrupt_stroke_keep_min <= self.corrupt_stroke_keep_max <= 1.0:
+            raise ValueError("prompt.corrupt_stroke_keep_min/max must satisfy 0 <= min <= max <= 1")
+        if self.corrupt_max_shift_px < 1:
+            raise ValueError("prompt.corrupt_max_shift_px must be >= 1")
+        if self.corrupt_polygon_tolerance <= 0.0:
+            raise ValueError("prompt.corrupt_polygon_tolerance must be > 0")
+        if not isinstance(self.drop_overlapping_circles, bool):
+            raise ValueError("negative.drop_overlapping_circles must be true or false")
         for name in ("bg_point_prob_circle", "bg_point_prob_polygon", "circle_target_fraction"):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"negative.{name} must be within [0, 1]")
@@ -196,6 +218,36 @@ def sample_points_in_mask(
     return np.stack(points).astype(np.float32)
 
 
+def interior_point_xy(mask: np.ndarray) -> tuple[float, float] | None:
+    """The deepest interior pixel of a boolean mask as (x, y), or None for an empty mask.
+
+    Unlike the centroid it always lies inside the mask, which matters for C-shaped and branching cells. The mask
+    is padded with background first, so a mask cut by the tile edge is measured against the edge too.
+    """
+    if not mask.any():
+        return None
+    depth = distance_transform_edt(np.pad(mask.astype(bool), 1))[1:-1, 1:-1]
+    y, x = np.unravel_index(int(np.argmax(depth)), depth.shape)
+    return float(x), float(y)
+
+
+def inscribed_circle_xyr(mask: np.ndarray, scale: float = 0.95) -> tuple[float, float, float] | None:
+    """Largest circle inside a boolean mask as (center_x, center_y, radius), radius times ``scale``.
+
+    Stands in for the exporter's inscribed circle (``circle_annotations.json``, ``source = inscribed``) when a
+    validation sample has none in its tile. The mask is padded with background, so the circle stays in the visible part.
+    """
+    if not mask.any():
+        return None
+    depth = distance_transform_edt(np.pad(mask.astype(bool), 1))[1:-1, 1:-1]
+    y, x = np.unravel_index(int(np.argmax(depth)), depth.shape)
+    # Distance is to the nearest background pixel center; half a pixel less keeps the disc off it.
+    radius = max(float(depth[y, x]) - 0.5, 0.5) * float(scale)
+    if radius <= 0.0:
+        return None
+    return float(x) + 0.5, float(y) + 0.5, radius
+
+
 def jittered_box(
     mask: np.ndarray,
     rng: np.random.Generator,
@@ -245,20 +297,28 @@ def choose_prompt_type(
     *,
     can_circle_mask: bool,
     has_negatives: bool,
+    allowed: Collection[PromptType] | None = None,
 ) -> PromptType:
     """Draw a prompt type, dropping types the sample cannot support and renormalizing the rest.
 
     ``circle_mask`` needs a circle for the target whose center is in the tile; ``negative_only`` needs at least
-    one other annotation. Their probability mass moves to the remaining types in proportion. If nothing is
-    left the sample gets a full mask prompt.
+    one other annotation. Their probability mass moves to the remaining types in proportion. With ``allowed``
+    every other type is dropped too (fully masked tiles use only points and circle masks). If nothing is left
+    the sample gets a points prompt when that is allowed, else a full mask prompt.
     """
     weights = dict(cfg.probabilities())
     if not can_circle_mask:
         weights[PromptType.CIRCLE_MASK] = 0.0
     if not has_negatives:
         weights[PromptType.NEGATIVE_ONLY] = 0.0
+    if allowed is not None:
+        for kind in weights:
+            if kind not in allowed:
+                weights[kind] = 0.0
     total = sum(weights.values())
     if total <= 0.0:
+        if allowed is not None and PromptType.POINTS in allowed:
+            return PromptType.POINTS
         return PromptType.FULL_MASK
     types = list(weights)
     return types[int(rng.choice(len(types), p=np.array([weights[t] for t in types]) / total))]
@@ -345,6 +405,16 @@ def build_prompt(
     elif prompt_type is PromptType.FULL_MASK:
         foreground_canvas = target_mask.astype(np.int8)
         points = sample_points_in_mask(target_mask, 1, rng, **kwargs)
+    elif prompt_type is PromptType.CORRUPTED_MASK:
+        foreground_canvas = corrupt_mask(
+            target_mask,
+            rng,
+            max_shift_px=cfg.corrupt_max_shift_px,
+            stroke_keep_min=cfg.corrupt_stroke_keep_min,
+            stroke_keep_max=cfg.corrupt_stroke_keep_max,
+            polygon_tolerance=cfg.corrupt_polygon_tolerance,
+        ).astype(np.int8)
+        points = sample_points_in_mask(target_mask, 1, rng, **kwargs)
     elif prompt_type is PromptType.NEGATIVE_ONLY:
         points = np.zeros((0, 2), dtype=np.float32)
         if not background.shape[0]:
@@ -358,7 +428,10 @@ def build_prompt(
     )
     signed = combine_signed(foreground_canvas, negative)
     has_dense = bool(signed.any())
-    foreground_region = (signed > 0) if foreground_canvas is not None and bool((signed > 0).any()) else None
+    # A corrupted mask is deliberately wrong in places, so it must not feed the "never predict background here"
+    # containment loss; every other dense foreground is trustworthy.
+    trusted = foreground_canvas is not None and prompt_type is not PromptType.CORRUPTED_MASK
+    foreground_region = (signed > 0) if trusted and bool((signed > 0).any()) else None
     return PromptSample(
         prompt_type=prompt_type,
         point_coords=coords.astype(np.float32, copy=False),

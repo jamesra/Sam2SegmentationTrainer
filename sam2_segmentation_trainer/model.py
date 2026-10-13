@@ -162,6 +162,7 @@ def decode_prompts(
     orig_hw: tuple[int, int] | None = None,
     boxes: torch.Tensor | None = None,
     dense_masks: torch.Tensor | None = None,
+    return_low_res: bool = False,
 ):
     """Prompt encoder + mask decoder for a batch that shares one prompt structure.
 
@@ -171,7 +172,9 @@ def decode_prompts(
     corner labels are built here). ``dense_masks`` is ``[B, 1, 256, 256]`` float ``mask_input`` logits. None
     selects the encoder's learned no-box / no-mask embedding, which an all-zero tensor would not.
 
-    Returns ``(pred_logits [B, image_size, image_size], iou_preds [B, 1])``.
+    Returns ``(pred_logits [B, image_size, image_size], iou_preds [B, 1])``; with ``return_low_res`` a third
+    value, the decoder's own low-resolution logits ``[B, h, w]``, which is what corrective-click rounds feed
+    back as the next mask prompt.
     """
     if orig_hw is None:
         orig_hw = (image_size, image_size)
@@ -208,6 +211,8 @@ def decode_prompts(
         mode="bilinear",
         align_corners=False,
     )[:, 0]
+    if return_low_res:
+        return pred_logits, iou_preds, low_res_masks[:, 0]
     return pred_logits, iou_preds
 
 
@@ -251,14 +256,46 @@ def predict_masks_mixed(
     back to batch order. ``boxes[i]`` is ``[4]`` xyxy and ``dense_masks[i]`` is ``[256, 256]`` or None.
     Returns ``(pred_logits [B, H, W], iou_preds [B, 1])`` like :func:`predict_masks`.
     """
-    batch = images.shape[0]
     image_embed, high_res = encode_images(model, images)
+    return decode_grouped(
+        model,
+        image_embed,
+        high_res,
+        point_coords,
+        point_labels,
+        boxes,
+        dense_masks,
+        image_size=image_size,
+        orig_hw=orig_hw,
+    )
+
+
+def decode_grouped(
+    model,
+    image_embed: torch.Tensor,
+    high_res: list[torch.Tensor],
+    point_coords: torch.Tensor,
+    point_labels: torch.Tensor,
+    boxes: Sequence[torch.Tensor | None],
+    dense_masks: Sequence[torch.Tensor | None],
+    *,
+    image_size: int,
+    orig_hw: tuple[int, int] | None = None,
+    return_low_res: bool = False,
+):
+    """Decode an already encoded batch whose samples may have boxes and dense masks or not.
+
+    Samples are grouped by (has box, has dense mask) and each group is decoded separately, then scattered back
+    to batch order. With ``return_low_res`` the result has a third value, the low-resolution logits
+    ``[B, h, w]``.
+    """
+    batch = image_embed.shape[0]
     groups: dict[tuple[bool, bool], list[int]] = {}
     for i in range(batch):
         groups.setdefault((boxes[i] is not None, dense_masks[i] is not None), []).append(i)
 
-    device = images.device
-    pieces: list[tuple[list[int], torch.Tensor, torch.Tensor]] = []
+    device = image_embed.device
+    pieces: list[tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
     for (has_box, has_dense), members in groups.items():
         sel = torch.tensor(members, device=device, dtype=torch.long)
         group_boxes = (
@@ -269,7 +306,7 @@ def predict_masks_mixed(
             if has_dense
             else None
         )
-        logits, iou = decode_prompts(
+        decoded = decode_prompts(
             model,
             image_embed[sel],
             [feat[sel] for feat in high_res],
@@ -279,19 +316,24 @@ def predict_masks_mixed(
             orig_hw=orig_hw,
             boxes=group_boxes,
             dense_masks=group_dense,
+            return_low_res=return_low_res,
         )
-        pieces.append((members, logits, iou))
+        pieces.append((members, decoded[0], decoded[1], decoded[2] if return_low_res else None))
 
     if len(pieces) == 1:
-        return pieces[0][1], pieces[0][2]
-    first_logits, first_iou = pieces[0][1], pieces[0][2]
+        _members, logits, iou, low = pieces[0]
+        return (logits, iou, low) if return_low_res else (logits, iou)
+    first_logits, first_iou, first_low = pieces[0][1], pieces[0][2], pieces[0][3]
     pred_logits = first_logits.new_empty((batch, *first_logits.shape[1:]))
     iou_preds = first_iou.new_empty((batch, *first_iou.shape[1:]))
-    for members, logits, iou in pieces:
+    low_res = first_low.new_empty((batch, *first_low.shape[1:])) if return_low_res else None
+    for members, logits, iou, low in pieces:
         index = torch.tensor(members, device=device, dtype=torch.long)
         pred_logits = pred_logits.index_copy(0, index, logits)
         iou_preds = iou_preds.index_copy(0, index, iou)
-    return pred_logits, iou_preds
+        if return_low_res:
+            low_res = low_res.index_copy(0, index, low)
+    return (pred_logits, iou_preds, low_res) if return_low_res else (pred_logits, iou_preds)
 
 
 def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -320,9 +362,9 @@ def focal_loss(
 
 
 def iou_prediction_loss_per_sample(
-    pred: torch.Tensor, target: torch.Tensor, iou_preds: torch.Tensor
+    pred: torch.Tensor, target: torch.Tensor, iou_preds: torch.Tensor, *, use_l1: bool = False
 ) -> torch.Tensor:
-    """Per-sample IoU-head MSE (shape ``[B]``)."""
+    """Per-sample IoU-head loss (shape ``[B]``): squared error, or absolute error with ``use_l1`` (SAM 2)."""
     with torch.no_grad():
         pred_bin = torch.sigmoid(pred) > 0.5
         target_b = target.bool()
@@ -330,7 +372,8 @@ def iou_prediction_loss_per_sample(
         union = (pred_bin | target_b).flatten(1).sum(1).float()
         gt_iou = inter / (union + 1e-6)
     iou_head = iou_preds[:, 0] if iou_preds.ndim > 1 else iou_preds
-    return (iou_head.float() - gt_iou).pow(2)
+    error = iou_head.float() - gt_iou
+    return error.abs() if use_l1 else error.pow(2)
 
 
 def iou_prediction_loss(
@@ -390,6 +433,7 @@ def combined_loss(
     containment_radius: float = 8.0,
     prompt_foreground: torch.Tensor | None = None,
     mask_contain_weight: float = 0.0,
+    iou_use_l1: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return the batch loss and detached GPU stats. Callers sync when they log.
 
@@ -399,7 +443,7 @@ def combined_loss(
     """
     loss_focal_ps = focal_loss_per_sample(pred, target)
     loss_dice_ps = dice_loss(pred, target)
-    loss_iou_ps = iou_prediction_loss_per_sample(pred, target, iou_preds)
+    loss_iou_ps = iou_prediction_loss_per_sample(pred, target, iou_preds, use_l1=iou_use_l1)
     sample_losses = (
         float(focal_weight) * loss_focal_ps
         + float(dice_weight) * loss_dice_ps

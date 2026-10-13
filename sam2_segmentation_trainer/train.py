@@ -15,6 +15,7 @@ import signal
 import sqlite3
 import statistics
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +48,7 @@ from sam2_segmentation_trainer.data.tiles import (
     circle_target_examples,
 )
 from sam2_segmentation_trainer.losses import containment_warmup_scale
+from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
 from annotation_crops.scores import ensure_location_scores_schema
 
 from sam2_segmentation_trainer.data.manifest import (
@@ -57,6 +59,14 @@ from sam2_segmentation_trainer.data.manifest import (
     move_ignored_masks,
     take_model_sized,
     volume_counts,
+)
+from sam2_segmentation_trainer.data.fulltile import cap_full_tiles, is_full_tile
+from sam2_segmentation_trainer.interactive import iterative_predict_masks
+from sam2_segmentation_trainer.validation import (
+    DEFAULT_VAL_PROMPTS,
+    ValidationSuite,
+    collect_records,
+    log_results,
 )
 from sam2_segmentation_trainer.data.splits import (
     include_new_keys,
@@ -330,6 +340,7 @@ def run_throughput_benchmark(
                 containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
                 prompt_foreground=prompt_fg,
                 mask_contain_weight=_mask_contain_weight(cfg, 1.0),
+                iou_use_l1=_iou_use_l1(cfg),
             )
             loss = loss / accum
         scaler.scale(loss).backward()
@@ -471,17 +482,35 @@ def _mixed_prompts_enabled(cfg: DictConfig) -> bool:
     return bool(OmegaConf.select(cfg, "prompt.enabled", default=True))
 
 
+def _circle_scale(cfg: DictConfig) -> float:
+    """Diameter scale of the circles drawn as prompts and negatives (``prompt.circle_diameter_scale``).
+
+    The exporter writes true radii; the loader rescales each file to this value.
+    """
+    return float(OmegaConf.select(cfg, "prompt.circle_diameter_scale", default=DEFAULT_CIRCLE_DIAMETER_SCALE))
+
+
+def _circle_guard(cfg: DictConfig, prompt_cfg: PromptConfig) -> dict:
+    """Keyword arguments for :func:`build_tile_context`: the circle scale, and a failure when circles are absent."""
+    return {
+        "require_circles": prompt_cfg.prob_circle_mask > 0.0
+        and bool(OmegaConf.select(cfg, "data.require_circle_file", default=True)),
+        "circle_scale": _circle_scale(cfg),
+    }
+
+
 def _with_circle_targets(
     examples: list,
     prompt_cfg: PromptConfig,
     seed: int,
+    guard: dict | None = None,
 ) -> tuple[list, TileContext]:
     """Tile context for ``examples`` plus, when allowed, circle-only training examples appended to them.
 
     The context is built from the mask-bearing examples alone, so the added circle targets are not their own
     neighbors. Used at startup and again whenever the inventory is rebuilt.
     """
-    context = build_tile_context(examples)
+    context = build_tile_context(examples, **(guard or {}))
     if prompt_cfg.allow_circle_targets:
         extra = circle_target_examples(
             examples, context, max_fraction=prompt_cfg.circle_target_fraction, seed=seed
@@ -490,6 +519,64 @@ def _with_circle_targets(
             print(f"added {len(extra)} circle-only negative-prompt targets")
             return list(examples) + extra, context
     return list(examples), context
+
+
+def prompt_mix_fractions(counts: Counter[str]) -> dict[str, float]:
+    """Share of each prompt type among the samples of one epoch, largest first."""
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    return {ptype: count / total for ptype, count in counts.most_common()}
+
+
+def _log_prompt_mix(writer: SummaryWriter, epoch: int, counts: Counter[str]) -> None:
+    """Print and log the realized prompt mix, so a missing circle file or a dropped type shows at once."""
+    fractions = prompt_mix_fractions(counts)
+    if not fractions:
+        return
+    summary = ", ".join(f"{ptype} {share:.1%}" for ptype, share in fractions.items())
+    print(f"epoch {epoch} prompt mix ({sum(counts.values())} samples): {summary}")
+    for ptype, share in fractions.items():
+        writer.add_scalar(f"train/prompt_mix/{ptype}", share, epoch)
+
+
+def _iterative_rounds(cfg: DictConfig, seed: int, epoch: int, step: int) -> int:
+    """Corrective-click rounds for this batch: 0 for an ordinary step, else a draw from ``iterative.rounds_min..max``.
+
+    ``iterative.batch_fraction`` of the batches take the iterative path. The draw is seeded from
+    ``(seed, epoch, step)``, so a resumed epoch repeats it.
+    """
+    fraction = float(OmegaConf.select(cfg, "iterative.batch_fraction", default=0.0))
+    if fraction <= 0.0:
+        return 0
+    low = max(1, int(OmegaConf.select(cfg, "iterative.rounds_min", default=2)))
+    high = max(low, int(OmegaConf.select(cfg, "iterative.rounds_max", default=6)))
+    rng = np.random.default_rng([int(seed), int(epoch), int(step), 8])
+    if rng.random() >= fraction:
+        return 0
+    return int(rng.integers(low, high + 1))
+
+
+def _full_tile_settings(cfg: DictConfig) -> tuple[float | None, float]:
+    """``(threshold, keep_fraction)`` for fully masked tiles; a null threshold turns the handling off."""
+    threshold = OmegaConf.select(cfg, "data.full_tile_threshold", default=0.99)
+    keep = float(OmegaConf.select(cfg, "data.full_tile_keep_fraction", default=0.25))
+    return (None if threshold is None else float(threshold)), keep
+
+
+def _cap_full_tiles(train_ex: list, cfg: DictConfig) -> list:
+    """Keep a deterministic fraction of the training tiles that the target fills completely."""
+    threshold, keep = _full_tile_settings(cfg)
+    capped = cap_full_tiles(train_ex, threshold=threshold, keep_fraction=keep, seed=int(cfg.training.seed))
+    dropped = len(train_ex) - len(capped)
+    if dropped:
+        print(f"fully masked tiles: kept {sum(is_full_tile(e, threshold) for e in capped)}, dropped {dropped} from training")
+    return capped
+
+
+def _iou_use_l1(cfg: DictConfig) -> bool:
+    """SAM 2 trains the IoU head with L1 (``iou_use_l1_loss``); ``loss.iou_use_l1: false`` restores MSE."""
+    return bool(OmegaConf.select(cfg, "loss.iou_use_l1", default=True))
 
 
 def _mask_contain_weight(cfg: DictConfig, scale: float) -> float:
@@ -556,39 +643,10 @@ def run_validation(
     the start of the loader. The prediction is the mask decoder output after
     ``sigmoid > threshold`` (0.5 in the default config).
     """
-    model.eval()
-    samples: list[tuple[str, float]] = []
-    overlays: list[tuple[str, np.ndarray]] = []
-    overlay_counts: dict[str, int] = {}
-    keep_overlays = max(0, int(overlays_per_volume))
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        masks = batch["mask"].to(device, non_blocking=True)
-        points = batch["point"].to(device, non_blocking=True)
-        labels = batch["point_label"].to(device, non_blocking=True)
-        pred, _iou = predict_masks(
-            model, images, points, labels, image_size=image_size
-        )
-        pred_bin = (torch.sigmoid(pred) > threshold).to(torch.int64)
-        meta = batch.get("meta") or []
-        for index, (pred_i, mask_i, item) in enumerate(
-            zip(pred_bin, masks, meta, strict=True)
-        ):
-            pred_np = pred_i.detach().cpu().numpy()
-            gt_np = mask_i.detach().cpu().numpy()
-            stats = iou_dice_pr(pred_np, gt_np)
-            volume = "" if item is None else str(item.get("volume", "")).strip()
-            samples.append((volume, stats["iou"]))
-            if not volume or keep_overlays <= 0:
-                continue
-            seen = overlay_counts.get(volume, 0)
-            if seen >= keep_overlays:
-                continue
-            panel = overlay_panel(denorm_preview(batch["image"][index]), gt_np, pred_np)
-            overlays.append((volume, panel))
-            overlay_counts[volume] = seen + 1
-    model.train()
-    overall, by_volume = mean_iou_by_volume(samples)
+    records, overlays = collect_records(
+        model, loader, device, image_size, threshold, overlays_per_volume=overlays_per_volume
+    )
+    overall, by_volume = mean_iou_by_volume([(r["volume"], r["iou"]) for r in records])
     return overall, by_volume, overlays
 
 
@@ -862,7 +920,9 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     prompt_cfg = PromptConfig.from_cfg(cfg)
     tile_context: TileContext | None = None
     if mixed_prompts:
-        examples, tile_context = _with_circle_targets(examples, prompt_cfg, int(cfg.training.seed))
+        examples, tile_context = _with_circle_targets(
+            examples, prompt_cfg, int(cfg.training.seed), _circle_guard(cfg, prompt_cfg)
+        )
         n_with_negatives = sum(
             1
             for ex in examples
@@ -924,6 +984,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         even_applied = even
         print(f"wrote split {run_split} mode={split.mode} even_per_volume={even}")
     train_ex, val_ex = split.partition(examples)
+    train_ex = _cap_full_tiles(train_ex, cfg)
     if not train_ex or not val_ex:
         raise RuntimeError(
             f"empty split: train={len(train_ex)} val={len(val_ex)} (file {split_path})"
@@ -969,10 +1030,25 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         prompt_cfg=prompt_cfg if mixed_prompts else None,
         seed=seed,
         epoch=epoch_counter,
+        full_tile_threshold=_full_tile_settings(cfg)[0],
     )
-    val_ds = EMSegDataset(
-        val_ex, split="val", image_size=image_size, missing_tiles=missing_tiles
+    val_modes = [str(m) for m in OmegaConf.select(cfg, "eval.val_prompts", default=list(DEFAULT_VAL_PROMPTS))]
+    val_primary = str(OmegaConf.select(cfg, "eval.primary_val_prompt", default=val_modes[0]))
+    val_suite = ValidationSuite(
+        val_ex,
+        modes=val_modes,
+        primary=val_primary,
+        image_size=image_size,
+        num_workers=num_workers,
+        missing_tiles=missing_tiles,
+        tiles=tile_context,
+        prompt_cfg=prompt_cfg if mixed_prompts else None,
+        seed=seed,
+        circle_scale=_circle_scale(cfg),
+        full_tile_threshold=_full_tile_settings(cfg)[0],
     )
+    val_ds = val_suite.dataset
+    print(f"validation prompts: {val_modes} (primary {val_primary})")
 
     n_train = len(train_ds)
     batches_per_epoch = max(1, n_train // batch_size)
@@ -1045,15 +1121,6 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         device,
         worker_name=run_name,
     )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_em,
-    )
-
     best_val_iou = -1.0
     epochs_without_improve = 0
     global_step = 0
@@ -1149,7 +1216,9 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
             examples, rejected_tiles = take_model_sized(examples, image_size)
             if mixed_prompts:
-                examples, tile_context = _with_circle_targets(examples, prompt_cfg, seed)
+                examples, tile_context = _with_circle_targets(
+                    examples, prompt_cfg, seed, _circle_guard(cfg, prompt_cfg)
+                )
                 train_ds.tiles = tile_context
             grown = include_new_keys(
                 split,
@@ -1161,22 +1230,17 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 split = grown
                 save_split(split, run_split)
             train_ex, val_ex = split.partition(examples)
+            train_ex = _cap_full_tiles(train_ex, cfg)
             if not train_ex:
                 raise RuntimeError(
                     f"inventory refresh left no training examples under {data_dir}"
                 )
             train_ds.replace_examples(train_ex)
-            val_ds.replace_examples(val_ex)
+            val_suite.replace_examples(val_ex)
+            if mixed_prompts:
+                val_suite.set_tiles(tile_context)
             n_train = len(train_ds)
             batches_per_epoch = max(1, n_train // batch_size)
-            val_dl = DataLoader(
-                val_ds,
-                batch_size=1,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=True,
-                collate_fn=collate_em,
-            )
             ignore_stamps = ignore_list_stamps(volumes, data_dir)
             print(
                 f"epoch {epoch}: inventory rebuilt, "
@@ -1221,6 +1285,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         interrupted = False
         t_prev = time.perf_counter()
         loss_window = _LossWindow()
+        epoch_prompt_mix: Counter[str] = Counter()
         log_every = max(1, int(cfg.training.log_every_n_steps))
 
         def flush_losses() -> None:
@@ -1228,6 +1293,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             if not rows:
                 return
             for row in rows:
+                epoch_prompt_mix.update(row["prompt_types"])
                 anomaly.observe(
                     progress=progress,
                     epoch=row["epoch"],
@@ -1289,15 +1355,31 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 dtype=amp_dtype,
                 enabled=bool(cfg.training.mixed_precision) and device.type == "cuda",
             ):
-                pred, iou_preds = predict_masks_mixed(
-                    model,
-                    images,
-                    points,
-                    labels,
-                    batch["boxes"],
-                    batch["dense_mask"],
-                    image_size=image_size,
-                )
+                correction_rounds = _iterative_rounds(cfg, seed, epoch, step)
+                if correction_rounds > 0:
+                    pred, iou_preds = iterative_predict_masks(
+                        model,
+                        images,
+                        points,
+                        labels,
+                        batch["boxes"],
+                        batch["dense_mask"],
+                        masks,
+                        image_size=image_size,
+                        rounds=correction_rounds,
+                        prev_mask_prob=float(OmegaConf.select(cfg, "iterative.prev_mask_prob", default=0.5)),
+                        rng=np.random.default_rng([seed, epoch, step, 9]),
+                    )
+                else:
+                    pred, iou_preds = predict_masks_mixed(
+                        model,
+                        images,
+                        points,
+                        labels,
+                        batch["boxes"],
+                        batch["dense_mask"],
+                        image_size=image_size,
+                    )
                 loss, stats = combined_loss(
                     pred,
                     masks,
@@ -1311,6 +1393,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
                     prompt_foreground=prompt_fg,
                     mask_contain_weight=_mask_contain_weight(cfg, contain_scale),
+                    iou_use_l1=_iou_use_l1(cfg),
                 )
                 loss = loss / accum
             scaler.scale(loss).backward()
@@ -1356,6 +1439,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 break
 
         flush_losses()
+        _log_prompt_mix(writer, epoch, epoch_prompt_mix)
 
         if interrupted:
             profiler.close()
@@ -1373,9 +1457,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 else 0
             )
             try:
-                val_iou, val_by_volume, overlays = run_validation(
+                val_results, overlays = val_suite.run(
                     model,
-                    val_dl,
                     device,
                     image_size,
                     float(cfg.data.mask_threshold),
@@ -1383,9 +1466,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 )
             finally:
                 progress.stage("validate", "end")
-            writer.add_scalar("val/iou", val_iou, epoch)
-            for volume, score in val_by_volume.items():
-                writer.add_scalar(f"val_iou/{volume}", score, epoch)
+            val_iou = val_results[val_suite.primary].iou
+            val_summary = log_results(writer, epoch, val_results, val_suite.primary)
             if overlays:
                 slots: dict[str, int] = {}
                 for volume, panel in overlays:
@@ -1403,15 +1485,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     f"logged {len(overlays)} val overlays at step {global_step} "
                     f"({', '.join(sorted(slots))})"
                 )
-            per_volume = ", ".join(
-                f"{name} {score:.4f}" for name, score in val_by_volume.items()
-            )
-            if per_volume:
-                progress.transcript(
-                    f"epoch {epoch} val IoU {val_iou:.4f} ({per_volume})"
-                )
-            else:
-                progress.transcript(f"epoch {epoch} val IoU {val_iou:.4f}")
+            progress.transcript(val_summary)
             if val_iou > best_val_iou + min_delta:
                 best_val_iou = val_iou
                 epochs_without_improve = 0

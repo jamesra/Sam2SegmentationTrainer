@@ -21,6 +21,8 @@ import numpy as np
 from PIL import Image
 
 CIRCLE_FILE_NAME = "circle_annotations.json"
+#: Fraction of a circle's true diameter that a prompt circle covers (training default, ``prompt.circle_diameter_scale``).
+DEFAULT_CIRCLE_DIAMETER_SCALE = 0.95
 """File the exporter writes in ``AnnotationCrops/``: circle annotations keyed by ``imageKey``."""
 
 KIND_POLYGON = "polygon"
@@ -76,8 +78,14 @@ def circle_file_stamp(crops: Path) -> int | None:
         return None
 
 
-def load_circle_annotations(crops: Path) -> dict[str, tuple[CircleAnnotation, ...]]:
+def load_circle_annotations(
+    crops: Path, scale: float | None = None
+) -> dict[str, tuple[CircleAnnotation, ...]]:
     """Read ``circle_annotations.json`` into ``{imageKey: circles}``.
+
+    The exporter writes true radii and records ``diameter_scale`` 1.0; files from older exporters have the
+    scale baked into ``radius``. ``scale`` is the diameter scale the caller wants: every radius is multiplied
+    by ``scale / diameter_scale`` so both kinds of file give the same circles. None keeps the radii as written.
 
     A missing or unreadable file, or a version this code does not know, yields an empty mapping: circles are
     optional context, so training and the gallery run without them. Malformed entries are skipped.
@@ -91,6 +99,14 @@ def load_circle_annotations(crops: Path) -> dict[str, tuple[CircleAnnotation, ..
     cells = payload.get("grid_cells")
     if not isinstance(cells, dict):
         return {}
+    factor = 1.0
+    if scale is not None:
+        try:
+            file_scale = float(payload.get("diameter_scale", 1.0))
+        except (TypeError, ValueError):
+            file_scale = 1.0
+        if file_scale > 0.0:
+            factor = float(scale) / file_scale
     index: dict[str, tuple[CircleAnnotation, ...]] = {}
     for image_key, entries in cells.items():
         circles: list[CircleAnnotation] = []
@@ -101,7 +117,7 @@ def load_circle_annotations(crops: Path) -> dict[str, tuple[CircleAnnotation, ..
                         location_id=int(entry["location_id"]),
                         center_x=float(entry["center_x"]),
                         center_y=float(entry["center_y"]),
-                        radius=float(entry["radius"]),
+                        radius=float(entry["radius"]) * factor,
                         structure_label=str(entry.get("structure_label") or ""),
                         has_polygon_mask=bool(entry.get("has_polygon_mask", False)),
                         source=str(entry.get("source") or "annotated"),
@@ -112,6 +128,15 @@ def load_circle_annotations(crops: Path) -> dict[str, tuple[CircleAnnotation, ..
         if circles:
             index[str(image_key)] = tuple(circles)
     return index
+
+
+def load_circle_scale(crops: Path) -> float | None:
+    """The ``diameter_scale`` recorded in ``circle_annotations.json``, or None when absent or unreadable."""
+    try:
+        payload = json.loads(circle_file_path(crops).read_text(encoding="utf-8"))
+        return float(payload["diameter_scale"])
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def rasterize_circle(shape: tuple[int, int], center_x: float, center_y: float, radius: float) -> np.ndarray:
@@ -250,3 +275,19 @@ def combine_signed(foreground: np.ndarray | None, negative: np.ndarray) -> np.nd
     if foreground is None:
         return negative.copy()
     return np.clip(negative.astype(np.int16) + foreground.astype(np.int16), -1, 1).astype(np.int8)
+
+
+def circles_over_target(regions: Sequence[NegativeRegion], target: np.ndarray) -> list[NegativeRegion]:
+    """The circle regions that touch the target mask. Those say background about pixels the loss calls foreground."""
+    return [r for r in regions if r.kind == KIND_CIRCLE and bool((r.mask & target).any())]
+
+
+def drop_circles_over_target(regions: Sequence[NegativeRegion], target: np.ndarray) -> list[NegativeRegion]:
+    """``regions`` without the circles that overlap ``target``.
+
+    A polygon neighbor is never dropped. A neighbor's circle that reaches into the target contradicts the ground
+    truth (combine_signed only cancels it against a dense foreground canvas, which most prompt types lack).
+    Choosing by the true mask lets a little of its extent into the prompt, so this is off by default.
+    """
+    over = {id(r) for r in circles_over_target(regions, target)}
+    return [r for r in regions if id(r) not in over]

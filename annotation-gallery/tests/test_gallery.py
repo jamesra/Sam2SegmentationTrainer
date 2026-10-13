@@ -25,6 +25,7 @@ from catalog import (  # noqa: E402
     ignore_location,
     list_catalog_rows,
     restore_location,
+    review_locations,
 )
 from identity import OidcIdentity, map_permission_names  # noqa: E402
 from server import (  # noqa: E402
@@ -1103,3 +1104,49 @@ def test_thumbnail_request_encodes_jpeg(httpd: tuple[str, int], registry: Path) 
     assert body[:2] == b"\xff\xd8"
     saved = registry / "RC2" / "AnnotationCrops" / "overlays" / "thumb" / "384" / "RC2_17_D1_X0_Y0.jpg"
     assert saved.is_file()
+
+
+def test_review_locations_touches_only_the_listed_locations(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    (crops / "masks").mkdir(parents=True)
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE locations ("
+        "location_id INTEGER NOT NULL, z INTEGER NOT NULL, structure_id INTEGER, "
+        "structure_label TEXT, type_id INTEGER, type_name TEXT, radius REAL, "
+        "image_key TEXT NOT NULL, image_relpath TEXT, mask_relpath TEXT, "
+        "ignored INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (location_id, image_key))"
+    )
+    connection.executemany(
+        "INSERT INTO locations (location_id, z, structure_id, structure_label, "
+        "type_id, type_name, radius, image_key, image_relpath, mask_relpath, ignored) "
+        "VALUES (?, 17, 7, 'soma', 1, 'Cell', 12.5, ?, ?, ?, 0)",
+        [(loc, f"k{loc}", f"images/k{loc}.png", f"masks/k{loc}_{loc}.png") for loc in (1, 2, 3, 4)],
+    )
+    connection.commit()
+    connection.close()
+    for loc in (1, 2, 3, 4):
+        (crops / "masks" / f"k{loc}_{loc}.png").write_bytes(b"png")
+    approve_window(crops, 4)
+
+    assert review_locations(crops, [1, 2], "ignore") == 2
+    by_id = {row["location_id"]: row for row in list_catalog_rows(crops)}
+    assert [by_id[loc]["ignored"] for loc in (1, 2, 3, 4)] == [1, 1, 0, 0]
+    assert by_id[4]["approved"] == 1
+    assert (crops / "ignored" / "k1_1.png").is_file() and not (crops / "masks" / "k1_1.png").exists()
+    assert (crops / "masks" / "k3_3.png").is_file()
+
+    # Approving a rejected location restores it; location 4 keeps its earlier approval; 3 is untouched.
+    assert review_locations(crops, [1, 3], "approve") == 2
+    by_id = {row["location_id"]: row for row in list_catalog_rows(crops)}
+    assert [by_id[loc]["ignored"] for loc in (1, 2, 3, 4)] == [0, 1, 0, 0]
+    assert [by_id[loc]["approved"] for loc in (1, 2, 3, 4)] == [1, 0, 1, 1]
+    assert (crops / "masks" / "k1_1.png").is_file()
+
+    # Rejecting an approved location clears its approval.
+    review_locations(crops, [4], "ignore")
+    by_id = {row["location_id"]: row for row in list_catalog_rows(crops)}
+    assert by_id[4]["ignored"] == 1 and by_id[4]["approved"] == 0
+    assert review_locations(crops, [], "ignore") == 0
+    with pytest.raises(ValueError):
+        review_locations(crops, [1], "delete")

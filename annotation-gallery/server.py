@@ -36,6 +36,7 @@ from catalog import (
     read_crop_size,
     save_source_settings,
     restore_location,
+    review_locations,
     unapprove_window,
 )
 from identity import (
@@ -542,6 +543,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_refresh_location(match.group(1))
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/review-batch", path)
+        if match:
+            self._handle_review_batch(match.group(1))
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/(ignore|restore|approve|unapprove)", path)
         if not match:
             self._send_json({"error": "not found"}, status=404)
@@ -584,6 +589,33 @@ class GalleryHandler(BaseHTTPRequestHandler):
             "ignored": action == "ignore",
             "approved": action == "approve",
         })
+
+    def _handle_review_batch(self, volume: str) -> None:
+        """Approve or reject a list of whole locations: body ``{"action": "approve"|"ignore", "location_ids": [...]}``."""
+        role = self._principal().grants.get(volume)
+        if role is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        if role != PERMISSION_REVIEW:
+            self._send_json({"error": "review required"}, status=403)
+            return
+        try:
+            body = self._read_json()
+            action = str(body.get("action"))
+            raw_ids = body.get("location_ids")
+            if action not in ("approve", "ignore") or not isinstance(raw_ids, list):
+                raise ValueError("action and location_ids required")
+            location_ids = [int(item) for item in raw_ids]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "action (approve or ignore) and location_ids required"}, status=400)
+            return
+        try:
+            crops = crops_dir(self._registry(), volume)
+        except (ValueError, FileNotFoundError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        count = review_locations(crops, location_ids, action)
+        self._send_json({"ok": True, "action": action, "count": count})
 
     def _handle_login(self) -> None:
         if identity_mode() != "oidc":

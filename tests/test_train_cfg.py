@@ -36,8 +36,13 @@ class TrainCfgTests(unittest.TestCase):
             cfg.prompt.prob_circle_mask,
             cfg.prompt.prob_full_mask,
             cfg.prompt.prob_negative_only,
+            cfg.prompt.prob_corrupted_mask,
         ]
         self.assertAlmostEqual(sum(float(p) for p in probs), 1.0)
+        self.assertEqual(float(cfg.prompt.prob_full_mask), 0.0)
+        self.assertEqual(float(cfg.prompt.prob_negative_only), 0.0)
+        self.assertEqual(float(cfg.prompt.prob_corrupted_mask), 0.25)
+        self.assertEqual(float(cfg.prompt.prob_circle_mask), 0.45)
         self.assertEqual(float(cfg.loss.mask_contain_weight), 0.5)
         self.assertEqual(float(cfg.loss.containment_warmup_epochs), 2.0)
         self.assertTrue(bool(cfg.model.unfreeze_mask_cnn))
@@ -47,8 +52,8 @@ class TrainCfgTests(unittest.TestCase):
     def test_prompt_probabilities_must_sum_to_one(self) -> None:
         with self.assertRaises(ValueError):
             load_train_cfg(["prompt.prob_points_only=0.5"])
-        cfg = load_train_cfg(["prompt.prob_points_only=0.15", "prompt.prob_circle_mask=0.40"])
-        self.assertAlmostEqual(float(cfg.prompt.prob_points_only), 0.15)
+        cfg = load_train_cfg(["prompt.prob_points_only=0.20", "prompt.prob_circle_mask=0.40"])
+        self.assertAlmostEqual(float(cfg.prompt.prob_points_only), 0.20)
 
     def test_next_run_name_increments(self) -> None:
         from tempfile import TemporaryDirectory

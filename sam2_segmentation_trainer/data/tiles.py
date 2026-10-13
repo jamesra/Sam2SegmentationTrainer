@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Sequence
 
-from annotation_crops.negatives import CircleAnnotation, load_circle_annotations
+from annotation_crops.negatives import CircleAnnotation, load_circle_annotations, load_circle_scale
 
 from sam2_segmentation_trainer.data.manifest import CropExample, load_ignore_ids
 
@@ -55,11 +55,50 @@ def crops_dir_of(example: CropExample) -> Path:
     return example.mask_path.parent.parent
 
 
-def build_tile_context(examples: Sequence[CropExample], *, load_circles: bool = True) -> TileContext:
+def check_circle_files(
+    crops_dirs: dict[str, Path],
+    loaded: dict[str, int],
+    *,
+    require: bool,
+    circle_scale: float | None,
+) -> list[str]:
+    """Report volumes whose circle file is missing or empty, and how each file's radii are rescaled.
+
+    ``loaded`` maps each volume to its number of circle entries. With ``require`` a missing or empty file
+    raises, because circle-mask prompts would silently disappear and the prompt mix would shift to the rest.
+    Returns the warnings it printed.
+    """
+    missing = sorted(volume for volume in crops_dirs if loaded.get(volume, 0) == 0)
+    if missing and require:
+        raise RuntimeError(
+            f"circle_annotations.json is missing or empty for {missing}, so circle-mask prompts are unavailable. "
+            "Export circles for these volumes, or set data.require_circle_file: false to train without them."
+        )
+    messages = [f"no circle entries for {volume}" for volume in missing]
+    for volume, crops in sorted(crops_dirs.items()):
+        if volume in missing:
+            continue
+        scale = load_circle_scale(crops)
+        note = "" if circle_scale is None else f", radii x{circle_scale / (scale or 1.0):.4g} to diameter scale {circle_scale}"
+        print(f"circles {volume}: {loaded[volume]} entries, file diameter_scale {scale}{note}")
+    for message in messages:
+        print(f"WARNING: {message}")
+    return messages
+
+
+def build_tile_context(
+    examples: Sequence[CropExample],
+    *,
+    load_circles: bool = True,
+    require_circles: bool = False,
+    circle_scale: float | None = None,
+) -> TileContext:
     """Index ``examples`` by tile and read each volume's circle file.
 
     ``examples`` should be the whole usable inventory, not just the training split: a validation location is
-    still an annotation that a training tile must treat as background.
+    still an annotation that a training tile must treat as background. ``circle_scale`` is the diameter scale
+    of the circles the caller draws; radii are rescaled from the file's own ``diameter_scale`` to it (None
+    keeps them as written). ``require_circles`` turns a missing file into an error (:func:`check_circle_files`).
     """
     by_tile: dict[TileKey, list[int]] = {}
     crops_dirs: dict[str, Path] = {}
@@ -69,9 +108,13 @@ def build_tile_context(examples: Sequence[CropExample], *, load_circles: bool = 
     neighbors = {key: tuple(sorted(set(ids))) for key, ids in by_tile.items()}
     circles: dict[TileKey, tuple[CircleAnnotation, ...]] = {}
     if load_circles:
+        loaded: dict[str, int] = {}
         for volume, crops in crops_dirs.items():
-            for image_key, entries in load_circle_annotations(crops).items():
+            entries_by_key = load_circle_annotations(crops, circle_scale)
+            loaded[volume] = sum(len(entries) for entries in entries_by_key.values())
+            for image_key, entries in entries_by_key.items():
                 circles[(volume, image_key)] = entries
+        check_circle_files(crops_dirs, loaded, require=require_circles, circle_scale=circle_scale)
     return TileContext(neighbors=neighbors, circles=circles)
 
 

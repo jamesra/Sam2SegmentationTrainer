@@ -284,6 +284,46 @@ def ignore_location(
     return True
 
 
+def review_locations(
+    crops: str | os.PathLike[str],
+    location_ids: Iterable[int],
+    action: str,
+) -> int:
+    """Approve or reject many whole locations with one read and write of each review file.
+
+    ``action`` is ``approve`` or ``ignore``, with the same effect per location as :func:`approve_window` and
+    :func:`ignore_location` called without an image key. Returns the number of locations handled.
+    """
+    if action not in ("approve", "ignore"):
+        raise ValueError(f"unknown batch action {action!r}")
+    ids = sorted({int(item) for item in location_ids})
+    if not ids:
+        return 0
+    wanted = set(ids)
+    if action == "approve":
+        for location_id in sorted(wanted & load_ignore_ids(crops)):
+            restore_location(crops, location_id)
+        keys = load_approved(crops)
+        for location_id in ids:
+            for key in _location_image_keys(crops, location_id) or [""]:
+                keys.add(_approval_key(location_id, key))
+        save_approved(crops, keys)
+        return len(ids)
+    save_approved(crops, [item for item in load_approved(crops) if item[0] not in wanted])
+    save_ignore_ids(crops, load_ignore_ids(crops) | wanted)
+    output = Path(crops)
+    ignored_dir = output / "ignored"
+    for location_id in ids:
+        for source in _masks_named_for(output / "masks", location_id):
+            ignored_dir.mkdir(parents=True, exist_ok=True)
+            destination = ignored_dir / source.name
+            if destination.is_file():
+                destination.unlink()
+            source.replace(destination)
+        _set_ignored_flag(crops, location_id, ignored=True)
+    return len(ids)
+
+
 def restore_location(
     crops: str | os.PathLike[str],
     location_id: int,

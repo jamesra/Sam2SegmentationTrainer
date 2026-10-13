@@ -21,6 +21,8 @@ class SampleMeta:
     downsample: int
     category_name: str
     split_key: str
+    full_tile: bool = False
+    """The target fills at least ``data.full_tile_threshold`` of the tile; validation scores these apart."""
 
     def as_dict(self) -> dict[str, Any]:
         """Mapping stored on a collated batch. Keys match this record."""
@@ -31,6 +33,7 @@ class SampleMeta:
             "downsample": self.downsample,
             "category_name": self.category_name,
             "split_key": self.split_key,
+            "full_tile": self.full_tile,
         }
 
     @property

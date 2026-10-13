@@ -1623,6 +1623,40 @@
     }
   }
 
+  // Approve or reject every card that is visible now, after one confirmation that lists the count. Cards that
+  // are hidden by a filter, including locations already in the other state, are never touched.
+  async function reviewVisible(act) {
+    const approving = act === "approve";
+    const wanted = approving ? "approved" : "rejected";
+    const ids = ensureVisibleCards()
+      .filter((windows) => windows.some((row) => reviewClass(row) !== wanted))
+      .map((windows) => windows[0].location_id);
+    if (!ids.length) {
+      els.status.textContent = `Nothing to ${approving ? "accept" : "reject"}: every visible card is already ${wanted}.`;
+      return;
+    }
+    const verb = approving ? "Accept" : "Reject";
+    const noun = ids.length === 1 ? "annotation" : "annotations";
+    if (!window.confirm(`${verb} ${ids.length} visible ${noun}? Hidden annotations are not changed.`)) {
+      return;
+    }
+    els.status.textContent = `${approving ? "Accepting" : "Rejecting"} ${ids.length} ${noun}...`;
+    const payload = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/review-batch`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: approving ? "approve" : "ignore", location_ids: ids }),
+    });
+    for (const locationId of ids) {
+      for (const row of windowsForLocation(locationId)) {
+        applyLocalReview(row, act);
+      }
+    }
+    undoStack.length = 0;
+    resetVisibleCards();
+    render(true, true);
+    els.status.textContent = `${approving ? "Accepted" : "Rejected"} ${payload.count} ${noun}.`;
+  }
+
   async function applyRememberedStatus(entry) {
     const windows = entry.windows || [{
       imageKey: entry.imageKey || "",
@@ -2543,6 +2577,13 @@
       });
   });
 
+  [["accept-all", "approve"], ["reject-all", "ignore"]].forEach(([id, act]) => {
+    document.getElementById(id).addEventListener("click", () => {
+      reviewVisible(act).catch((error) => {
+        els.status.textContent = error.message;
+      });
+    });
+  });
   document.getElementById("export-ignore").addEventListener("click", () => {
     exportIgnore().catch((error) => {
       els.status.textContent = error.message;

@@ -29,6 +29,8 @@ class CropExample:
     target_circle: tuple[float, float, float] | None = None
     """``(center_x, center_y, radius)`` in tile pixels for an example whose target is a circle annotation
     with no mask file (see ``tiles.circle_target_examples``); None for the usual polygon-mask example."""
+    area_frac: float | None = None
+    """Fraction of the tile the target mask covers (sidecar `area` over width times height), when known."""
 
     @property
     def image_ext(self) -> str:
@@ -118,13 +120,29 @@ def list_filenames(folder: Path) -> set[str]:
     return {entry.name for entry in folder.iterdir() if entry.is_file()}
 
 
-def sidecar_ids_and_size(json_path: Path) -> tuple[set[int] | None, tuple[int, int] | None]:
-    """Return annotation ids and ``image.width`` / ``image.height``, or None if unreadable."""
+def _area_fraction(area: float | None, size: tuple[int, int] | None) -> float | None:
+    """Share of the tile a mask of ``area`` pixels covers, or None when either number is unknown."""
+    if area is None or size is None or size[0] <= 0 or size[1] <= 0:
+        return None
+    return float(area) / float(size[0] * size[1])
+
+
+def sidecar_details(
+    json_path: Path,
+) -> tuple[set[int] | None, tuple[int, int] | None, dict[int, float]]:
+    """Annotation ids, ``image.width`` / ``image.height``, and each annotation's ``area``; ids None if unreadable."""
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return None, None
-    ids = {int(ann.get("id", -1)) for ann in (payload.get("annotations") or [])}
+        return None, None, {}
+    annotations = payload.get("annotations") or []
+    ids = {int(ann.get("id", -1)) for ann in annotations}
+    areas: dict[int, float] = {}
+    for ann in annotations:
+        try:
+            areas[int(ann.get("id", -1))] = float(ann["area"])
+        except (KeyError, TypeError, ValueError):
+            continue
     image = payload.get("image")
     if isinstance(image, list):
         image = image[0] if image else None
@@ -134,6 +152,12 @@ def sidecar_ids_and_size(json_path: Path) -> tuple[set[int] | None, tuple[int, i
             size = (int(image["width"]), int(image["height"]))
         except (TypeError, ValueError):
             size = None
+    return ids, size, areas
+
+
+def sidecar_ids_and_size(json_path: Path) -> tuple[set[int] | None, tuple[int, int] | None]:
+    """Return annotation ids and ``image.width`` / ``image.height``, or None if unreadable."""
+    ids, size, _areas = sidecar_details(json_path)
     return ids, size
 
 
@@ -230,8 +254,9 @@ def _index_manifest(
             rec_volume = str(rec.get("volume") or volume)
             present_ids: set[int] | None = None
             tile_size: tuple[int, int] | None = None
+            areas: dict[int, float] = {}
             if skip_missing:
-                present_ids, tile_size = sidecar_ids_and_size(json_path)
+                present_ids, tile_size, areas = sidecar_details(json_path)
                 if present_ids is None:
                     skipped_missing_ann += sum(1 for _ in location_ids)
                     continue
@@ -262,6 +287,7 @@ def _index_manifest(
                         split_key=f"{rec_volume}:{loc_i}",
                         width=width,
                         height=height,
+                        area_frac=_area_fraction(areas.get(loc_i), tile_size),
                     )
                 )
     return examples, skipped_missing_ann, skipped_missing_mask, skipped_ignored

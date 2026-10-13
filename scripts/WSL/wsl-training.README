@@ -56,6 +56,15 @@ One-time setup
   sed -i 's/\r$//' scripts/WSL/*.sh
   chmod +x scripts/WSL/*.sh
 
+  # Optional: call the scripts from anywhere. Use symlinks, not copies: the script follows the link back into
+  # the repo to find training_data_common.sh and annotation_crops/scores.py, and a git pull then updates it.
+  mkdir -p ~/bin
+  ln -sf "$PWD/scripts/WSL/sync_training_data.sh" ~/bin/sync_training_data.sh
+  ln -sf "$PWD/scripts/WSL/select_training_data.sh" ~/bin/select_training_data.sh
+  rm -f ~/bin/training_data_common.sh          # a stale copy from before, if any
+  # If the checkout is not at /mnt/d/src/git/SAM2SegmentationTrainer, say where it is:
+  export SAM2_TRAINER_REPO=/mnt/d/src/git/SAM2SegmentationTrainer
+
   # Put these in ~/.bashrc to skip typing them
   export TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData
   export SAM2_TRAINING_DEST=$HOME/sam2-training

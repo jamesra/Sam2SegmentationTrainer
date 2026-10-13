@@ -89,6 +89,13 @@
         <input id="import-ignore-file" type="file" accept="application/json,.json" hidden>
       </div>
     </div>
+    <div class="filter review-only">
+      <span title="Applies to the cards shown now, after every filter above. Locations that are hidden, including ones already approved or rejected, are not touched.">Visible cards</span>
+      <div class="filter-row">
+        <button type="button" id="accept-all" title="Approve every card shown now. Asks first and lists the count.">Accept all</button>
+        <button type="button" id="reject-all" title="Reject every card shown now. Asks first and lists the count.">Reject all</button>
+      </div>
+    </div>
     <div class="filter" id="sort-filter">
       <span>Sort</span>
       <div id="sort-stack"></div>
