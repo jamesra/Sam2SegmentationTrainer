@@ -796,17 +796,37 @@
       .replaceAll("{id}", encodeURIComponent(String(row.location_id)));
   }
 
+  // "250" is one radius, "100-500" a range, "100-" and "-500" are open ended. Anything else is `invalid`, which
+  // matches nothing (and says so), instead of being ignored and leaving every card on screen.
   function parseRadius(text) {
     const trimmed = text.trim();
     if (!trimmed) {
       return null;
     }
-    if (trimmed.includes("-")) {
-      const [lo, hi] = trimmed.split("-", 2).map(Number);
-      return { lo, hi };
+    const range = /^(\d+(?:\.\d+)?)?\s*-\s*(\d+(?:\.\d+)?)?$/.exec(trimmed);
+    if (range && (range[1] !== undefined || range[2] !== undefined)) {
+      return {
+        lo: range[1] === undefined ? -Infinity : Number(range[1]),
+        hi: range[2] === undefined ? Infinity : Number(range[2]),
+      };
     }
     const value = Number(trimmed);
-    return Number.isFinite(value) ? { lo: value, hi: value } : null;
+    return Number.isFinite(value) ? { lo: value, hi: value } : { invalid: true };
+  }
+
+  // "1529372" or "1529372, 1529388": the location ids to show. Text with no usable id matches nothing.
+  function parseLocationIds(text) {
+    const trimmed = (text || "").trim();
+    if (!trimmed) {
+      return null;
+    }
+    const ids = new Set();
+    for (const piece of trimmed.split(/[\s,;]+/)) {
+      if (/^\d+$/.test(piece)) {
+        ids.add(Number(piece));
+      }
+    }
+    return ids;
   }
 
   function overlayHue() {
@@ -935,6 +955,7 @@
       ["Tags", values.tags],
       ["Z", values.z],
       ["Radius", values.radius],
+      ["Location", values.location],
     ]) {
       const trimmed = (text || "").trim();
       if (trimmed) {
@@ -960,6 +981,7 @@
       tags: els.tags.value,
       z: els.z.value,
       radius: els.radius.value,
+      location: els.locate.value,
       sorts: state.sorts,
     }, (key) => labels.get(key) || key);
     const text = [...scope, ...(criteria.length ? criteria : ["No filters"])].join(" · ");
@@ -1114,9 +1136,18 @@
     const label = els.label.value.trim().toLowerCase();
     const zText = els.z.value.trim();
     const radius = parseRadius(els.radius.value);
+    const locations = parseLocationIds(els.locate.value);
     const classes = visibleClasses();
+    if (radius && radius.invalid) {
+      state.filterNote = "radius: use a number or a range such as 100-500";
+    }
     return state.rows.filter((row) => {
-      if (!classes.has(reviewClass(row))) {
+      if (locations) {
+        // Asking for a location by id shows it whatever its review state, so View does not hide it.
+        if (!locations.has(Number(row.location_id))) {
+          return false;
+        }
+      } else if (!classes.has(reviewClass(row))) {
         return false;
       }
       if (zText && String(row.z) !== zText) {
@@ -1137,7 +1168,7 @@
             return false;
           }
         } else if (/^\d+$/.test(label)) {
-          if (idText !== label && !idText.startsWith(label)) {
+          if (idText !== label) {
             return false;
           }
         } else {
@@ -1158,7 +1189,7 @@
       }
       if (radius) {
         const value = Number(row.radius);
-        if (!Number.isFinite(value) || value < radius.lo || value > radius.hi) {
+        if (radius.invalid || !Number.isFinite(value) || value < radius.lo || value > radius.hi) {
           return false;
         }
       }
@@ -1380,6 +1411,7 @@
       els.label.value,
       els.z.value,
       els.radius.value,
+      els.locate.value,
       views.join(""),
       state.sorts.map((item) => `${item.key}:${item.desc ? 1 : 0}`).join(","),
       state.cropSize || 0,
@@ -1565,22 +1597,26 @@
     return { cardPx, baseHeight, rowOffsets, ...laid };
   }
 
-  function scrollToLocation() {
+  // Why the grid is empty when locations were asked for: not in this volume, or hidden by another filter.
+  function locationMissNote() {
     const text = els.locate.value.trim();
-    if (!text) {
-      return;
+    const ids = parseLocationIds(text);
+    if (!ids) {
+      return "";
     }
-    const cards = ensureVisibleCards();
-    const layout = layoutCards(cards);
-    const cell = layout.cells.find((item) => String(item.row.location_id) === text);
-    if (!cell) {
-      render(true);
-      els.status.textContent = `Location ${text} is not in this view.`;
-      return;
+    if (!ids.size) {
+      return `"${text}" has no location id`;
     }
-    els.scroller.scrollTop = layout.rowOffsets[cell.gr] || 0;
+    const known = state.rows.some((row) => ids.has(Number(row.location_id)));
+    return known
+      ? `location ${text} is hidden by the other filters`
+      : `location ${text} is not in this volume`;
+  }
+
+  // The Location box is a filter: only the listed locations stay. Start at the top of the (short) list.
+  function showLocations() {
+    els.scroller.scrollTop = 0;
     render(true);
-    els.status.textContent = `Location ${text}.`;
   }
 
   function columnCount(width) {
@@ -1670,7 +1706,9 @@
     els.grid.style.gridTemplateColumns = `repeat(${columns}, ${cardPx}px)`;
     els.grid.style.gridAutoRows = `${Math.max(1, baseHeight - GRID_GAP)}px`;
     els.spacer.style.height = `${rowOffsets[rowOffsets.length - 1] || baseHeight}px`;
-    els.status.textContent = `${cards.length} location(s) · ${state.permission}${state.filterNote ? ` · ${state.filterNote}` : ""}`;
+    const missNote = cards.length ? "" : locationMissNote();
+    const notes = [state.filterNote, missNote].filter(Boolean).join(" · ");
+    els.status.textContent = `${cards.length} location(s) · ${state.permission}${notes ? ` · ${notes}` : ""}`;
     syncVisibilityLabel();
     syncReverseButtons();
     const rangeTop = Math.max(0, scroll - page);
@@ -2733,13 +2771,12 @@
     renderSortStack();
     render();
   });
-  els.locate.addEventListener("change", () => {
-    scrollToLocation();
-  });
+  els.locate.addEventListener("input", showLocations);
+  els.locate.addEventListener("change", showLocations);
   els.locate.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
-      scrollToLocation();
+      showLocations();
     }
   });
 

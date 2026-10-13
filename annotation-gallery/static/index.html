@@ -48,16 +48,16 @@
       </div>
     </div>
     <div class="filter">
-      <label for="label" title="Comma-separated structure ids, such as 487, 120. Or a regular expression matched against structure labels, such as ^M.">Structure</label>
+      <label for="label" title="Exact structure ids, such as 487 or 487, 120. Or a regular expression matched against structure labels, such as ^M.">Structure</label>
       <div class="filter-row">
-        <input id="label" type="search" placeholder="ids or label regex" title="Comma-separated structure ids, such as 487, 120. Or a regular expression matched against structure labels, such as ^M.">
+        <input id="label" type="search" placeholder="ids or label regex" title="Exact structure ids, such as 487 or 487, 120. Or a regular expression matched against structure labels, such as ^M.">
         <button type="button" class="reverse" data-sort="structure_label" title="Sort by structure label. Click again to reverse.">Reverse</button>
       </div>
     </div>
     <div class="filter">
-      <label for="locate" title="Scroll to this location id. Other cards stay in the list.">Location</label>
+      <label for="locate" title="Show only this location id, or several separated by commas. A location is shown whether it is approved, rejected, or unknown; the other filters still apply.">Location</label>
       <div class="filter-row">
-        <input id="locate" type="search" inputmode="numeric" placeholder="location id" title="Scroll to this location id. Other cards stay in the list.">
+        <input id="locate" type="search" placeholder="location id(s)" title="Show only this location id, or several separated by commas. A location is shown whether it is approved, rejected, or unknown; the other filters still apply.">
       </div>
     </div>
     <div class="filter">
@@ -74,9 +74,9 @@
       </div>
     </div>
     <div class="filter">
-      <label for="radius" title="One radius, or a min-max range such as 100-500.">Radius</label>
+      <label for="radius" title="One radius, a min-max range such as 100-500, or an open range such as 100- or -500.">Radius</label>
       <div class="filter-row">
-        <input id="radius" type="search" placeholder="min-max" title="One radius, or a min-max range such as 100-500.">
+        <input id="radius" type="search" placeholder="min-max" title="One radius, a min-max range such as 100-500, or an open range such as 100- or -500.">
         <button type="button" class="reverse" data-sort="radius" title="Sort by radius. Click again to reverse.">Reverse</button>
       </div>
     </div>
