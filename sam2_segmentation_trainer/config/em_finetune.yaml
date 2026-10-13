@@ -121,8 +121,17 @@ data:
   image_size: 1024
   mask_threshold: 0.5
   train_split: 0.9
-  split_name: location_v1
-  # false: 90/10 inside each volume, using every usable sample.
+  # zslab: validation is slab_count contiguous runs of sections spaced evenly through each volume, together about
+  # (1 - train_split) of its examples, with guard_sections sections on each side of every slab used by neither
+  # side. Adjacent sections and overlapping crop windows then never cross the split.
+  # location: the original random 90/10 over location keys. An existing run keeps the split in its split.json;
+  # changing the mode needs -refresh.
+  split_mode: zslab
+  zslab:
+    slab_count: 5
+    guard_sections: 1
+  split_name: zslab_v1
+  # location mode only. false: 90/10 inside each volume, using every usable sample.
   # true: also cap every volume to the smallest volume's count.
   even_per_volume: false
 
