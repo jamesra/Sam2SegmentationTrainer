@@ -43,7 +43,7 @@ Install
 -------
 
   mkdir -p ~/bin
-  cp version-bump version-sync ~/bin/ && chmod +x ~/bin/version-bump ~/bin/version-sync
+  cp version-bump version-sync version-flatten ~/bin/ && chmod +x ~/bin/version-*
   echo 'export PATH="$HOME/bin:$PATH"' >> ~/.profile && . ~/.profile
 
 DSM notes: ~/.profile needs the user home service enabled (Control Panel > User & Group >

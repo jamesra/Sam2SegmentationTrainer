@@ -4,7 +4,7 @@
 # Run on the WSL Ubuntu host. The container reads that link as /data-local/current.
 #
 # Usage:
-#   scripts/select_training_data.sh [v1|v1b|v2|...]
+#   scripts/WSL/select_training_data.sh [v1|v1b|v2|...]
 #
 # No version: link current to the highest version directory already under the dest.
 #

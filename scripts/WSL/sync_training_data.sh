@@ -5,7 +5,7 @@
 # not mounted there. ~/sam2-training is bind-mounted at /data-local.
 #
 # Usage:
-#   scripts/sync_training_data.sh [-n] [-noselect] [-force-layout] [-seed-from vX] [v1|v1b|v2|...]
+#   scripts/WSL/sync_training_data.sh [-n] [-noselect] [-force-layout] [-seed-from vX] [v1|v1b|v2|...]
 #
 # No version: sync the highest source version directory.
 # Default: after a successful mirror, point ~/sam2-training/current at that version.
@@ -17,6 +17,10 @@
 #   local version vX into volumes of the destination that do not have them yet. Use it
 #   when mirroring into a new version so the review lists and location_scores carry over.
 #   Never overwrites existing lists; this version's own scores win on a clash.
+# -clone-from vX: build the new version as a hardlink clone of the local version vX, then
+#   rsync only the changes. Unchanged files stay one copy on disk shared by both versions.
+#   The catalog, approved.json, ignore.json, and ignored/ are real copies. Implies the
+#   review-state carry-over of -seed-from. The destination version must not exist yet.
 #
 # Kept across a mirror: approved.json, ignore.json, and ignored/ (excluded from rsync, with
 # rejected masks moved back to ignored/ afterwards), and the location_scores table in
@@ -25,15 +29,15 @@
 # Env:
 #   TRAINING_DATA_SRC=/mnt/d/TrainingData   (e.g. /mnt/y/SAM2TrainingData with the NAS
 #                                            share CIFS-mounted at /mnt/y; see
-#                                            scripts/wsl-training.README)
+#                                            scripts/WSL/wsl-training.README)
 #   SAM2_TRAINING_DEST=$HOME/sam2-training
 #
 # One-time move of a flat layout (RC1, RC2, RPC1, RPC2 next to version dirs):
 #   mkdir -p ~/sam2-training/v1
 #   mv ~/sam2-training/RC1 ~/sam2-training/RC2 \
 #      ~/sam2-training/RPC1 ~/sam2-training/RPC2 ~/sam2-training/v1/
-#   scripts/sync_training_data.sh v1b
-#   scripts/sync_training_data.sh          # latest source, and select it
+#   scripts/WSL/sync_training_data.sh v1b
+#   scripts/WSL/sync_training_data.sh          # latest source, and select it
 #   readlink ~/sam2-training/current       # expect the highest synced version
 set -euo pipefail
 
@@ -48,6 +52,7 @@ dry=0
 noselect=0
 force_layout=0
 seed_from=""
+clone_from=""
 ver=""
 while [[ $# -gt 0 ]]; do
   arg="$1"
@@ -64,8 +69,16 @@ while [[ $# -gt 0 ]]; do
       seed_from="$1"
       shift
       ;;
+    -clone-from)
+      if [[ $# -eq 0 ]]; then
+        echo "-clone-from needs a version" >&2
+        exit 2
+      fi
+      clone_from="$1"
+      shift
+      ;;
     -h|--help)
-      sed -n '2,32p' "$0"
+      sed -n '2,/^set -euo/p' "$0" | sed '$d'
       exit 0
       ;;
     -*)
@@ -93,6 +106,15 @@ else
     exit 1
   fi
   echo "selected highest source version ${ver}"
+fi
+
+if [[ -n "$clone_from" ]]; then
+  if [[ -n "$seed_from" && "$seed_from" != "$clone_from" ]]; then
+    echo "-clone-from already carries the review state; drop -seed-from or use the same version" >&2
+    exit 2
+  fi
+  # A clone has the review lists and scores of its parent, so it doubles as the seed.
+  seed_from="$clone_from"
 fi
 
 if [[ -n "$seed_from" ]]; then
@@ -127,15 +149,22 @@ else
 fi
 echo "keeping approved.json, ignore.json, ignored/, and location_scores in each volume"
 
-if [[ "$force_layout" -eq 0 ]] && ! check_layouts_match "$src" "$dest"; then
+# With -clone-from the destination will be a copy of that version, so compare against it.
+layout_ref="$dest"
+[[ -z "$clone_from" ]] || layout_ref="${SAM2_TRAINING_DEST}/${clone_from}"
+if [[ "$force_layout" -eq 0 ]] && ! check_layouts_match "$src" "$layout_ref"; then
   echo "refusing to mirror: rsync --delete would swap the destination's layout." >&2
   echo "Flatten the source (the NAS version-sync output) or re-run with -force-layout." >&2
   exit 1
 fi
 
 if [[ "$dry" -eq 1 ]]; then
-  [[ -z "$seed_from" ]] || seed_review_lists "${SAM2_TRAINING_DEST}/${seed_from}" "$dest" "$src" dry
+  [[ -z "$clone_from" ]] || clone_version_hardlinked "${SAM2_TRAINING_DEST}/${clone_from}" "$dest" dry
+  [[ -n "$clone_from" || -z "$seed_from" ]] || seed_review_lists "${SAM2_TRAINING_DEST}/${seed_from}" "$dest" "$src" dry
 else
+  if [[ -n "$clone_from" ]]; then
+    clone_version_hardlinked "${SAM2_TRAINING_DEST}/${clone_from}" "$dest"
+  fi
   mkdir -p "$dest"
   [[ -z "$seed_from" ]] || seed_review_lists "${SAM2_TRAINING_DEST}/${seed_from}" "$dest" "$src"
   stash="$(mktemp -d)"
@@ -146,6 +175,9 @@ else
 fi
 
 # Flat layout: <volume>/approved.json etc. Legacy layout: <volume>/AnnotationCrops/...
+rsync_dest="$dest"
+# A dry run with -clone-from has no clone yet, so compare against the version it would clone.
+[[ "$dry" -eq 1 && -n "$clone_from" ]] && rsync_dest="$layout_ref"
 rsync_args=(-a --delete --info=stats2)
 [[ "$dry" -eq 0 ]] || rsync_args+=(-n --itemize-changes)
 rsync "${rsync_args[@]}" \
@@ -157,7 +189,7 @@ rsync "${rsync_args[@]}" \
   --exclude '**/AnnotationCrops/ignore.json' \
   --exclude '**/AnnotationCrops/ignored/***' \
   --exclude '_review/***' \
-  "${src}/" "${dest}/"
+  "${src}/" "${rsync_dest}/"
 
 if [[ "$dry" -eq 1 ]]; then
   echo "dry run complete: nothing changed"

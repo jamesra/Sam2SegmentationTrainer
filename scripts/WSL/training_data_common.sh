@@ -106,13 +106,50 @@ seed_review_lists() {
   shopt -u nullglob
 }
 
+# Build version dir $2 from version dir $1 on the same filesystem, sharing disk space:
+# every file is a hardlink to the earlier version, except the files that get modified in
+# place (the SQLite catalog, approved.json, ignore.json, ignored/), which are real copies.
+# rsync writes a temp file and renames it, so a changed file breaks its link and the
+# earlier version keeps the old content. With $3 = dry, only report.
+clone_version_hardlinked() {
+  local from="$1" to="$2" mode="${3:-}" path vol crops rel item
+  if [[ -e "$to" ]]; then
+    echo "clone: ${to} already exists; -clone-from builds a new version" >&2
+    return 1
+  fi
+  if [[ "$mode" == dry ]]; then
+    echo "clone ${from##*/} -> ${to##*/} with hardlinks (dry run)"
+    return 0
+  fi
+  echo "clone ${from##*/} -> ${to##*/} with hardlinks"
+  if ! cp -al "$from" "$to"; then
+    echo "clone failed; removing ${to}" >&2
+    rm -rf "$to"
+    return 1
+  fi
+  shopt -s nullglob
+  for path in "$to"/*/; do
+    vol="$(basename "$path")"
+    crops="$(volume_crops_dir "$to/$vol")"
+    [[ -n "$crops" ]] || continue
+    rel="${crops#"$to"/}"
+    for item in annotation_crops.sqlite annotation_crops.sqlite-wal annotation_crops.sqlite-shm \
+        approved.json ignore.json ignored; do
+      [[ -e "$crops/$item" ]] || continue
+      rm -rf "${crops:?}/$item"
+      cp -a "$from/$rel/$item" "$crops/$item"
+    done
+  done
+  shopt -u nullglob
+}
+
 # Keep the trainer's location_scores table across a mirror. The source catalog replaces
 # annotation_crops.sqlite, which would drop the scores written on this machine.
 #   save:    copy each volume's scores into $3 (a scratch dir)
 #   restore: merge them back into the new catalogs (saved rows win on a key clash)
 preserve_location_scores() {
   local mode="$1" dest="$2" stash="$3" repo
-  repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   if ! command -v python3 >/dev/null 2>&1; then
     echo "python3 missing; cannot preserve location_scores. Install it or stop." >&2
     return 1
