@@ -17,6 +17,12 @@
   ];
   const HUE_KEY = "galleryOverlayHue";
   const VIS_KEY = "galleryOverlayVisibility";
+  // Other annotations in the tile, which the trainer treats as background: shown red in the viewer, yellow where
+  // they overlap the target (the trainer resolves that overlap to "unknown").
+  const NEG_KEY = "galleryNegativeOverlay";
+  const NEG_HEX = "#ef4444";
+  const NEG_OVERLAP_HEX = "#f5d90a";
+  const NEG_VISIBILITY = 55;
   const SIZE_KEY = "galleryCardSize";
   const COLLAPSE_KEY = "galleryFiltersCollapsed";
   // Last training set, and the volume last opened inside each set.
@@ -209,6 +215,9 @@
     layoutHeight: 0,
     hue: "#3478cb",
     visibility: 30,
+    // { count, base, overlap } for the open location: `base` is the tile with the negatives tinted, `overlap`
+    // marks where they cover the target. Null until loaded, or when the tile has no other annotation.
+    negatives: null,
   };
 
   function rgbToHcl(red255, green255, blue255) {
@@ -1694,6 +1703,12 @@
     if (row.sam2GtIou != null) {
       lines.push(`SAM2 ${Number(row.sam2GtIou).toFixed(2)}`);
     }
+    if (viewer.negatives) {
+      const count = viewer.negatives.count;
+      lines.push(
+        `${count} negative annotation${count === 1 ? "" : "s"} <span class="neg-state">(N: ${negativesOn() ? "hide" : "show"})</span>`,
+      );
+    }
     return lines.map((line) => `<div>${line}</div>`).join("");
   }
 
@@ -1754,6 +1769,114 @@
     openViewerFromRow(next.row);
   }
 
+  // On unless the viewer turned it off. Remembered in the browser when storage works; the variable keeps the
+  // toggle working when it does not.
+  let negativesEnabled = (() => {
+    try {
+      return localStorage.getItem(NEG_KEY) !== "off";
+    } catch {
+      return true;
+    }
+  })();
+
+  function negativesOn() {
+    return negativesEnabled;
+  }
+
+  function negativesShown() {
+    return Boolean(viewer.negatives) && negativesOn();
+  }
+
+  // The negatives layer for one location: the tile with the other annotations tinted red, and a yellow patch where
+  // they cover the target mask. Reuses the foreground tint so red and blue read as one system. Pure of viewer state.
+  // `negMask` is the server's 0/255 bitmask, `target` the location's own mask image.
+  function composeNegatives(image, negMask, target, count) {
+    const { width, height } = imageSize(image);
+    const readMask = (source) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.drawImage(source, 0, 0, width, height);
+      return context.getImageData(0, 0, width, height).data;
+    };
+    const tinted = (maskPixels, hex, visibility, keepOutside) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.drawImage(image, 0, 0, width, height);
+      const imageData = context.getImageData(0, 0, width, height);
+      tintMaskedPixels(imageData.data, maskPixels, hex, visibility, keepOutside);
+      context.putImageData(imageData, 0, 0);
+      return canvas;
+    };
+    const negative = readMask(negMask);
+    const base = tinted(negative, NEG_HEX, NEG_VISIBILITY, true);
+    let overlap = null;
+    if (target) {
+      const own = readMask(target);
+      const both = new Uint8ClampedArray(negative.length);
+      let covered = false;
+      for (let index = 0; index < both.length; index += 4) {
+        if (negative[index] > 127 && own[index] > 127) {
+          both[index] = 255;
+          covered = true;
+        }
+      }
+      overlap = covered ? tinted(both, NEG_OVERLAP_HEX, NEG_VISIBILITY, false) : null;
+    }
+    return { count, base, overlap };
+  }
+
+  // Fetches the other annotations in the open location's tile and shows them. Nothing is drawn, and no badge is
+  // added, when the tile has none or the request fails. Safe to drop on the floor if another location opens first.
+  async function loadViewerNegatives(token, image, target) {
+    const imageKey = viewer.imageKey;
+    if (!imageKey) {
+      return;
+    }
+    let negMask;
+    let count;
+    try {
+      const response = await fetch(withSet(
+        `/api/volumes/${encodeURIComponent(state.volume)}/negatives?key=${encodeURIComponent(imageKey)}&loc=${encodeURIComponent(viewer.locationId)}`,
+      ));
+      if (!response.ok) {
+        return;
+      }
+      count = Number(response.headers.get("X-Negative-Count") || "0");
+      if (!count) {
+        return;
+      }
+      const url = URL.createObjectURL(await response.blob());
+      try {
+        negMask = await loadImage(url);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    } catch {
+      return;
+    }
+    if (token !== viewer.token) {
+      return;
+    }
+    viewer.negatives = composeNegatives(image, negMask, target, count);
+    paintViewer();
+    placeViewerInfo();
+  }
+
+  function toggleNegatives() {
+    negativesEnabled = !negativesEnabled;
+    try {
+      localStorage.setItem(NEG_KEY, negativesEnabled ? "on" : "off");
+    } catch {
+      // Not remembered across sessions; the toggle still works for this page.
+    }
+    paintViewer();
+    placeViewerInfo();
+  }
+
   function drawFull(image, overlay) {
     const width = image.naturalWidth;
     const height = image.naturalHeight;
@@ -1761,11 +1884,16 @@
     els.viewerImage.height = height;
     els.viewerMask.width = width;
     els.viewerMask.height = height;
-    els.viewerImage.getContext("2d").drawImage(image, 0, 0);
+    // Negatives only belong to the whole-tile view, not to the parts of a split location.
+    const negatives = negativesShown() && image === viewer.image ? viewer.negatives : null;
+    els.viewerImage.getContext("2d").drawImage(negatives ? negatives.base : image, 0, 0);
     const maskContext = els.viewerMask.getContext("2d");
     maskContext.clearRect(0, 0, width, height);
     if (overlay) {
       maskContext.drawImage(overlay, 0, 0);
+    }
+    if (negatives && negatives.overlap) {
+      maskContext.drawImage(negatives.overlap, 0, 0);
     }
     layoutViewerFrame(width, height);
   }
@@ -1848,6 +1976,7 @@
     viewer.parts = null;
     viewer.image = null;
     viewer.overlay = null;
+    viewer.negatives = null;
     for (const canvas of [els.viewerImage, els.viewerMask]) {
       canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
     }
@@ -1953,6 +2082,7 @@
     viewer.partIndex = null;
     paintViewer();
     syncViewerActs();
+    void loadViewerNegatives(token, image, mask);
   }
 
   function viewerRow() {
@@ -2176,6 +2306,16 @@
     if (!els.viewer.hidden && (event.key === "Escape" || event.key === "Esc" || event.code === "Escape")) {
       event.preventDefault();
       closeViewer();
+      return;
+    }
+    if (
+      !els.viewer.hidden
+      && (event.key === "n" || event.key === "N")
+      && !event.ctrlKey && !event.metaKey && !event.altKey
+      && !zoomKeyTarget(event)
+    ) {
+      event.preventDefault();
+      toggleNegatives();
       return;
     }
     if (!isSpaceKey(event) || zoomKeyTarget(event)) {

@@ -12,6 +12,7 @@ from sam2_segmentation_trainer.data.manifest import (
     index_volumes,
     summarize_index,
 )
+from sam2_segmentation_trainer.data.tiles import build_tile_context
 from sam2_segmentation_trainer.paths import DEFAULT_VOLUMES, data_root
 
 
@@ -50,6 +51,30 @@ def _read_json_stats(examples, *, limit: int | None) -> dict[str, object]:
     }
 
 
+def _circle_stats(examples) -> dict[str, object]:
+    """How much negative context the mixed-prompt trainer will find.
+
+    Counts circle entries from each volume's ``circle_annotations.json`` by origin, and the tiles whose target
+    has another annotation (a neighbor mask or a circle) to use as negative context. A volume with no circle
+    file simply contributes no circles.
+    """
+    context = build_tile_context(examples)
+    by_source: Counter[str] = Counter()
+    for circles in context.circles.values():
+        for circle in circles:
+            by_source[circle.source] += 1
+    with_context = 0
+    for key, ids in context.neighbors.items():
+        if len(ids) > 1 or any(c.location_id not in ids for c in context.circles_in(key)):
+            with_context += 1
+    return {
+        "tiles_with_circle_entries": len(context.circles),
+        "circle_entries_by_source": dict(by_source),
+        "tiles_with_negative_context": with_context,
+        "tiles": len(context.neighbors),
+    }
+
+
 def build_report(
     *,
     root: Path,
@@ -67,6 +92,7 @@ def build_report(
         "usable_examples": len(present),
         "skipped_vs_manifest_rows": summary["n_examples"] - len(present),
     }
+    report["circle_context"] = _circle_stats(present)
     if check_json:
         report["json_stats"] = _read_json_stats(present, limit=json_limit)
     return report

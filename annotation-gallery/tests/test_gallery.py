@@ -844,7 +844,10 @@ def test_dockerfile_has_no_nornir() -> None:
     assert "torch" not in text
     assert "refresh-export" not in text
     assert "nornir_shared" not in text
-    assert "pip install --no-cache-dir pillow" in text
+    # The image needs Pillow and NumPy for the negative-context bitmask (annotation_crops.negatives), nothing heavier.
+    assert "pip install --no-cache-dir" in text and "pillow" in text and "numpy" in text
+    assert "annotation-gallery/negatives_view.py" in text
+    assert "copy annotation_crops /app/annotation_crops" in text
 
 
 def test_https_redirect_location_public_origin_wins() -> None:

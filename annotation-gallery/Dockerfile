@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY annotation-gallery/server.py annotation-gallery/identity.py annotation-gallery/catalog.py annotation-gallery/thumbs.py annotation-gallery/refresh.py annotation-gallery/crops_path.py /app/
+COPY annotation-gallery/server.py annotation-gallery/identity.py annotation-gallery/catalog.py annotation-gallery/thumbs.py annotation-gallery/refresh.py annotation-gallery/crops_path.py annotation-gallery/negatives_view.py /app/
 COPY annotation-gallery/static /app/static
 COPY annotation_crops /app/annotation_crops
 

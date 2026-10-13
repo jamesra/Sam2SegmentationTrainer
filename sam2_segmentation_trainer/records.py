@@ -78,6 +78,7 @@ class TrainSnapshot:
     epochs_without_improve: int
     freeze_mode: str
     rng: dict
+    unfreeze_mask_cnn: bool = False
 
     def as_checkpoint(self) -> dict[str, Any]:
         """Dict ``torch.save`` already understands."""
@@ -93,6 +94,7 @@ class TrainSnapshot:
             "best_val_iou": self.best_val_iou,
             "epochs_without_improve": self.epochs_without_improve,
             "freeze_mode": self.freeze_mode,
+            "unfreeze_mask_cnn": self.unfreeze_mask_cnn,
             "n_param_groups": len(self.optimizer.param_groups),
             "rng": self.rng,
         }
