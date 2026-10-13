@@ -3139,11 +3139,12 @@
     updateUi.since.textContent = status.watermarkBefore
       ? `Changes since ${status.watermarkBefore.replace("T", " ").replace(/\.\d+Z$/, "Z")}.`
       : "";
-    const counts = `${status.refreshed || 0} refreshed, ${status.added || 0} added, ${status.skipped || 0} skipped, ${status.failed || 0} failed`;
+    const circles = status.circles ? `, ${status.circles} circles` : "";
+    const counts = `${status.refreshed || 0} refreshed, ${status.added || 0} added${circles}, ${status.skipped || 0} skipped, ${status.failed || 0} failed`;
     const place = status.pages ? `page ${status.page} of ${status.pages}: ` : "";
     const label = { done: "Finished. ", cancelled: "Cancelled. ", failed: "Finished with failures. " }[phase] || "";
     updateUi.line.textContent = `${label}${place}${counts}`;
-    const lines = [...(status.errors || []), ...(status.skipLines || []).slice(0, 20)];
+    const lines = [...(status.notes || []), ...(status.errors || []), ...(status.skipLines || []).slice(0, 20)];
     if (status.skipped > (status.skipLines || []).length) {
       lines.push(`... ${status.skipped} skipped in all; the full list is in update_all.log`);
     }
@@ -3168,7 +3169,7 @@
     }
     const justFinished = updateUi.wasRunning;
     updateUi.wasRunning = false;
-    if (justFinished && (status.refreshed || status.added)) {
+    if (justFinished && (status.refreshed || status.added || status.circles)) {
       for (const id of status.refreshedIds || []) {
         locationGenerations.set(Number(id), locationGen(id) + 1);
       }

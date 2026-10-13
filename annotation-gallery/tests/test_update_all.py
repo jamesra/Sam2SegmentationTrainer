@@ -301,3 +301,132 @@ def test_add_location_is_skipped_whole_when_a_tile_is_missing(tmp_path: Path) ->
     assert [a["id"] for a in payload["annotations"]] == [1]
     other, other_reason = add_new_location(crops, {"ID": 51}, index, _fake_support((5000, 5000, 5100, 5100)))
     assert other is None and other_reason == "no tile image covers it"
+
+
+# ------------------------------------------------------------------- circles
+
+from circle_update import (  # noqa: E402
+    Circle,
+    CircleFile,
+    CropWindowRef,
+    annotated_circle,
+    circle_geometry_from_wkt,
+    entries_for_circle,
+    inscribed_circle,
+)
+
+
+def test_circle_geometry_from_circularstring_and_circle_wkt() -> None:
+    wkt = "CURVEPOLYGON(CIRCULARSTRING(90 100, 100 110, 110 100, 100 90, 90 100))"
+    x, y, r = circle_geometry_from_wkt(wkt)
+    assert (round(x, 6), round(y, 6), round(r, 6)) == (100.0, 100.0, 10.0)
+    assert circle_geometry_from_wkt("CIRCLE((5 6), 7)") == (5.0, 6.0, 7.0)
+    assert circle_geometry_from_wkt("POINT(1 2)") is None
+    stored = annotated_circle(3, wkt, 12.5, "MC")
+    assert stored.radius == 12.5 and stored.source == "annotated" and not stored.has_polygon_mask
+    assert annotated_circle(3, wkt, None, "MC").radius == 10.0
+
+
+def test_inscribed_circle_of_a_square_and_a_c_shape() -> None:
+    square = [(((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)),)]
+    circle = inscribed_circle(9, square, "MC")
+    assert abs(circle.center_x - 50) < 1 and abs(circle.center_y - 50) < 1 and abs(circle.radius - 50) < 1
+    assert circle.source == "inscribed" and circle.has_polygon_mask
+    c_shape = [(((0.0, 0.0), (100.0, 0.0), (100.0, 30.0), (30.0, 30.0), (30.0, 70.0),
+                 (100.0, 70.0), (100.0, 100.0), (0.0, 100.0)),)]
+    inside = inscribed_circle(9, c_shape, "")
+    assert inside.radius > 13                               # the arms and the spine are each 30 wide
+    x, y = inside.center_x, inside.center_y
+    assert x <= 30 or y <= 30 or y >= 70                    # the center is in the C, not in its mouth
+
+
+def test_entries_use_crop_pixels_including_negative_origins() -> None:
+    circle = Circle(7, 1000.0, 200.0, 40.0, "MC", False, "annotated")
+    windows = [
+        CropWindowRef("RC2_17_D1_X1024-2048_Y0-1024", 1, 1024, 0, 1024, 1024),
+        CropWindowRef("RC2_17_D1_X0-1024_Y0-1024", 1, 0, 0, 1024, 1024),
+        CropWindowRef("RC2_17_D2_X-512-512_Y0-512", 2, -512, 0, 1024, 512),
+    ]
+    entries = entries_for_circle(circle, windows)
+    assert set(entries) == {"RC2_17_D1_X1024-2048_Y0-1024", "RC2_17_D1_X0-1024_Y0-1024", "RC2_17_D2_X-512-512_Y0-512"}
+    assert entries["RC2_17_D1_X1024-2048_Y0-1024"] == {
+        "location_id": 7, "center_x": -24.0, "center_y": 200.0, "radius": 40.0,
+        "structure_label": "MC", "has_polygon_mask": False, "source": "annotated",
+    }
+    assert entries["RC2_17_D1_X0-1024_Y0-1024"]["center_x"] == 1000.0
+    d2 = entries["RC2_17_D2_X-512-512_Y0-512"]               # the window hangs over the mosaic edge
+    assert d2["center_x"] == (1000.0 - (-512 * 2)) / 2 and d2["radius"] == 20.0
+    far = entries_for_circle(Circle(7, 5000.0, 5000.0, 40.0, "", False, "annotated"), windows)
+    assert far == {}
+
+
+def test_circle_file_replace_keeps_other_entries_and_writes_once(tmp_path: Path) -> None:
+    crops = tmp_path / "AnnotationCrops"
+    crops.mkdir()
+    (crops / "circle_annotations.json").write_text(json.dumps({
+        "version": 1, "diameter_scale": 1.0,
+        "grid_cells": {
+            "A": [{"location_id": 1, "center_x": 1.0}, {"location_id": 2, "center_x": 2.0}],
+            "B": [{"location_id": 2, "center_x": 3.0}],
+        },
+    }), encoding="utf-8")
+    file = CircleFile(crops)
+    assert file.exists
+    file.replace(2, {"C": {"location_id": 2, "center_x": 9.0}})
+    assert file.save()
+    saved = json.loads((crops / "circle_annotations.json").read_text(encoding="utf-8"))
+    assert saved["grid_cells"] == {"A": [{"location_id": 1, "center_x": 1.0}], "C": [{"location_id": 2, "center_x": 9.0}]}
+    stamp = (crops / "circle_annotations.json").stat().st_mtime_ns
+    assert CircleFile(crops).save() and (crops / "circle_annotations.json").stat().st_mtime_ns == stamp
+
+
+def _circle_deps(odata: _FakeOData, circle_by_id: dict[int, Circle]):
+    deps, calls = _deps(odata)
+    deps.circle_for = lambda entity: circle_by_id.get(entity["ID"])
+    deps.tile_index = lambda crops: types.SimpleNamespace(
+        windows=lambda z: [types.SimpleNamespace(key=KEY_A, downsample=1, x0=0, y0=0, x1=1024, y1=1024)]
+    )
+    return deps, calls
+
+
+def test_update_all_rewrites_circle_entries(tmp_path: Path) -> None:
+    crops = _crops(tmp_path, ids=(1,))
+    save_state(crops, {"watermark": "2026-01-01T00:00:00.000000Z"})
+    (crops / "circle_annotations.json").write_text(json.dumps({
+        "version": 1, "diameter_scale": 1.0,
+        "grid_cells": {KEY_A: [
+            {"location_id": 1, "center_x": 10.0, "center_y": 10.0, "radius": 5.0, "source": "inscribed"},
+            {"location_id": 8, "center_x": 300.0, "center_y": 300.0, "radius": 20.0, "source": "annotated"},
+        ]},
+    }), encoding="utf-8")
+    circle_entity = {**_entity(8, "2026-03-02T00:00:00Z"), "TypeCode": 1}
+    odata = _FakeOData([_entity(1, "2026-03-01T00:00:00Z"), circle_entity])
+    circles = {
+        1: Circle(1, 500.0, 600.0, 55.0, "new", True, "inscribed"),     # polygon 1 was edited
+        8: Circle(8, 700.0, 710.0, 33.0, "new", False, "annotated"),    # circle 8 moved and was resized
+    }
+    try:
+        deps, calls = _circle_deps(odata, circles)
+        result = _run(crops, odata, deps, page_size=10)
+    finally:
+        odata.close()
+    assert result["phase"] == "done" and result["circles"] == 2
+    assert calls["refresh"] == [1] and calls["add"] == []           # the circle location is never rasterized
+    assert (result["refreshed"], result["skipped"]) == (1, 0)       # and is not counted as a skip
+    entries = {e["location_id"]: e for e in json.loads(
+        (crops / "circle_annotations.json").read_text(encoding="utf-8"))["grid_cells"][KEY_A]}
+    assert entries[1]["center_x"] == 500.0 and entries[1]["radius"] == 55.0 and entries[1]["source"] == "inscribed"
+    assert entries[8]["center_x"] == 700.0 and entries[8]["radius"] == 33.0 and entries[8]["source"] == "annotated"
+
+
+def test_circles_are_not_created_when_the_volume_has_no_circle_file(tmp_path: Path) -> None:
+    crops = _crops(tmp_path, ids=(1,))
+    save_state(crops, {"watermark": "2026-01-01T00:00:00.000000Z"})
+    odata = _FakeOData([{**_entity(8, "2026-03-02T00:00:00Z"), "TypeCode": 1}])
+    try:
+        deps, _calls = _circle_deps(odata, {8: Circle(8, 1.0, 1.0, 5.0, "", False, "annotated")})
+        result = _run(crops, odata, deps, page_size=10)
+    finally:
+        odata.close()
+    assert result["circles"] == 0 and any("circle_annotations.json is missing" in n for n in result["notes"])
+    assert not (crops / "circle_annotations.json").exists()

@@ -181,11 +181,13 @@ def load_add_support(root: Path) -> types.SimpleNamespace:
     from nornir_buildmanager.operations.segmentationtraining.sam2.write import sa1b_annotation
     from nornir_buildmanager.operations.segmentationtraining.wkt import (
         location_from_odata_entity,
+        mosaic_wkt_from_odata_shape,
         parse_wkt_polygons,
     )
 
     return types.SimpleNamespace(
         location_from_odata_entity=location_from_odata_entity,
+        mosaic_wkt_from_odata_shape=mosaic_wkt_from_odata_shape,
         parse_wkt_polygons=parse_wkt_polygons,
         hydrate_polygons=hydrate_polygons,
         mosaic_bbox=mosaic_bbox,

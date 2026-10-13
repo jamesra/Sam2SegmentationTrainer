@@ -51,3 +51,8 @@
 #   on the next run). The watermark moves only after a run with no failures. First run: the older of the ``masks/``
 #   folder's mtime and the oldest mask's creation time. Label and type edits do not change OData ``LastModified``,
 #   so they arrive only with a changed shape or a full re-export.
+#   Update all also rewrites ``circle_annotations.json``: a changed circle location gets its annotated circle
+#   (center and the stored ``Radius``) recomputed, and a redrawn or added polygon gets its inscribed circle
+#   recomputed, in every crop window the circle reaches. Only the listed locations change, and the file is
+#   written once at the end. A volume without that file is left without one (the dialog says so). Deleted
+#   annotations do not appear in an OData "changed since" query, so their circles stay until the next export.

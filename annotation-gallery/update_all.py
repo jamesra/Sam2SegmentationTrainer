@@ -29,7 +29,24 @@ from urllib.parse import quote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from catalog import connect
-from refresh import TileIndex, add_new_location, drop_stale_thumbnails, refresh_location
+from circle_update import (
+    CIRCLE_TYPE_CODE,
+    Circle,
+    CircleFile,
+    CropWindowRef,
+    annotated_circle,
+    entries_for_circle,
+    inscribed_available,
+    inscribed_circle,
+)
+from refresh import (
+    TileIndex,
+    add_new_location,
+    drop_stale_thumbnails,
+    load_add_support,
+    nornir_buildmanager_root,
+    refresh_location,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -229,6 +246,56 @@ def _insert_rows(crops: Path, added: dict[str, Any]) -> None:
         connection.close()
 
 
+# ------------------------------------------------------------------ circle entries
+
+_support_cache: list[Any] = []
+
+
+def _label_of(entity: dict[str, Any]) -> str:
+    """The category the exporter writes: structure label, else type name, else empty."""
+    parent = entity.get("Parent") or {}
+    return str(parent.get("Label") or (parent.get("Type") or {}).get("Name") or "").strip()
+
+
+def circle_for_entity(entity: dict[str, Any]) -> Circle | None:
+    """The circle the exporter would write for this OData location.
+
+    A Viking circle (``TypeCode`` 1) gives its annotated circle; any other shape gives the largest circle inside
+    its polygon. None when the shape cannot be read, or scipy is missing for the polygon case.
+    """
+    if not _support_cache:
+        root = nornir_buildmanager_root()
+        if root is None:
+            return None
+        _support_cache.append(load_add_support(root))
+    support = _support_cache[0]
+    location_id = int(entity["ID"])
+    wkt = support.mosaic_wkt_from_odata_shape(entity.get("MosaicShape"))
+    if not wkt:
+        return None
+    type_code = entity.get("TypeCode")
+    type_code = None if type_code in (None, "") else int(type_code)
+    label = _label_of(entity)
+    if type_code == CIRCLE_TYPE_CODE:
+        radius = entity.get("Radius")
+        return annotated_circle(location_id, wkt, None if radius in (None, "") else float(radius), label)
+    polygons = support.hydrate_polygons(support.parse_wkt_polygons(wkt), type_code)
+    return inscribed_circle(location_id, polygons, label)
+
+
+def is_circle_entity(entity: dict[str, Any]) -> bool:
+    code = entity.get("TypeCode")
+    return code not in (None, "") and int(code) == CIRCLE_TYPE_CODE
+
+
+def window_refs(index: Any, z: int) -> list[CropWindowRef]:
+    """Crop windows whose image is on disk for section *z*, as circle-entry geometry."""
+    return [
+        CropWindowRef(w.key, w.downsample, w.x0, w.y0, w.x1 - w.x0, w.y1 - w.y0)
+        for w in index.windows(z)
+    ]
+
+
 # ----------------------------------------------------------------------- the job
 
 @dataclass
@@ -244,6 +311,7 @@ class Dependencies:
     )
     drop_stale: Callable[[Path, list[str]], None] = lambda crops, keys: drop_stale_thumbnails(crops, keys)
     tile_index: Callable[[Path], TileIndex] = lambda crops: TileIndex(crops)
+    circle_for: Callable[[dict[str, Any]], Circle | None] = lambda entity: circle_for_entity(entity)
 
 
 @dataclass
@@ -262,7 +330,9 @@ class UpdateJob:
     unchanged: int = 0
     added: int = 0
     skipped: int = 0
+    circles: int = 0
     failed: int = 0
+    notes: list[str] = field(default_factory=list)
     skip_lines: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     started: float = 0.0
@@ -308,6 +378,8 @@ class UpdateJob:
                 "unchanged": self.unchanged,
                 "added": self.added,
                 "skipped": self.skipped,
+                "circles": self.circles,
+                "notes": list(self.notes),
                 "failed": self.failed,
                 "skipLines": list(self.skip_lines),
                 "errors": list(self.errors),
@@ -344,6 +416,39 @@ class UpdateJob:
             pass
 
     def _walk(self) -> None:
+        self._circle_file: CircleFile | None = None
+        try:
+            self._walk_rows()
+        finally:
+            # The circle entries replaced so far are real changes, so they are written even when the run stops.
+            if self._circle_file is not None and not self._circle_file.save():
+                with self._lock:
+                    self.errors.append("could not write circle_annotations.json")
+
+    def _update_circle(self, entity: dict[str, Any], index_for: Callable[[], TileIndex]) -> None:
+        """Replace this location's circle entries from its current OData shape."""
+        if self._circle_file is None:
+            self._circle_file = CircleFile(self.crops)
+            if not self._circle_file.exists:
+                with self._lock:
+                    self.notes.append(
+                        "circle_annotations.json is missing, so circles were not updated; export circles first."
+                    )
+        if not self._circle_file.exists:
+            return
+        circle = self.deps.circle_for(entity)
+        if circle is None and not is_circle_entity(entity) and not inscribed_available():
+            if not any("scipy" in note for note in self.notes):
+                with self._lock:
+                    self.notes.append("scipy is not installed, so inscribed circles were not updated.")
+            return
+        windows = window_refs(index_for(), int(entity["Z"]))
+        entries = entries_for_circle(circle, windows) if circle is not None else {}
+        self._circle_file.replace(int(entity["ID"]), entries)
+        with self._lock:
+            self.circles += 1
+
+    def _walk_rows(self) -> None:
         state = load_state(self.crops)
         before = parse_odata_datetime(state.get("watermark")) or initial_watermark(self.crops)
         self._set(watermark_before=odata_literal(before), phase="reading catalog")
@@ -367,6 +472,10 @@ class UpdateJob:
             if modified is not None and modified > newest and not retry:
                 newest = modified
             try:
+                if is_circle_entity(entity):
+                    # A circle has no mask. It only feeds circle_annotations.json.
+                    self._update_circle(entity, tile_index)
+                    return
                 if location_id in known:
                     keys = self.deps.refresh(self.crops, entity, self.exporter)
                     _update_metadata(self.crops, entity)
@@ -377,6 +486,8 @@ class UpdateJob:
                         else:
                             self.unchanged += 1
                     touched_keys.extend(keys)
+                    if keys:
+                        self._update_circle(entity, tile_index)
                     return
                 added, reason = self.deps.add(self.crops, entity, tile_index())
                 if added is None:
@@ -389,6 +500,7 @@ class UpdateJob:
                             self.skip_lines.append(line)
                     return
                 _insert_rows(self.crops, added)
+                self._update_circle(entity, tile_index)
                 known.add(location_id)
                 resolved.add(location_id)
                 touched_keys.extend(window["image_key"] for window in added["windows"])
@@ -461,7 +573,7 @@ class UpdateJob:
                 "last_run": datetime.now(timezone.utc).isoformat(),
                 "last_counts": {
                     "refreshed": self.refreshed, "added": self.added, "skipped": self.skipped,
-                    "unchanged": self.unchanged, "failed": self.failed, "clean": clean,
+                    "circles": self.circles, "unchanged": self.unchanged, "failed": self.failed, "clean": clean,
                 },
                 "skipped_ids": remaining,
             },

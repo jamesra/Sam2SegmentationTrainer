@@ -1,4 +1,4 @@
-# Slim AnnotationCrops gallery. Stdlib, Pillow, and NumPy.
+# Slim AnnotationCrops gallery. Stdlib, Pillow, NumPy, and SciPy (inscribed circles).
 # Mask refresh loads mounted mask modules only: no imageregistration, CuPy, or torch.
 FROM python:3.14-slim-bookworm
 
@@ -11,11 +11,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+COPY annotation-gallery/circle_update.py /app/
 COPY annotation-gallery/server.py annotation-gallery/identity.py annotation-gallery/catalog.py annotation-gallery/thumbs.py annotation-gallery/refresh.py annotation-gallery/crops_path.py annotation-gallery/negatives_view.py annotation-gallery/cardmask.py annotation-gallery/update_all.py /app/
 COPY annotation-gallery/static /app/static
 COPY annotation_crops /app/annotation_crops
 
-RUN pip install --no-cache-dir "numpy>=2.2" pillow \
+RUN pip install --no-cache-dir "numpy>=2.2" pillow scipy \
     && groupadd --gid 10001 gallery \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin gallery
 
