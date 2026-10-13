@@ -5,7 +5,7 @@
 # The gallery HTTP process must never spawn nornir-build.
 #
 # Registry child name = Identity volume name; child target = volume root.
-# For each child: ExportAnnotationCrops -Output {root}/AnnotationCrops
+# For each child: ExportTrainingData -Output {root}/AnnotationCrops
 #
 # Cron example (on the build appliance, after nornir:prod is available):
 #   15 3 * * 0 GALLERY_VOLUME_DIR=/gallery-volumes \
@@ -35,7 +35,7 @@ for child in "$REGISTRY"/*; do
   output="$target/AnnotationCrops"
   odata="${TEMPLATE//\{volume\}/$name}"
   echo "refresh-export: $name -> $output ($odata)"
-  "$NORNIR_BUILD" ExportAnnotationCrops "$target" \
+  "$NORNIR_BUILD" ExportTrainingData "$target" \
     -OData "$odata" \
     -Output "$output"
 done
