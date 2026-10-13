@@ -24,6 +24,7 @@
   const NEG_OVERLAP_HEX = "#f5d90a";
   const NEG_VISIBILITY = 55;
   const SIZE_KEY = "galleryCardSize";
+  const COLLAPSE_KEY = "galleryFiltersCollapsed";
   // Last training set, and the volume last opened inside each set.
   const VIEW_KEY = "galleryView";
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
@@ -66,6 +67,8 @@
     spacer: document.getElementById("spacer"),
     grid: document.getElementById("grid"),
     filters: document.getElementById("filters"),
+    filtersToggle: document.getElementById("filters-toggle"),
+    filterSummary: document.getElementById("filter-summary"),
     viewer: document.getElementById("viewer"),
     viewerStage: document.getElementById("viewer-stage"),
     viewerFrame: document.getElementById("viewer-frame"),
@@ -671,6 +674,89 @@
       }
     }
     syncVisibilityLabel();
+  }
+
+  const VIEW_LABELS = { approved: "Approved", rejected: "Rejected", unknown: "Unknown" };
+
+  // What the collapsed bar says about the cards. Pure, so it reads the same wherever the values come from.
+  // `values` holds the control values (trainingSet, volume, classes as a Set, type, label, tags, z, radius, sorts);
+  // `sortLabel` names a sort key. Returns { scope, criteria }: where the cards come from, and what narrows or orders them.
+  function describeFilters(values, sortLabel) {
+    const scope = [];
+    if (values.trainingSet && values.trainingSet !== "current") {
+      scope.push(`Training set ${values.trainingSet}`);
+    }
+    if (values.volume) {
+      scope.push(`Volume ${values.volume}`);
+    }
+    const criteria = [];
+    const classes = values.classes;
+    if (!(classes.size === 1 && classes.has("unknown"))) {
+      const names = Object.keys(VIEW_LABELS).filter((name) => classes.has(name)).map((name) => VIEW_LABELS[name]);
+      criteria.push(names.length ? `View ${names.join(" + ")}` : "View nothing");
+    }
+    for (const [label, text] of [
+      ["Type", values.type],
+      ["Structure", values.label],
+      ["Tags", values.tags],
+      ["Z", values.z],
+      ["Radius", values.radius],
+    ]) {
+      const trimmed = (text || "").trim();
+      if (trimmed) {
+        criteria.push(`${label} ${trimmed}`);
+      }
+    }
+    const sorts = values.sorts || [];
+    const defaultSort = sorts.length === 1 && sorts[0].key === "z" && !sorts[0].desc;
+    if (sorts.length && !defaultSort) {
+      criteria.push(`Sorted by ${sorts.map((item) => `${sortLabel(item.key)} ${item.desc ? "↓" : "↑"}`).join(", ")}`);
+    }
+    return { scope, criteria };
+  }
+
+  function updateFilterSummary() {
+    const labels = new Map(sortFields());
+    const { scope, criteria } = describeFilters({
+      trainingSet: state.trainingSet,
+      volume: state.volume,
+      classes: visibleClasses(),
+      type: els.type.value,
+      label: els.label.value,
+      tags: els.tags.value,
+      z: els.z.value,
+      radius: els.radius.value,
+      sorts: state.sorts,
+    }, (key) => labels.get(key) || key);
+    const text = [...scope, ...(criteria.length ? criteria : ["No filters"])].join(" · ");
+    els.filterSummary.textContent = text;
+    els.filterSummary.title = text;
+  }
+
+  function filtersCollapsed() {
+    return document.body.classList.contains("filters-collapsed");
+  }
+
+  // Hides the filter controls and shows their criteria as one line in the top bar, or brings the controls back.
+  // The filters stay in effect either way. `remember` keeps the choice for the next visit.
+  function setFiltersCollapsed(collapsed, remember) {
+    document.body.classList.toggle("filters-collapsed", collapsed);
+    els.filterSummary.hidden = !collapsed;
+    els.filtersToggle.textContent = collapsed ? "Show filters" : "Hide filters";
+    els.filtersToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    els.filtersToggle.title = collapsed
+      ? "Show the filter controls again."
+      : "Hide the filter controls to make room for cards. The filters stay in effect.";
+    if (collapsed) {
+      updateFilterSummary();
+    }
+    if (remember) {
+      localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
+    }
+  }
+
+  function loadFiltersCollapsedPref() {
+    setFiltersCollapsed(localStorage.getItem(COLLAPSE_KEY) === "1", false);
   }
 
   const SORT_FIELDS = [
@@ -1315,6 +1401,9 @@
   }
 
   function render(force = true, reuse = false) {
+    if (force && filtersCollapsed()) {
+      updateFilterSummary();
+    }
     const scroll = els.scroller.scrollTop;
     const viewH = els.scroller.clientHeight || 1;
     const page = viewH;
@@ -2529,6 +2618,12 @@
       : `Imported review lists for ${applied} volume(s).`;
   }
 
+  els.filtersToggle.addEventListener("click", () => {
+    setFiltersCollapsed(!filtersCollapsed(), true);
+    // The scroller gained or lost the controls' height, so lay the cards out for the new size.
+    render(true);
+  });
+
   els.scroller.addEventListener("scroll", () => render(false));
   window.addEventListener("resize", () => {
     renderSortStack();
@@ -2715,6 +2810,7 @@
   async function boot() {
     loadOverlayPrefs();
     loadCardSizePref();
+    loadFiltersCollapsedPref();
     renderSortStack();
     state.config = await getJson("/api/config");
     const setsPayload = await getJson("/api/training-sets");

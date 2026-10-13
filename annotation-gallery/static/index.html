@@ -12,7 +12,11 @@
       <h1>Annotation overlay gallery</h1>
       <a class="site-link" href="https://tensor.codepharm.net" target="_blank" rel="noopener noreferrer">TensorBoard</a>
     </div>
-    <p id="who" class="who"></p>
+    <p id="filter-summary" class="filter-summary" aria-live="polite" hidden></p>
+    <div class="bar-end">
+      <button type="button" id="filters-toggle" aria-controls="filters" aria-expanded="true" title="Hide the filter controls to make room for cards. The filters stay in effect.">Hide filters</button>
+      <p id="who" class="who"></p>
+    </div>
   </header>
   <section class="filters" id="filters">
     <div class="filter">

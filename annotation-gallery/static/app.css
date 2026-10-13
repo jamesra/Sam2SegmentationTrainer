@@ -57,6 +57,43 @@ h1 {
 
 .who { margin: 0; color: var(--muted); }
 
+.bar-end {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.bar-end button {
+  border: 0;
+  background: #232833;
+  color: var(--ink);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* The collapsed bar: one line holding the title, the active criteria as text, and the button to bring the controls back. */
+.filter-summary {
+  flex: 1;
+  min-width: 0;
+  margin: 0 16px;
+  align-self: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent);
+}
+
+body.filters-collapsed .filters {
+  display: none;
+}
+
+body.filters-collapsed .bar {
+  align-items: center;
+  padding: 6px 16px;
+}
+
 .filters {
   display: flex;
   flex-wrap: wrap;

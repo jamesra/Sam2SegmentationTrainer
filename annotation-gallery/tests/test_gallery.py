@@ -277,6 +277,24 @@ def test_location_search_scrolls_and_sort_stacks() -> None:
     assert "maxSortRows" not in js
 
 
+def test_filters_collapse_to_a_summary_bar() -> None:
+    html = (GALLERY_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    css = (GALLERY_ROOT / "static" / "app.css").read_text(encoding="utf-8")
+    assert 'id="filters-toggle"' in html and 'aria-controls="filters"' in html
+    assert 'id="filter-summary"' in html
+    # The collapsed bar replaces the controls; the filters themselves are untouched.
+    assert "body.filters-collapsed .filters" in css and "display: none" in css.split("body.filters-collapsed .filters", 1)[1].split("}", 1)[0]
+    assert ".filter-summary" in css and "text-overflow: ellipsis" in css
+    assert "function describeFilters" in js and "function setFiltersCollapsed" in js
+    assert 'COLLAPSE_KEY = "galleryFiltersCollapsed"' in js
+    # The summary follows every filter change, and the cards are laid out again when the bar changes height.
+    render = js.split("function render(", 1)[1].split("const scroll", 1)[0]
+    assert "updateFilterSummary()" in render
+    toggle = js.split('els.filtersToggle.addEventListener("click"', 1)[1].split("});", 1)[0]
+    assert "render(true)" in toggle
+
+
 def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     css = (GALLERY_ROOT / "static" / "app.css").read_text(encoding="utf-8")
