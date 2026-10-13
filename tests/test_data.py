@@ -107,8 +107,7 @@ class ManifestSplitTests(unittest.TestCase):
     def test_skips_location_ids_missing_from_json(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            make_crops(root, "RC1", n=4)
-            crops = root / "RC1" / "AnnotationCrops"
+            crops = make_crops(root, "RC1", n=4)
             # Append a manifest row whose JSON has no matching annotation id.
             key = "RC1_orphan_D1_X0-1_Y0-1"
             gray = np.full((32, 32), 10, dtype=np.uint8)
@@ -189,11 +188,10 @@ class ManifestSplitTests(unittest.TestCase):
     def test_ignore_list_rebuilds_only_when_the_file_is_newer(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            make_crops(root, "RC1", n=2)
+            crops = make_crops(root, "RC1", n=2)
             before = ignore_list_stamps(["RC1"], root)
             self.assertIsNone(before["RC1"])
             self.assertFalse(ignore_lists_newer(before, before))
-            crops = root / "RC1" / "AnnotationCrops"
             (crops / "ignore.json").write_text("[1]", encoding="utf-8")
             created = ignore_list_stamps(["RC1"], root)
             self.assertTrue(ignore_lists_newer(before, created))

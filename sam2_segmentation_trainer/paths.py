@@ -38,9 +38,23 @@ def pretrained_checkpoint(output: Path | None = None) -> Path:
     return root / "checkpoints" / DEFAULT_CHECKPOINT_NAME
 
 
+LEGACY_CROPS_SUBDIR = "AnnotationCrops"
+_FLAT_MARKERS = ("manifest.jsonl", "annotation_crops.sqlite")
+
+
 def annotation_crops_root(volume: str, root: Path | None = None) -> Path:
+    """Folder holding a volume's manifest, images/, and masks/.
+
+    Training versions are flat (``{root}/{volume}/manifest.jsonl``). Older mirrors and the
+    NAS export nest everything under ``{volume}/AnnotationCrops``. The flat layout wins when
+    the volume folder holds a manifest or catalog; otherwise the nested path is returned,
+    whether or not it exists yet.
+    """
     base = root if root is not None else data_root()
-    return base / volume / "AnnotationCrops"
+    volume_dir = base / volume
+    if any((volume_dir / name).is_file() for name in _FLAT_MARKERS):
+        return volume_dir
+    return volume_dir / LEGACY_CROPS_SUBDIR
 
 
 def run_dir_for(run_name: str, *, ckpt_root: Path | None = None) -> Path:

@@ -53,6 +53,7 @@ from refresh import (
     refresh_location,
 )
 from negatives_view import negative_bitmask
+from crops_path import crops_dir_for
 from thumbs import ensure_thumbnail, parse_thumb_request, start_thumbnail_watch, thumb_parts_allowed
 
 VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -263,8 +264,8 @@ def volume_root(registry: Path, name: str) -> Path:
 
 
 def crops_dir(registry: Path, name: str) -> Path:
-    """``{volume-root}/AnnotationCrops`` for a registry child."""
-    return volume_root(registry, name) / "AnnotationCrops"
+    """Crops folder for a registry child: the volume root itself (flat) or ``AnnotationCrops`` under it."""
+    return crops_dir_for(volume_root(registry, name))
 
 
 def _allowed_crop_parts(parts: list[str]) -> bool:
@@ -697,7 +698,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         for name in list_registry_names(registry):
             if name not in principal.grants:
                 continue
-            crops = registry / name / "AnnotationCrops"
+            crops = crops_dir_for(registry / name)
             if not crops.is_dir():
                 continue
             entry = export_volume_review(crops, name)
@@ -747,7 +748,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 continue
             if principal.grants.get(volume) != PERMISSION_REVIEW:
                 continue
-            crops = registry / volume / "AnnotationCrops"
+            crops = crops_dir_for(registry / volume)
             if not crops.is_dir():
                 save_held_review(registry, volume, rejected, approved)
                 held.append(volume)

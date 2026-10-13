@@ -70,7 +70,7 @@ If the 32k dataset is not under `/storage4`, add a row to `D:\Docker\Run\nornir-
 
 ## AnnotationCrops layout
 
-Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-local/current`). Each volume uses `{volume}/AnnotationCrops`:
+Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-local/current`). Each volume folder holds the export directly (flat: `{volume}/manifest.jsonl`). Older mirrors and the NAS export nest it under `{volume}/AnnotationCrops`; the trainer and gallery accept both, and the flat layout wins when a volume has a `manifest.jsonl` or `annotation_crops.sqlite`. To flatten an old version run `version-flatten <version>` (NAS scripts) or, on WSL, `TRAIN_ROOT=~/sam2-training scripts/version-flatten <version>`. Contents:
 
 - `manifest.jsonl` — index (`image` or `jpeg`, `json`, `imageKey`, `locationIds`, `downsample`, `volume`, `z`)
 - `images/` — tile PNG/JPEG plus COCO-RLE sidecar JSON
@@ -93,11 +93,21 @@ scripts/sync_training_data.sh
 scripts/sync_training_data.sh v1b
 # Mirror without changing current.
 scripts/sync_training_data.sh -noselect v1
+# Preview what a mirror would change (nothing is written).
+scripts/sync_training_data.sh -n -noselect v2
+# Mirror a new version and carry the review lists and location_scores over from v2.
+scripts/sync_training_data.sh -seed-from v2 v3
+# Mirror from the NAS instead of D: (mount the mapped drive once: sudo mount -t drvfs Y: /mnt/y).
+TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData scripts/sync_training_data.sh -noselect v2
 # Only retarget current (no copy). No arg picks the highest local version.
 scripts/select_training_data.sh v2
 ```
 
 `current` is a relative symlink (`v2`). Restart training after it changes.
+
+A mirror keeps each volume's `approved.json`, `ignore.json`, and `ignored/` (rejected masks are moved back to `ignored/` after the copy) and the `location_scores` table in `annotation_crops.sqlite` (saved before the copy and merged back after). A new version starts without them, so mirror it with `-seed-from <older version>`.
+
+`sync_training_data.sh` refuses to mirror when a volume is flat on one side and nested (`{volume}/AnnotationCrops`) on the other, because `rsync --delete` would swap the destination's layout. Flatten the source mirror first (the NAS `version-sync` output is flat), or pass `-force-layout` to take the source's layout on purpose.
 
 If `~/sam2-training` still has flat `RC1` `RC2` `RPC1` `RPC2` and no version directories yet, move them aside once before the first sync:
 

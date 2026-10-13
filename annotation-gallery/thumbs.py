@@ -24,6 +24,7 @@ from pathlib import Path
 
 import crops_path  # noqa: F401
 from annotation_crops.maskname import MaskName
+from crops_path import crops_dir_for
 from PIL import Image
 
 THUMB_SIZES = frozenset({512, 384, 256})
@@ -263,7 +264,7 @@ def _backfill_registry(registry: Path) -> None:
         return
     written = 0
     for child in registry.iterdir():
-        crops = child / "AnnotationCrops"
+        crops = crops_dir_for(child)
         if not crops.is_dir():
             continue
         try:
@@ -305,7 +306,7 @@ def registry_signature(registry: Path) -> tuple[str, tuple[tuple[str, tuple[int 
     except OSError:
         children = []
     for child in children:
-        crops = child / "AnnotationCrops"
+        crops = crops_dir_for(child)
         if not crops.is_dir():
             continue
         rows.append((child.name, tuple(_dir_mtime_ns(crops / name) for name in _WATCH_FOLDERS)))

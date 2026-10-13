@@ -14,6 +14,7 @@ from sam2_segmentation_trainer.data.manifest import index_volumes
 from sam2_segmentation_trainer.data.prompts import MASK_PROMPT_LOGIT, PromptConfig
 from sam2_segmentation_trainer.data.tiles import build_tile_context, circle_target_examples
 from sam2_segmentation_trainer.losses import containment_warmup_scale, mask_containment_loss_per_sample
+from sam2_segmentation_trainer.paths import annotation_crops_root
 from sam2_segmentation_trainer.model import (
     combined_loss,
     configure_trainable_params,
@@ -41,7 +42,7 @@ def _cfg(**kwargs: float) -> PromptConfig:
 
 
 def _write_circles(root: Path, volume: str, cells: dict) -> None:
-    path = root / volume / "AnnotationCrops" / CIRCLE_FILE_NAME
+    path = annotation_crops_root(volume, root) / CIRCLE_FILE_NAME
     path.write_text(json.dumps({"version": 1, "diameter_scale": 0.8, "grid_cells": cells}), encoding="utf-8")
 
 

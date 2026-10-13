@@ -1,0 +1,96 @@
+WSL training data (~/sam2-training)
+==================================
+
+What this is
+------------
+A local-SSD copy of the NAS training versions, used by the trainer and the
+annotation gallery containers (~/sam2-training is bind-mounted at /data-local).
+
+  ~/sam2-training/
+    v1b/ v2/ v3/ ...        one folder per version, flat layout:
+      RC1/ RC2/ RPC1/ RPC2/   <VOL>/manifest.jsonl, annotation_crops.sqlite,
+                              images/, masks/, approved.json, ignore.json, ignored/
+    current -> v3           relative symlink; the containers read /data-local/current
+
+Source of truth: Y:\SAM2TrainingData\<version>\<VOL> (the NAS, built with
+version-bump / version-sync). WSL copies are plain ext4 (no reflinks), so every
+version costs its full size.
+
+Review state that must survive a mirror
+---------------------------------------
+Per volume: approved.json, ignore.json, ignored/ (rejected mask PNGs), and the
+location_scores table in annotation_crops.sqlite. The NAS does not have these.
+sync_training_data.sh keeps them (excluded from rsync --delete, scores saved and
+merged back, rejected masks moved back to ignored/).
+
+One-time setup
+--------------
+  # Y: as a Linux path (repeat after each WSL restart, or add to /etc/fstab)
+  sudo mount -t drvfs Y: /mnt/y
+  ls /mnt/y/SAM2TrainingData
+
+  # Repo scripts (D: drive), strip CRLF that git on Windows may have added
+  cd /mnt/d/src/git/SAM2SegmentationTrainer
+  sed -i 's/\r$//' scripts/*.sh
+  chmod +x scripts/*.sh
+
+  # Put these in ~/.bashrc to skip typing them
+  export TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData
+  export SAM2_TRAINING_DEST=$HOME/sam2-training
+
+Run these in the WSL Ubuntu shell, not inside a container.
+
+Back up the review state first (every time before a mirror)
+-----------------------------------------------------------
+  cd ~/sam2-training
+  tar czf ~/review-backup-$(date +%Y%m%d-%H%M).tgz \
+    $(find . -maxdepth 3 \( -name approved.json -o -name ignore.json -o -name ignored \
+        -o -name annotation_crops.sqlite \) -not -path './current/*')
+
+Mirror a NEW version (example: v3, carrying review state from v2)
+-----------------------------------------------------------------
+  cd /mnt/d/src/git/SAM2SegmentationTrainer
+  scripts/sync_training_data.sh -n -seed-from v2 v3     # dry run, changes nothing
+  scripts/sync_training_data.sh -seed-from v2 v3        # real run, then points current at v3
+
+Refresh an EXISTING version (example: v3 was re-exported on the NAS)
+--------------------------------------------------------------------
+  scripts/sync_training_data.sh -n v3
+  scripts/sync_training_data.sh v3
+
+Flags
+-----
+  -n               dry run: layout check, seeding, and rsync changes are listed
+  -seed-from vX    copy approved.json / ignore.json / ignored/ and location_scores
+                   from local version vX into volumes that lack them (never overwrites)
+  -noselect        mirror but leave `current` alone
+  -force-layout    allow a flat/nested mismatch (the destination takes the source layout)
+  (no version)     mirror the highest version found at the source
+
+What to check afterwards
+------------------------
+  readlink ~/sam2-training/current                 # expect v3
+  ls ~/sam2-training/v3/RC1/manifest.jsonl         # flat: manifest is directly under the volume
+  # Output lines per volume, compare with your backup:
+  #   saved N location_scores row(s) for <VOL>
+  #   restored location_scores for <VOL>: N row(s) now
+  #   kept reject list <VOL>: N location(s), M mask(s) moved
+
+If `current` changed, restart the gallery container so it re-reads the catalog:
+  docker restart sam2-trainer-annotation-gallery-1
+
+Problems
+--------
+  "refusing to mirror" / layout mismatch
+      One side is flat, the other still has <VOL>/AnnotationCrops/. Flatten the NAS
+      version with `version-flatten vN` there; locally, the destination is already
+      flat. Use -force-layout only if you mean it.
+  "missing source"
+      Y: is not mounted: sudo mount -t drvfs Y: /mnt/y
+  "$'\r': command not found" or bad interpreter
+      CRLF line endings: sed -i 's/\r$//' scripts/*.sh
+  Mirror failed partway
+      The script prints where it kept the saved location_scores copy (a /tmp dir).
+      Fix the cause and re-run; the same version can be mirrored again safely.
+  Old nested folders (~/sam2-training/RC1 etc. at the top level)
+      Not used by current versions. Leave them or delete once you are sure.

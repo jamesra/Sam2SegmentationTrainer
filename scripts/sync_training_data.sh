@@ -5,18 +5,26 @@
 # not mounted there. ~/sam2-training is bind-mounted at /data-local.
 #
 # Usage:
-#   scripts/sync_training_data.sh [-noselect] [v1|v1b|v2|...]
+#   scripts/sync_training_data.sh [-n] [-noselect] [-force-layout] [-seed-from vX] [v1|v1b|v2|...]
 #
-# No version: sync the highest /mnt/d/TrainingData/v* directory.
+# No version: sync the highest source version directory.
 # Default: after a successful mirror, point ~/sam2-training/current at that version.
+# -n: dry run. Report the layout check, seeding, and rsync changes; change nothing.
 # -noselect: mirror only; leave current unchanged.
+# -force-layout: mirror even when a volume is flat on one side and nested
+#   (<volume>/AnnotationCrops/) on the other. The destination takes the source's layout.
+# -seed-from vX: before mirroring, copy approved.json, ignore.json, and ignored/ from the
+#   local version vX into volumes of the destination that do not have them yet. Use it
+#   when mirroring into a new version so the review lists and location_scores carry over.
+#   Never overwrites existing lists; this version's own scores win on a clash.
 #
-# approved.json and ignore.json are written on this SSD by the gallery. They are
-# excluded from the mirror, and rejected masks are moved back to ignored/ after
-# the copy so --delete cannot clear a volume's review lists.
+# Kept across a mirror: approved.json, ignore.json, and ignored/ (excluded from rsync, with
+# rejected masks moved back to ignored/ afterwards), and the location_scores table in
+# annotation_crops.sqlite (saved before the copy and merged back after).
 #
 # Env:
-#   TRAINING_DATA_SRC=/mnt/d/TrainingData
+#   TRAINING_DATA_SRC=/mnt/d/TrainingData   (e.g. /mnt/y/SAM2TrainingData after
+#                                            `sudo mount -t drvfs Y: /mnt/y`)
 #   SAM2_TRAINING_DEST=$HOME/sam2-training
 #
 # One-time move of a flat layout (RC1, RC2, RPC1, RPC2 next to version dirs):
@@ -35,13 +43,28 @@ source "${SCRIPT_DIR}/training_data_common.sh"
 TRAINING_DATA_SRC="${TRAINING_DATA_SRC:-/mnt/d/TrainingData}"
 SAM2_TRAINING_DEST="${SAM2_TRAINING_DEST:-${HOME}/sam2-training}"
 
+dry=0
 noselect=0
+force_layout=0
+seed_from=""
 ver=""
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+  arg="$1"
+  shift
   case "$arg" in
+    -n) dry=1 ;;
     -noselect) noselect=1 ;;
+    -force-layout) force_layout=1 ;;
+    -seed-from)
+      if [[ $# -eq 0 ]]; then
+        echo "-seed-from needs a version" >&2
+        exit 2
+      fi
+      seed_from="$1"
+      shift
+      ;;
     -h|--help)
-      sed -n '2,22p' "$0"
+      sed -n '2,32p' "$0"
       exit 0
       ;;
     -*)
@@ -71,6 +94,21 @@ else
   echo "selected highest source version ${ver}"
 fi
 
+if [[ -n "$seed_from" ]]; then
+  if ! version_name_ok "$seed_from"; then
+    echo "-seed-from version must look like v1, v1b, or v2 (got ${seed_from})" >&2
+    exit 2
+  fi
+  if [[ "$seed_from" == "$ver" ]]; then
+    echo "-seed-from must differ from the version being mirrored" >&2
+    exit 2
+  fi
+  if [[ ! -d "${SAM2_TRAINING_DEST}/${seed_from}" ]]; then
+    echo "missing seed version ${SAM2_TRAINING_DEST}/${seed_from}" >&2
+    exit 1
+  fi
+fi
+
 src="${TRAINING_DATA_SRC}/${ver}"
 dest="${SAM2_TRAINING_DEST}/${ver}"
 if [[ ! -d "$src" ]]; then
@@ -78,24 +116,58 @@ if [[ ! -d "$src" ]]; then
   exit 1
 fi
 
-mkdir -p "$dest"
-echo "rsync ${src}/ -> ${dest}/"
-if [[ "$noselect" -eq 1 ]]; then
+echo "rsync ${src}/ -> ${dest}/$([[ "$dry" -eq 1 ]] && echo ' (dry run)')"
+if [[ "$dry" -eq 1 ]]; then
+  echo "dry run: nothing will be changed"
+elif [[ "$noselect" -eq 1 ]]; then
   echo "current unchanged (-noselect)"
 else
   echo "will select ${ver} as current"
 fi
-echo "keeping AnnotationCrops approved.json, ignore.json, and ignored/"
+echo "keeping approved.json, ignore.json, ignored/, and location_scores in each volume"
 
-rsync -a --delete --info=stats2 \
+if [[ "$force_layout" -eq 0 ]] && ! check_layouts_match "$src" "$dest"; then
+  echo "refusing to mirror: rsync --delete would swap the destination's layout." >&2
+  echo "Flatten the source (the NAS version-sync output) or re-run with -force-layout." >&2
+  exit 1
+fi
+
+if [[ "$dry" -eq 1 ]]; then
+  [[ -z "$seed_from" ]] || seed_review_lists "${SAM2_TRAINING_DEST}/${seed_from}" "$dest" "$src" dry
+else
+  mkdir -p "$dest"
+  [[ -z "$seed_from" ]] || seed_review_lists "${SAM2_TRAINING_DEST}/${seed_from}" "$dest" "$src"
+  stash="$(mktemp -d)"
+  seed_stash="$(mktemp -d)"
+  trap '[[ -d "${stash:-}" ]] && echo "location_scores copy kept at ${stash} and ${seed_stash}" >&2' EXIT
+  preserve_location_scores save "$dest" "$stash"
+  [[ -z "$seed_from" ]] || preserve_location_scores save "${SAM2_TRAINING_DEST}/${seed_from}" "$seed_stash"
+fi
+
+# Flat layout: <volume>/approved.json etc. Legacy layout: <volume>/AnnotationCrops/...
+rsync_args=(-a --delete --info=stats2)
+[[ "$dry" -eq 0 ]] || rsync_args+=(-n --itemize-changes)
+rsync "${rsync_args[@]}" \
   --exclude Thumbs.db --exclude .DS_Store \
+  --exclude '/*/approved.json' \
+  --exclude '/*/ignore.json' \
+  --exclude '/*/ignored/***' \
   --exclude '**/AnnotationCrops/approved.json' \
   --exclude '**/AnnotationCrops/ignore.json' \
   --exclude '**/AnnotationCrops/ignored/***' \
   --exclude '_review/***' \
   "${src}/" "${dest}/"
 
+if [[ "$dry" -eq 1 ]]; then
+  echo "dry run complete: nothing changed"
+  exit 0
+fi
+
+# Seed scores first so this version's own scores win on a key clash.
+preserve_location_scores restore "$dest" "$seed_stash"
+preserve_location_scores restore "$dest" "$stash"
 reapply_rejected_masks "$dest"
+rm -rf "$stash" "$seed_stash"
 
 if [[ "$noselect" -eq 0 ]]; then
   link_current "$SAM2_TRAINING_DEST" "$ver"

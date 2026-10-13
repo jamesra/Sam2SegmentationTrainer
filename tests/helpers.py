@@ -29,8 +29,13 @@ def write_png(path: Path, array: np.ndarray) -> None:
     Image.fromarray(array).save(path)
 
 
-def make_crops(root: Path, volume: str, n: int = 8) -> None:
-    crops = root / volume / "AnnotationCrops"
+def make_crops(root: Path, volume: str, n: int = 8, *, nested: bool = False) -> Path:
+    """Write a tiny export for ``volume`` and return its crops folder.
+
+    Flat (``{root}/{volume}/manifest.jsonl``) is the training-version layout. ``nested=True``
+    writes the legacy ``{root}/{volume}/AnnotationCrops`` layout instead.
+    """
+    crops = root / volume / "AnnotationCrops" if nested else root / volume
     images = crops / "images"
     masks = crops / "masks"
     images.mkdir(parents=True)
@@ -103,3 +108,4 @@ def make_crops(root: Path, volume: str, n: int = 8) -> None:
     (crops / "manifest.jsonl").write_text(
         "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
     )
+    return crops
