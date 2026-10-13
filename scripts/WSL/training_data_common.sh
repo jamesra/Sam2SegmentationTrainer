@@ -143,13 +143,43 @@ clone_version_hardlinked() {
   shopt -u nullglob
 }
 
+# Print the trainer repo root (the folder that holds annotation_crops/scores.py).
+# $SAM2_TRAINER_REPO wins; else search upward from this file's real path (symlinks followed);
+# else the usual WSL path of the D: checkout.
+find_trainer_repo() {
+  local marker="annotation_crops/scores.py" dir
+  if [[ -n "${SAM2_TRAINER_REPO:-}" ]]; then
+    if [[ -f "${SAM2_TRAINER_REPO}/${marker}" ]]; then
+      echo "$SAM2_TRAINER_REPO"
+      return 0
+    fi
+    echo "SAM2_TRAINER_REPO=${SAM2_TRAINER_REPO} has no ${marker}" >&2
+    return 1
+  fi
+  dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "${dir}/${marker}" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  if [[ -f "/mnt/d/src/git/SAM2SegmentationTrainer/${marker}" ]]; then
+    echo "/mnt/d/src/git/SAM2SegmentationTrainer"
+    return 0
+  fi
+  echo "cannot find the SAM2SegmentationTrainer checkout (no ${marker})." >&2
+  echo "Set SAM2_TRAINER_REPO=/mnt/d/src/git/SAM2SegmentationTrainer and re-run." >&2
+  return 1
+}
+
 # Keep the trainer's location_scores table across a mirror. The source catalog replaces
 # annotation_crops.sqlite, which would drop the scores written on this machine.
 #   save:    copy each volume's scores into $3 (a scratch dir)
 #   restore: merge them back into the new catalogs (saved rows win on a key clash)
 preserve_location_scores() {
   local mode="$1" dest="$2" stash="$3" repo
-  repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  repo="$(find_trainer_repo)" || return 1
   if ! command -v python3 >/dev/null 2>&1; then
     echo "python3 missing; cannot preserve location_scores. Install it or stop." >&2
     return 1

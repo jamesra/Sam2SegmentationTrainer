@@ -41,9 +41,12 @@
 #   readlink ~/sam2-training/current       # expect the highest synced version
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=training_data_common.sh
 source "${SCRIPT_DIR}/training_data_common.sh"
+
+# Fail before any clone or copy when the repo (needed for location_scores) cannot be found.
+find_trainer_repo >/dev/null || exit 1
 
 TRAINING_DATA_SRC="${TRAINING_DATA_SRC:-/mnt/d/TrainingData}"
 SAM2_TRAINING_DEST="${SAM2_TRAINING_DEST:-${HOME}/sam2-training}"

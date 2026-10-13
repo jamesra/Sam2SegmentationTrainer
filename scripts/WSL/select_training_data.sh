@@ -12,7 +12,7 @@
 #   SAM2_TRAINING_DEST=$HOME/sam2-training
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=training_data_common.sh
 source "${SCRIPT_DIR}/training_data_common.sh"
 
