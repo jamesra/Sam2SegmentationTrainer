@@ -62,6 +62,7 @@ from sam2_segmentation_trainer.data.splits import (
     include_new_keys,
     load_split,
     make_location_split,
+    make_zslab_split,
     save_split,
 )
 from sam2_segmentation_trainer.metrics import iou_dice_pr, mean_iou_by_volume
@@ -756,6 +757,23 @@ def _resolve_run_name(cfg: DictConfig, ckpt_root: Path, out_dir: Path) -> str:
     return next_run_name(prefix, roots)
 
 
+def _z_runs(zs) -> str:
+    """Compact text for a set of section numbers: ``"10-14, 40-43"``."""
+    ordered = sorted(int(z) for z in zs)
+    if not ordered:
+        return "none"
+    runs: list[str] = []
+    start = prev = ordered[0]
+    for z in ordered[1:] + [None]:
+        if z is not None and z == prev + 1:
+            prev = z
+            continue
+        runs.append(f"{start}-{prev}" if start != prev else f"{start}")
+        if z is not None:
+            start = prev = z
+    return ", ".join(runs)
+
+
 def _counts_by_volume(examples) -> dict[str, int]:
     return volume_counts(examples)
 
@@ -875,16 +893,36 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             raise RuntimeError(
                 f"even split requires every volume to have usable examples; missing {missing}"
             )
-        split = make_location_split(
-            examples,
-            train_fraction=float(cfg.data.train_split),
-            seed=int(cfg.training.seed),
-            even_per_volume=even,
-        )
+        split_mode = str(cfg.data.get("split_mode", "location")).strip().lower()
+        if split_mode == "zslab":
+            zslab = cfg.data.get("zslab") or {}
+            if even:
+                print("data.even_per_volume is ignored for split_mode=zslab")
+            split = make_zslab_split(
+                examples,
+                val_fraction=1.0 - float(cfg.data.train_split),
+                slab_count=int(zslab.get("slab_count", 5)),
+                guard_sections=int(zslab.get("guard_sections", 1)),
+            )
+            even = False
+            for volume in sorted(split.val_z):
+                print(
+                    f"  {volume}: val sections {_z_runs(split.val_z[volume])}; "
+                    f"guard {_z_runs(split.guard_z.get(volume, ()))}"
+                )
+        elif split_mode == "location":
+            split = make_location_split(
+                examples,
+                train_fraction=float(cfg.data.train_split),
+                seed=int(cfg.training.seed),
+                even_per_volume=even,
+            )
+        else:
+            raise ValueError(f"data.split_mode must be zslab or location, got {split_mode!r}")
         split_path = run_split
         save_split(split, run_split)
         even_applied = even
-        print(f"wrote split {run_split} even_per_volume={even}")
+        print(f"wrote split {run_split} mode={split.mode} even_per_volume={even}")
     train_ex, val_ex = split.partition(examples)
     if not train_ex or not val_ex:
         raise RuntimeError(

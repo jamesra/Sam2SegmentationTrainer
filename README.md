@@ -76,9 +76,9 @@ Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-
 - `images/` — tile PNG/JPEG plus COCO-RLE sidecar JSON
 - `masks/` — required raster `{imageKey}_{locationId}.png` (examples without a mask PNG are skipped; no RLE fallback)
 - `overlays/` — viewing only, not used for training
-- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (already scaled by the file's `diameter_scale`), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter (`-CircleDiameterScale`, default 0.8). Without it training still runs; other annotations in a tile then come only from their masks.
+- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (already scaled by the file's `diameter_scale`), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter (`-CircleDiameterScale`, default 0.95). Without it training still runs; other annotations in a tile then come only from their masks.
 
-One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Within each volume, 90% go to train and 10% to val.
+One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Validation is split by section (`data.split_mode: zslab`): within each volume, five contiguous runs of sections spaced evenly through the volume hold about 10% of its samples, and one section on each side of every run (`data.zslab.guard_sections`) is used by neither side. All crop windows of a section land on one side, so adjacent sections and overlapping windows never cross the split. `data.split_mode=location` restores the original random 90/10 over locations. An existing run keeps the split in its `split.json`; use `-refresh` to get the new one.
 
 This is **not** Pascal VOC (`JPEGImages` / `Annotations` / `ImageSets`). Do not reshape the NAS.
 
@@ -146,7 +146,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 # Fine-tune sam2.1_hiera_large (prompt encoder frozen except its mask network).
 # Restart continues the run with the newest last.pt (for example sam2_em_rpc1).
 # -refresh starts the next sam2_em_vN from pretrained weights.
-# Each volume keeps every usable sample, split 90/10 inside that volume.
+# Each volume keeps every usable sample; ~10% of it (5 evenly spaced z-slabs) is validation.
 sam2-em-train
 # Pin a version: sam2-em-train data.root=/data-local/v1b
 # Overrides: sam2-em-train training.num_epochs=8 training.batch_size=2
