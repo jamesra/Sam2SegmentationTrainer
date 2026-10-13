@@ -97,7 +97,7 @@ scripts/sync_training_data.sh -noselect v1
 scripts/sync_training_data.sh -n -noselect v2
 # Mirror a new version and carry the review lists and location_scores over from v2.
 scripts/sync_training_data.sh -seed-from v2 v3
-# Mirror from the NAS instead of D: (mount the mapped drive once: sudo mount -t drvfs Y: /mnt/y).
+# Mirror from the NAS instead of D: (CIFS mount of //192.168.0.199/Data at /mnt/y; setup in scripts/wsl-training.README).
 TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData scripts/sync_training_data.sh -noselect v2
 # Only retarget current (no copy). No arg picks the highest local version.
 scripts/select_training_data.sh v2

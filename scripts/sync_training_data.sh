@@ -23,8 +23,9 @@
 # annotation_crops.sqlite (saved before the copy and merged back after).
 #
 # Env:
-#   TRAINING_DATA_SRC=/mnt/d/TrainingData   (e.g. /mnt/y/SAM2TrainingData after
-#                                            `sudo mount -t drvfs Y: /mnt/y`)
+#   TRAINING_DATA_SRC=/mnt/d/TrainingData   (e.g. /mnt/y/SAM2TrainingData with the NAS
+#                                            share CIFS-mounted at /mnt/y; see
+#                                            scripts/wsl-training.README)
 #   SAM2_TRAINING_DEST=$HOME/sam2-training
 #
 # One-time move of a flat layout (RC1, RC2, RPC1, RPC2 next to version dirs):
