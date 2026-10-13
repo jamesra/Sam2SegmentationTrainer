@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -25,6 +26,7 @@ from catalog import (
     ignore_location,
     import_review_lists,
     list_catalog_rows,
+    location_image_keys,
     load_approved,
     load_held_reviews,
     load_ignore_ids,
@@ -53,7 +55,9 @@ from refresh import (
     nornir_buildmanager_root,
     refresh_location,
 )
+from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
+import update_all
 from crops_path import crops_dir_for
 from thumbs import ensure_thumbnail, parse_thumb_request, start_thumbnail_watch, thumb_parts_allowed
 
@@ -515,6 +519,19 @@ class GalleryHandler(BaseHTTPRequestHandler):
             rel = (query.get("path") or [""])[0]
             self._handle_file(match.group(1), rel)
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/update-all", path)
+        if match:
+            self._handle_update_all(match.group(1), "status")
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/cardmask", path)
+        if match:
+            self._handle_cardmask(
+                match.group(1),
+                (query.get("size") or [""])[0],
+                (query.get("key") or [""])[0],
+                (query.get("loc") or [""])[0],
+            )
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/negatives", path)
         if match:
             self._handle_negatives(
@@ -546,6 +563,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/volumes/([^/]+)/review-batch", path)
         if match:
             self._handle_review_batch(match.group(1))
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/update-all(?:/(cancel))?", path)
+        if match:
+            self._handle_update_all(match.group(1), "cancel" if match.group(2) else "start")
             return
         match = re.fullmatch(r"/api/volumes/([^/]+)/(ignore|restore|approve|unapprove)", path)
         if not match:
@@ -583,12 +604,52 @@ class GalleryHandler(BaseHTTPRequestHandler):
             approve_window(crops, location_id, image_key)
         else:
             unapprove_window(crops, location_id, image_key)
+        if action in ("ignore", "restore"):
+            # A rejected mask stops being a negative for its neighbors, so the whole tile's layers are stale.
+            drop_card_masks(crops, location_image_keys(crops, [location_id]))
         self._send_json({
             "ok": True,
             "location_id": location_id,
             "ignored": action == "ignore",
             "approved": action == "approve",
         })
+
+    def _handle_update_all(self, volume: str, action: str) -> None:
+        """Start, watch, or cancel the volume's Update All job. Start and cancel need review permission."""
+        principal = self._principal()
+        role = principal.grants.get(volume)
+        if role is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        if action != "status" and role != PERMISSION_REVIEW:
+            self._send_json({"error": "review required"}, status=403)
+            return
+        try:
+            crops = crops_dir(self._registry(), volume)
+        except (ValueError, FileNotFoundError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        job = update_all.current_job(volume)
+        if action == "status":
+            payload = update_all.idle_status(crops)
+            if job is not None:
+                payload = {**payload, **job.snapshot()}
+            self._send_json(payload)
+            return
+        if action == "cancel":
+            if job is not None and job.running:
+                job.cancel()
+            self._send_json({"ok": True, "running": bool(job and job.running)})
+            return
+        if nornir_buildmanager_root() is None:
+            self._send_json({
+                "error": "Update all needs the nornir-buildmanager mount. No masks were changed.",
+            }, status=503)
+            return
+        source = load_source_document(crops)
+        url = odata_endpoint(volume, source).strip()
+        started_job, _new = update_all.start_job(volume, crops, url, str(source.get("exporter") or "tiled"))
+        self._send_json({**update_all.idle_status(crops), **started_job.snapshot()})
 
     def _handle_review_batch(self, volume: str) -> None:
         """Approve or reject a list of whole locations: body ``{"action": "approve"|"ignore", "location_ids": [...]}``."""
@@ -615,6 +676,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
             return
         count = review_locations(crops, location_ids, action)
+        if action == "ignore":
+            drop_card_masks(crops, location_image_keys(crops, location_ids))
         self._send_json({"ok": True, "action": action, "count": count})
 
     def _handle_login(self) -> None:
@@ -943,6 +1006,34 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Negative-Count", str(count))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_cardmask(self, volume: str, size: str, image_key: str, location_id: str) -> None:
+        """Card-size RGB layer (R target mask, G negatives, B overlap) for one card.
+
+        ``no-cache`` plus an ETag, so a changed mask is picked up and an unchanged one costs a 304.
+        """
+        principal = self._principal()
+        if volume not in principal.grants:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            data = ensure_card_mask(crops_dir(self._registry(), volume), int(size), image_key, int(location_id))
+        except (ValueError, OSError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        etag = '"' + hashlib.sha1(data).hexdigest()[:20] + '"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)

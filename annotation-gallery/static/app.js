@@ -445,8 +445,234 @@
     });
   }
 
+  // Bumped whenever a review or refresh can change what the other cards in a tile show as negatives, so cached
+  // composites built from older card layers are not reused.
+  let layerEpoch = 0;
+
+  // Every card image (photo, mask, card layer) goes through one bounded queue, so the browser is never handed
+  // dozens of requests in DOM order. Pending jobs are ordered by where their card is: the cards on screen first,
+  // top row to bottom and left to right, then the pre-rendered rows nearest the screen. The order is recomputed
+  // whenever the view changes (new render, sort, filter, scroll), so a card that scrolled away waits and one that
+  // scrolled into view jumps ahead. A job whose card has gone (or whose paint was superseded) is dropped unrun.
+  const LOAD_CONCURRENCY = 8;
+  const loadQueue = [];
+  let loadActive = 0;
+  let loadSeq = 0;
+  let reprioritizeTimer = 0;
+
+  function cardPriority(node, scrollerRect) {
+    const rect = node.getBoundingClientRect();
+    const top = rect.top - scrollerRect.top;
+    const left = Math.round(rect.left);
+    if (top + rect.height > 0 && top < scrollerRect.height) {
+      return [0, Math.round(Math.max(top, 0) / 8), left];
+    }
+    const away = top < 0 ? -(top + rect.height) : top - scrollerRect.height;
+    return [1, Math.round(away / 8), left];
+  }
+
+  function priorityBefore(a, b) {
+    for (let index = 0; index < 3; index += 1) {
+      if (a[index] !== b[index]) {
+        return a[index] - b[index];
+      }
+    }
+    return 0;
+  }
+
+  function reprioritize() {
+    window.clearTimeout(reprioritizeTimer);
+    for (let index = loadQueue.length - 1; index >= 0; index -= 1) {
+      if (!loadQueue[index].isLive()) {
+        loadQueue.splice(index, 1)[0].reject(new Error("stale"));
+      }
+    }
+    if (loadQueue.length < 2) {
+      return;
+    }
+    const scrollerRect = els.scroller.getBoundingClientRect();
+    const byNode = new Map();
+    for (const job of loadQueue) {
+      if (!byNode.has(job.node)) {
+        byNode.set(job.node, job.node.isConnected ? cardPriority(job.node, scrollerRect) : [2, 0, 0]);
+      }
+      job.priority = byNode.get(job.node);
+    }
+    loadQueue.sort((a, b) => priorityBefore(a.priority, b.priority) || a.seq - b.seq);
+  }
+
+  function scheduleReprioritize() {
+    window.clearTimeout(reprioritizeTimer);
+    reprioritizeTimer = window.setTimeout(reprioritize, 60);
+  }
+
+  function queuedImage(url, node, isLive) {
+    return new Promise((resolve, reject) => {
+      loadQueue.push({ url, node, isLive, resolve, reject, seq: loadSeq += 1, priority: [1, 0, 0] });
+      pumpLoads();
+    });
+  }
+
+  function pumpLoads() {
+    while (loadActive < LOAD_CONCURRENCY && loadQueue.length) {
+      const job = loadQueue.shift();
+      if (!job.isLive()) {
+        job.reject(new Error("stale"));
+        continue;
+      }
+      loadActive += 1;
+      loadImage(job.url).then(job.resolve, job.reject).finally(() => {
+        loadActive -= 1;
+        pumpLoads();
+      });
+    }
+  }
+
+  // The <img> under the canvas gets its source only when the card's turn comes, not when the card is built.
+  function showPhoto(node, photo) {
+    if (photo && photo.getAttribute("src") !== node.dataset.image) {
+      photo.src = node.dataset.image;
+    }
+  }
+
+  // Blends a pixel toward `hex` the way tintMaskedPixels does and writes the result (0-1 floats) to `out`.
+  function makeTinter(hex, visibility) {
+    const color = hexToRgb(hex);
+    const { hue, chroma } = rgbToHcl(color.r, color.g, color.b);
+    const { hextant, slopeCoeff } = hueHextant(hue);
+    const alpha = Math.min(1, Math.max(0, visibility / 100));
+    return (red, green, blue, out) => {
+      const luma = 0.3 * red + 0.59 * green + 0.11 * blue;
+      const limited = Math.min(chroma, maxChromaAtLuma(hextant, slopeCoeff, luma));
+      const tinted = hclToRgb(hextant, slopeCoeff, limited, luma);
+      out[0] = (1 - alpha) * red + alpha * tinted[0];
+      out[1] = (1 - alpha) * green + alpha * tinted[1];
+      out[2] = (1 - alpha) * blue + alpha * tinted[2];
+    };
+  }
+
+  // Draws the tissue with the card layer on top: R is the target (hue), G the other annotations (red), B where they
+  // overlap (yellow). Channel values are soft alpha, so a downsampled edge stays smooth. Pixels no channel covers
+  // are transparent, so the photo underneath shows through, as with the full-size mask path.
+  function composeLayered(image, layer, hex, visibility, withNegatives) {
+    const { width, height } = imageSize(image);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const layerCanvas = document.createElement("canvas");
+    layerCanvas.width = width;
+    layerCanvas.height = height;
+    const layerContext = layerCanvas.getContext("2d", { willReadFrequently: true });
+    layerContext.drawImage(layer, 0, 0, width, height);
+    const planes = layerContext.getImageData(0, 0, width, height).data;
+    context.drawImage(image, 0, 0, width, height);
+    const imageData = context.getImageData(0, 0, width, height);
+    const pixels = imageData.data;
+    const tintTarget = makeTinter(hex, visibility);
+    const tintNegative = makeTinter(NEG_HEX, NEG_VISIBILITY);
+    const tintOverlap = makeTinter(NEG_OVERLAP_HEX, NEG_VISIBILITY);
+    const out = [0, 0, 0];
+    for (let index = 0; index < pixels.length; index += 4) {
+      const own = planes[index] / 255;
+      const other = withNegatives ? planes[index + 1] / 255 : 0;
+      const both = withNegatives ? planes[index + 2] / 255 : 0;
+      const aOverlap = both;
+      const aTarget = withNegatives ? Math.max(own - both, 0) : own;
+      const aNegative = withNegatives ? Math.max(other - both, 0) : 0;
+      const total = aOverlap + aTarget + aNegative;
+      if (total <= 0.004) {
+        pixels[index + 3] = 0;
+        continue;
+      }
+      const red = pixels[index] / 255;
+      const green = pixels[index + 1] / 255;
+      const blue = pixels[index + 2] / 255;
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      if (aTarget > 0) {
+        tintTarget(red, green, blue, out);
+        r += aTarget * out[0];
+        g += aTarget * out[1];
+        b += aTarget * out[2];
+      }
+      if (aNegative > 0) {
+        tintNegative(red, green, blue, out);
+        r += aNegative * out[0];
+        g += aNegative * out[1];
+        b += aNegative * out[2];
+      }
+      if (aOverlap > 0) {
+        tintOverlap(red, green, blue, out);
+        r += aOverlap * out[0];
+        g += aOverlap * out[1];
+        b += aOverlap * out[2];
+      }
+      pixels[index] = Math.round((r / total) * 255);
+      pixels[index + 1] = Math.round((g / total) * 255);
+      pixels[index + 2] = Math.round((b / total) * 255);
+      pixels[index + 3] = Math.round(Math.min(1, total) * 255);
+    }
+    context.putImageData(imageData, 0, 0);
+    return canvas;
+  }
+
+  // Cards below Huge: one request for the target mask and its negatives at the thumbnail's size.
+  async function paintLayered(node, token, key, canvas, photo) {
+    const hue = node.dataset.hue;
+    const visibility = Number(node.dataset.visibility);
+    const withNegatives = negativesOn();
+    let image = null;
+    const live = () => node.isConnected && token === paintToken;
+    const imageTask = queuedImage(node.dataset.image, node, live).then((loaded) => {
+      image = loaded;
+      showPhoto(node, photo);
+    }).catch(() => null);
+    let layer;
+    try {
+      layer = await queuedImage(node.dataset.layer, node, live);
+    } catch {
+      await imageTask;
+      if (!live()) {
+        return;
+      }
+      setMediaState(node, image);
+      if (image && imageHasSignal(image) && photo) {
+        photo.classList.remove("pending");
+      }
+      return;
+    }
+    if (!live()) {
+      return;
+    }
+    const plate = greyPlate(imageSize(layer).width, imageSize(layer).height);
+    blit(canvas, composeLayered(plate, layer, hue, visibility, withNegatives));
+    await imageTask;
+    if (!live()) {
+      return;
+    }
+    const tissue = image && imageHasSignal(image) ? image : plate;
+    let composed = composeLayered(tissue, layer, hue, visibility, withNegatives);
+    if (node.dataset.status === "rejected" || node.dataset.status === "approved") {
+      composed = stampStatus(composed, node.dataset.status);
+    }
+    composed.photoVisible = tissue !== plate;
+    composed.missing = !image;
+    setMediaState(node, image);
+    if (photo) {
+      photo.classList.toggle("pending", !composed.photoVisible);
+    }
+    if (tissue !== plate) {
+      blit(canvas, composed);
+    }
+    cacheSet(key, composed);
+  }
+
   async function paintComposite(node, token) {
-    const key = `${node.dataset.loc}|${node.dataset.key}|${node.dataset.size}|${node.dataset.hue}|${node.dataset.visibility}|${node.dataset.status || ""}|${node.dataset.gen || ""}`;
+    const layered = Boolean(node.dataset.layer);
+    const layerPart = layered ? `|L${layerEpoch}${negativesOn() ? "n" : ""}` : "";
+    const key = `${node.dataset.loc}|${node.dataset.key}|${node.dataset.size}|${node.dataset.hue}|${node.dataset.visibility}|${node.dataset.status || ""}|${node.dataset.gen || ""}${layerPart}`;
     const canvas = node.querySelector("canvas.tint");
     const photo = node.querySelector("img.jpeg");
     const cached = cacheGet(key);
@@ -454,21 +680,28 @@
       if (node.isConnected && token === paintToken) {
         blit(canvas, cached);
         if (photo) {
+          showPhoto(node, photo);
           photo.classList.toggle("pending", !cached.photoVisible);
         }
         setMediaState(node, cached.missing ? null : true);
       }
       return;
     }
+    if (layered) {
+      await paintLayered(node, token, key, canvas, photo);
+      return;
+    }
     const hue = node.dataset.hue;
     const visibility = Number(node.dataset.visibility);
     let image = null;
-    const imageTask = loadImage(node.dataset.image).then((loaded) => {
+    const live = () => node.isConnected && token === paintToken;
+    const imageTask = queuedImage(node.dataset.image, node, live).then((loaded) => {
       image = loaded;
+      showPhoto(node, photo);
     }).catch(() => null);
     let mask;
     try {
-      mask = await loadImage(node.dataset.mask);
+      mask = await queuedImage(node.dataset.mask, node, live);
     } catch {
       await imageTask;
       if (!node.isConnected || token !== paintToken) {
@@ -519,6 +752,7 @@
     els.grid.querySelectorAll(".composite").forEach((node) => {
       paintComposite(node, token);
     });
+    reprioritize();
   }
 
   async function getJson(url, options) {
@@ -958,16 +1192,30 @@
     return check + reject;
   }
 
+  // The card-size layer (target mask + negatives) for sizes below Huge; Huge keeps the full-size mask.
+  function layerUrl(row) {
+    if (state.cardSize === "huge" || !row.image_key) {
+      return "";
+    }
+    const url = withSet(
+      `/api/volumes/${encodeURIComponent(state.volume)}/cardmask?size=${cardPixelSize()}`
+      + `&key=${encodeURIComponent(row.image_key)}&loc=${encodeURIComponent(row.location_id)}`,
+    );
+    const gen = locationGen(row.location_id);
+    return gen ? `${url}&v=${gen}` : url;
+  }
+
   function windowHtml(row) {
     const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
     const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
+    const layer = layerUrl(row);
     const hue = overlayHue();
     const visibility = overlayVisibility();
     const status = row.ignored ? "rejected" : (row.approved ? "approved" : "");
     return `
       <div class="window">
-        <div class="composite waiting" data-loc="${row.location_id}" data-key="${row.image_key || ""}" data-size="${state.cardSize}" data-status="${status}" data-gen="${locationGen(row.location_id)}" data-image="${image}" data-mask="${mask}" data-hue="${hue}" data-visibility="${visibility}">
-          <img class="jpeg pending" alt="" src="${image}">
+        <div class="composite waiting" data-loc="${row.location_id}" data-key="${row.image_key || ""}" data-size="${state.cardSize}" data-status="${status}" data-gen="${locationGen(row.location_id)}" data-image="${image}" data-mask="${mask}" data-layer="${layer}" data-hue="${hue}" data-visibility="${visibility}">
+          <img class="jpeg pending" alt="">
           <canvas class="tint" aria-hidden="true"></canvas>
           <span class="media-state" aria-hidden="true"></span>
         </div>
@@ -1398,6 +1646,7 @@
         paintComposite(composite, token);
       }
     });
+    reprioritize();
   }
 
   function render(force = true, reuse = false) {
@@ -1583,6 +1832,9 @@
   }
 
   async function mutate(act, locationId) {
+    if (act === "ignore" || act === "restore") {
+      layerEpoch += 1;
+    }
     const rows = rowsForLocation(locationId);
     rememberLocation(locationId);
     const snapshot = rows.map((row) => ({
@@ -1652,6 +1904,7 @@
       }
     }
     undoStack.length = 0;
+    layerEpoch += 1;
     resetVisibleCards();
     render(true, true);
     els.status.textContent = `${approving ? "Accepted" : "Rejected"} ${payload.count} ${noun}.`;
@@ -1909,6 +2162,7 @@
     }
     paintViewer();
     placeViewerInfo();
+    paintVisible();
   }
 
   function drawFull(image, overlay) {
@@ -2665,7 +2919,10 @@
     render(true);
   });
 
-  els.scroller.addEventListener("scroll", () => render(false));
+  els.scroller.addEventListener("scroll", () => {
+    render(false);
+    scheduleReprioritize();
+  });
   window.addEventListener("resize", () => {
     renderSortStack();
     render();
@@ -2786,6 +3043,7 @@
       node.dataset.gen = gen;
       node.dataset.image = image;
       node.dataset.mask = mask;
+      node.dataset.layer = layerUrl(row);
       node.classList.add("waiting");
       const photo = node.querySelector("img.jpeg");
       if (photo) {
@@ -2811,6 +3069,7 @@
         body: JSON.stringify({ location_id: locationId }),
       });
       locationGenerations.set(id, locationGen(id) + 1);
+      layerEpoch += 1;
       setRefreshMark(id, "done");
       repaintLocation(id);
       const count = (result.imageKeys || []).length;
@@ -2835,6 +3094,138 @@
       throw error;
     }
   }
+
+  // Update all: one background job per volume on the server; this dialog starts it and polls its progress.
+  const updateUi = {
+    timer: 0,
+    wasRunning: false,
+    dialog: document.getElementById("update-dialog"),
+    bar: document.getElementById("update-bar"),
+    since: document.getElementById("update-since"),
+    line: document.getElementById("update-line"),
+    detail: document.getElementById("update-detail"),
+    start: document.getElementById("update-start"),
+    cancel: document.getElementById("update-cancel"),
+  };
+
+  function updateUrl(suffix = "") {
+    return withSet(`/api/volumes/${encodeURIComponent(state.volume)}/update-all${suffix}`);
+  }
+
+  function describeWatermark(status) {
+    if (status.watermark) {
+      return `Changes since ${status.watermark.replace("T", " ").replace(/\.\d+Z$/, "Z")} will be checked.`;
+    }
+    return "First run: starts from the age of the oldest masks, so it may redraw more than later runs.";
+  }
+
+  function paintUpdate(status) {
+    const running = Boolean(status.running);
+    const phase = status.phase || "idle";
+    updateUi.start.hidden = running;
+    updateUi.cancel.hidden = !running;
+    updateUi.bar.hidden = !(running || status.pages);
+    updateUi.bar.max = Math.max(1, Number(status.pages) || 1);
+    updateUi.bar.value = Math.min(Number(status.page) || 0, updateUi.bar.max);
+    if (phase === "idle") {
+      updateUi.since.textContent = describeWatermark(status);
+      const last = status.lastCounts || {};
+      updateUi.line.textContent = status.lastRun
+        ? `Last run ${status.lastRun}: ${last.refreshed || 0} refreshed, ${last.added || 0} added, ${last.skipped || 0} skipped.`
+        : "";
+      updateUi.detail.hidden = true;
+      return;
+    }
+    updateUi.since.textContent = status.watermarkBefore
+      ? `Changes since ${status.watermarkBefore.replace("T", " ").replace(/\.\d+Z$/, "Z")}.`
+      : "";
+    const counts = `${status.refreshed || 0} refreshed, ${status.added || 0} added, ${status.skipped || 0} skipped, ${status.failed || 0} failed`;
+    const place = status.pages ? `page ${status.page} of ${status.pages}: ` : "";
+    const label = { done: "Finished. ", cancelled: "Cancelled. ", failed: "Finished with failures. " }[phase] || "";
+    updateUi.line.textContent = `${label}${place}${counts}`;
+    const lines = [...(status.errors || []), ...(status.skipLines || []).slice(0, 20)];
+    if (status.skipped > (status.skipLines || []).length) {
+      lines.push(`... ${status.skipped} skipped in all; the full list is in update_all.log`);
+    }
+    updateUi.detail.textContent = lines.join("\n");
+    updateUi.detail.hidden = lines.length === 0;
+  }
+
+  async function pollUpdate() {
+    window.clearTimeout(updateUi.timer);
+    let status;
+    try {
+      status = await getJson(updateUrl());
+    } catch (error) {
+      updateUi.line.textContent = error.message;
+      return;
+    }
+    paintUpdate(status);
+    if (status.running) {
+      updateUi.wasRunning = true;
+      updateUi.timer = window.setTimeout(pollUpdate, 1000);
+      return;
+    }
+    const justFinished = updateUi.wasRunning;
+    updateUi.wasRunning = false;
+    if (justFinished && (status.refreshed || status.added)) {
+      for (const id of status.refreshedIds || []) {
+        locationGenerations.set(Number(id), locationGen(id) + 1);
+      }
+      layerEpoch += 1;
+      resetVisibleCards();
+      await loadCatalog(false, true);
+    }
+  }
+
+  async function openUpdateAll() {
+    if (!state.volume) {
+      return;
+    }
+    updateUi.dialog.hidden = false;
+    updateUi.line.textContent = "";
+    await pollUpdate();
+  }
+
+  async function startUpdateAll() {
+    updateUi.start.hidden = true;
+    updateUi.line.textContent = "Starting...";
+    try {
+      const status = await getJson(updateUrl(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      paintUpdate(status);
+    } catch (error) {
+      updateUi.line.textContent = error.message;
+      updateUi.start.hidden = false;
+      return;
+    }
+    updateUi.timer = window.setTimeout(pollUpdate, 500);
+  }
+
+  document.getElementById("update-all").addEventListener("click", () => {
+    openUpdateAll().catch((error) => {
+      els.status.textContent = error.message;
+    });
+  });
+  updateUi.start.addEventListener("click", () => {
+    startUpdateAll();
+  });
+  updateUi.cancel.addEventListener("click", () => {
+    getJson(updateUrl("/cancel"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }).catch((error) => {
+      updateUi.line.textContent = error.message;
+    });
+  });
+  document.getElementById("update-close").addEventListener("click", () => {
+    window.clearTimeout(updateUi.timer);
+    updateUi.dialog.hidden = true;
+  });
 
   document.getElementById("volume-settings").addEventListener("click", () => {
     openSettings();

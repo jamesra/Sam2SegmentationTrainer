@@ -1150,3 +1150,57 @@ def test_review_locations_touches_only_the_listed_locations(tmp_path: Path) -> N
     assert review_locations(crops, [], "ignore") == 0
     with pytest.raises(ValueError):
         review_locations(crops, [1], "delete")
+
+
+def test_cardmask_endpoint_serves_png_with_etag(httpd: tuple[str, int], registry: Path) -> None:
+    import io as _io
+
+    import numpy as np
+    from PIL import Image as _Image
+
+    crops = registry / "RC2" / "AnnotationCrops"
+    key = "RC2_17_D1_X0-64_Y0-64"
+    (crops / "images").mkdir(parents=True, exist_ok=True)
+    (crops / "masks").mkdir(parents=True, exist_ok=True)
+    (crops / "images" / f"{key}.json").write_text(
+        json.dumps({"image": {"width": 64, "height": 64}, "annotations": [{"id": 42}]}), encoding="utf-8"
+    )
+    plane = np.zeros((64, 64), dtype=np.uint8)
+    plane[8:40, 8:40] = 255
+    _Image.fromarray(plane).save(crops / "masks" / f"{key}_42.png")
+    path = f"/api/volumes/RC2/cardmask?size=256&key={key}&loc=42"
+
+    def get(headers: dict[str, str] | None = None):
+        connection = HTTPConnection(httpd[0], httpd[1], timeout=5)
+        connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        body = response.read()
+        result = (response.status, response.getheader("Content-Type"), response.getheader("ETag"), body)
+        connection.close()
+        return result
+
+    status, content_type, etag, body = get()
+    assert status == 200 and content_type == "image/png" and etag
+    with _Image.open(_io.BytesIO(body)) as layer:
+        assert layer.size == (256, 256)
+        assert np.asarray(layer.convert("RGB"))[100, 100, 0] == 255
+    status, _type, _etag, body = get({"If-None-Match": etag})
+    assert status == 304 and body == b""
+    connection = HTTPConnection(httpd[0], httpd[1], timeout=5)
+    connection.request("GET", f"/api/volumes/RC2/cardmask?size=256&key={key}&loc=7")
+    missing = connection.getresponse()
+    missing.read()
+    connection.close()
+    assert missing.status == 404
+
+
+def test_update_all_endpoints(httpd: tuple[str, int], registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NORNIR_BUILDMANAGER_DIR", str(registry / "no-such-mount"))
+    status, payload = _request(httpd, "GET", "/api/volumes/RC2/update-all", bearer="review")
+    assert status == 200 and payload["phase"] == "idle" and payload["watermark"] == ""
+    status, payload = _request(httpd, "POST", "/api/volumes/RC2/update-all", body=b"{}", bearer="review")
+    assert status == 503 and "nornir" in payload["error"]
+    status, _payload = _request(httpd, "POST", "/api/volumes/RC2/update-all", body=b"{}")
+    assert status == 403
+    status, payload = _request(httpd, "POST", "/api/volumes/RC2/update-all/cancel", body=b"{}", bearer="review")
+    assert status == 200 and payload["running"] is False

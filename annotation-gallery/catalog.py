@@ -151,6 +151,29 @@ def _location_image_keys(crops: str | os.PathLike[str], location_id: int) -> lis
     return [str(row["image_key"]) for row in rows if row["image_key"]]
 
 
+def location_image_keys(crops: str | os.PathLike[str], location_ids: Iterable[int]) -> list[str]:
+    """Distinct image keys of every window of these locations, from one catalog query."""
+    ids = sorted({int(item) for item in location_ids})
+    if not ids or not sqlite_path(crops).is_file():
+        return []
+    connection = connect(crops)
+    keys: set[str] = set()
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            for row in connection.execute(
+                f"SELECT DISTINCT image_key FROM locations WHERE location_id IN ({marks})", chunk
+            ):
+                if row["image_key"]:
+                    keys.add(str(row["image_key"]))
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        connection.close()
+    return sorted(keys)
+
+
 def approve_window(
     crops: str | os.PathLike[str],
     location_id: int,

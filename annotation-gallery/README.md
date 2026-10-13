@@ -36,3 +36,18 @@
 # ``https://gallery.codepharm.net/callback``.
 #
 # Details: ``config-template/README.md``.
+#
+# ## Card masks and Update all
+#
+# - Grid cards below Huge load ``overlays/cardmask/<size>/<imageKey>_<locationId>.png``: R is the location's mask,
+#   G the other annotations in the tile (the trainer's negatives), B their overlap. Built on first request, reused
+#   while newer than the sidecar, the circle file and every mask in the tile, and deleted when the gallery rejects,
+#   restores, refreshes or updates a mask. Press N to hide the negatives on the grid as well as in the viewer.
+#   ``GALLERY_CARDMASK_BUILDS`` (default 4) limits concurrent cold builds.
+# - **Update all** (review role, needs the nornir mount) asks OData for every location changed since the volume's
+#   watermark in ``AnnotationCrops/update_state.json``, one progress tick per OData page
+#   (``GALLERY_UPDATE_PAGE_SIZE``, default 500). A location the volume has is redrawn; a new one is added only when
+#   every crop image it needs is already on disk, otherwise it is skipped and counted (``update_all.log``, retried
+#   on the next run). The watermark moves only after a run with no failures. First run: the older of the ``masks/``
+#   folder's mtime and the oldest mask's creation time. Label and type edits do not change OData ``LastModified``,
+#   so they arrive only with a changed shape or a full re-export.

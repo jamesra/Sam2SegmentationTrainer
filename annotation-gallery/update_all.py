@@ -1,0 +1,529 @@
+"""Update All: bring a volume's masks and annotations up to date with OData in one background job.
+
+One watermark per volume (``update_state.json`` in ``AnnotationCrops``) says how far the volume has been checked.
+The job asks OData for every location changed since it, walks those rows page by page, and moves the watermark
+only when the whole run finished without a failure.
+
+For each row OData returns:
+
+* a location the catalog already has is redrawn (``refresh.refresh_location``) and its label / type refreshed;
+* a location the catalog does not have is added when the crop images it needs are already on disk
+  (``refresh.add_new_location``); otherwise it is skipped, logged, and counted. Nothing is downloaded or stitched.
+
+Skipped ids are remembered and retried at the start of the next run, because they do not hold the watermark back.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterator
+from urllib.parse import quote, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+from catalog import connect
+from refresh import TileIndex, add_new_location, drop_stale_thumbnails, refresh_location
+
+_logger = logging.getLogger(__name__)
+
+STATE_FILE = "update_state.json"
+LOG_FILE = "update_all.log"
+PAGE_SIZE = int(os.environ.get("GALLERY_UPDATE_PAGE_SIZE", "500") or 500)
+RETRY_BATCH = 50
+SKIP_LINES_KEPT = 200
+ERRORS_KEPT = 20
+
+_SELECT = "ID,ParentID,TypeCode,Z,OffEdge,MosaicShape,LastModified,Radius"
+_EXPAND = "Parent($select=ID,TypeID,Label;$expand=Type($select=ID,Name,ParentID))"
+
+GetJson = Callable[[str], dict[str, Any]]
+
+
+# ---------------------------------------------------------------- time helpers
+
+def parse_odata_datetime(value: Any) -> datetime | None:
+    """OData or ISO timestamp as an aware UTC datetime, or None when it cannot be read."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.startswith("/Date(") and text.endswith(")/"):
+            millis = int(text[6:-2].split("+")[0].split("-")[0])
+            return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def odata_literal(moment: datetime) -> str:
+    """A UTC instant written the way an OData ``$filter`` compares dates."""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+# ------------------------------------------------------------------ state file
+
+def state_path(crops: str | os.PathLike[str]) -> Path:
+    return Path(crops) / STATE_FILE
+
+
+def load_state(crops: str | os.PathLike[str]) -> dict[str, Any]:
+    try:
+        payload = json.loads(state_path(crops).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_state(crops: str | os.PathLike[str], state: dict[str, Any]) -> bool:
+    """Write the state file atomically. False when the share does not let us."""
+    path = state_path(crops)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(json.dumps(state, indent=1), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def initial_watermark(crops: str | os.PathLike[str]) -> datetime:
+    """Where the first run starts: the older of the masks folder's mtime and the oldest mask creation time.
+
+    Older is the safe side: the first run may redraw more than needed, but cannot miss a change.
+    """
+    masks = Path(crops) / "masks"
+    stamps: list[float] = []
+    try:
+        stamps.append(masks.stat().st_mtime)
+        for entry in os.scandir(masks):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            info = entry.stat(follow_symlinks=False)
+            # Copies reset the creation time and keep the mtime (or the reverse), so take the older of the two.
+            stamps.append(min(info.st_mtime, getattr(info, "st_birthtime", None) or info.st_mtime))
+    except OSError:
+        pass
+    if not stamps:
+        return datetime.now(timezone.utc)
+    return datetime.fromtimestamp(min(stamps), tz=timezone.utc)
+
+
+# ------------------------------------------------------------------ OData paging
+
+def http_get_json(url: str) -> dict[str, Any]:
+    request = Request(url, headers={"Accept": "application/json"})
+    with urlopen(request, timeout=120) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("OData response is not an object")
+    return payload
+
+
+def locations_url(base: str, filter_text: str, top: int) -> str:
+    query = (
+        f"$filter={quote(filter_text, safe='()/')}"
+        f"&$orderby=ID&$select={quote(_SELECT, safe=',')}"
+        f"&$expand={quote(_EXPAND, safe='();$,')}"
+        f"&$count=true&$top={int(top)}"
+    )
+    return f"{base.rstrip('/')}/Locations?{query}"
+
+
+def iter_pages(url: str, get_json: GetJson) -> Iterator[dict[str, Any]]:
+    """Follow ``@odata.nextLink`` until a page leaves it out."""
+    next_url: str | None = url
+    while next_url:
+        document = get_json(next_url)
+        yield document
+        link = document.get("@odata.nextLink")
+        if not link:
+            return
+        next_url = str(link) if urlparse(str(link)).scheme else urljoin(next_url, str(link))
+
+
+def _entities(document: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in (document.get("value") or []) if isinstance(item, dict) and "ID" in item]
+
+
+# ------------------------------------------------------------------- catalog I/O
+
+def _catalog_ids(crops: Path) -> set[int]:
+    connection = connect(crops)
+    try:
+        return {int(row[0]) for row in connection.execute("SELECT DISTINCT location_id FROM locations")}
+    finally:
+        connection.close()
+
+
+def _update_metadata(crops: Path, entity: dict[str, Any]) -> None:
+    """Label and type of a location the catalog already has, from the expanded Parent. Missing values are kept."""
+    parent = entity.get("Parent") or {}
+    parent_type = parent.get("Type") or {}
+    fields = {
+        "structure_id": entity.get("ParentID", parent.get("ID")),
+        "structure_label": parent.get("Label"),
+        "type_id": parent.get("TypeID", parent_type.get("ID")),
+        "type_name": parent_type.get("Name"),
+    }
+    fields = {name: value for name, value in fields.items() if value is not None}
+    if not fields:
+        return
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    connection = connect(crops)
+    try:
+        connection.execute(
+            f"UPDATE locations SET {assignments} WHERE location_id = ?",
+            [*fields.values(), int(entity["ID"])],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _insert_rows(crops: Path, added: dict[str, Any]) -> None:
+    """Catalog rows for a location that was just added, one per window. SAM2 columns stay NULL."""
+    record = added["record"]
+    connection = connect(crops)
+    try:
+        for window in added["windows"]:
+            key = window["image_key"]
+            area = window["area"]
+            radius = record.radius if record.radius is not None else (
+                math.sqrt(area / math.pi) if area > 0 else None
+            )
+            image = next(
+                (f"images/{key}{suffix}" for suffix in (".png", ".jpg", ".jpeg")
+                 if (crops / "images" / f"{key}{suffix}").is_file()),
+                f"images/{key}.png",
+            )
+            connection.execute(
+                "DELETE FROM locations WHERE location_id = ? AND image_key = ?", [record.id, key]
+            )
+            connection.execute(
+                "INSERT INTO locations (location_id, z, structure_id, structure_label, type_id, type_name, "
+                "radius, image_key, image_relpath, mask_relpath, ignored) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                [
+                    record.id, record.z, record.parent_id, record.structure_label, record.type_id,
+                    record.type_name, radius, key, image, f"masks/{key}_{record.id}.png",
+                ],
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+# ----------------------------------------------------------------------- the job
+
+@dataclass
+class Dependencies:
+    """What the job calls out to; tests replace these."""
+
+    get_json: GetJson = http_get_json
+    refresh: Callable[[Path, dict[str, Any], str], list[str]] = lambda crops, entity, exporter: refresh_location(
+        crops, entity, exporter
+    )
+    add: Callable[[Path, dict[str, Any], TileIndex], tuple[dict[str, Any] | None, str | None]] = (
+        lambda crops, entity, index: add_new_location(crops, entity, index)
+    )
+    drop_stale: Callable[[Path, list[str]], None] = lambda crops, keys: drop_stale_thumbnails(crops, keys)
+    tile_index: Callable[[Path], TileIndex] = lambda crops: TileIndex(crops)
+
+
+@dataclass
+class UpdateJob:
+    volume: str
+    crops: Path
+    odata: str
+    exporter: str
+    page_size: int
+    deps: Dependencies
+    phase: str = "starting"
+    page: int = 0
+    pages: int = 0
+    entities_seen: int = 0
+    refreshed: int = 0
+    unchanged: int = 0
+    added: int = 0
+    skipped: int = 0
+    failed: int = 0
+    skip_lines: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    started: float = 0.0
+    finished: float = 0.0
+    cancelled: bool = False
+    watermark_before: str = ""
+    watermark_after: str = ""
+    state_saved: bool = True
+    refreshed_ids: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- control
+    def start(self) -> None:
+        self.started = time.time()
+        self._thread = threading.Thread(target=self._run, name=f"update-all-{self.volume}", daemon=True)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    @property
+    def running(self) -> bool:
+        return self.phase not in ("done", "failed", "cancelled")
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "volume": self.volume,
+                "phase": self.phase,
+                "running": self.running,
+                "page": self.page,
+                "pages": self.pages,
+                "entitiesSeen": self.entities_seen,
+                "refreshed": self.refreshed,
+                "unchanged": self.unchanged,
+                "added": self.added,
+                "skipped": self.skipped,
+                "failed": self.failed,
+                "skipLines": list(self.skip_lines),
+                "errors": list(self.errors),
+                "started": self.started,
+                "finished": self.finished,
+                "cancelled": self.cancelled,
+                "watermarkBefore": self.watermark_before,
+                "watermarkAfter": self.watermark_after,
+                "stateSaved": self.state_saved,
+                "refreshedIds": list(self.refreshed_ids),
+            }
+
+    def _set(self, **values: Any) -> None:
+        with self._lock:
+            for name, value in values.items():
+                setattr(self, name, value)
+
+    # -- the run
+    def _run(self) -> None:
+        try:
+            self._walk()
+        except Exception as exc:  # noqa: BLE001 - a job must always end in a reported state
+            _logger.exception("update-all %s failed", self.volume)
+            with self._lock:
+                self.errors.append(f"job stopped: {exc}")
+                self.failed += 1
+            self._set(phase="failed", finished=time.time())
+
+    def _log(self, line: str) -> None:
+        try:
+            with (self.crops / LOG_FILE).open("a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now(timezone.utc).isoformat()} {line}\n")
+        except OSError:
+            pass
+
+    def _walk(self) -> None:
+        state = load_state(self.crops)
+        before = parse_odata_datetime(state.get("watermark")) or initial_watermark(self.crops)
+        self._set(watermark_before=odata_literal(before), phase="reading catalog")
+        known = _catalog_ids(self.crops)
+        newest = before
+        index: list[TileIndex] = []
+        previous_skips = [int(item) for item in state.get("skipped_ids") or []]
+        skipped_now: set[int] = set()
+        resolved: set[int] = set()
+        touched_keys: list[str] = []
+
+        def tile_index() -> TileIndex:
+            if not index:
+                index.append(self.deps.tile_index(self.crops))
+            return index[0]
+
+        def handle(entity: dict[str, Any], retry: bool) -> None:
+            nonlocal newest
+            location_id = int(entity["ID"])
+            modified = parse_odata_datetime(entity.get("LastModified"))
+            if modified is not None and modified > newest and not retry:
+                newest = modified
+            try:
+                if location_id in known:
+                    keys = self.deps.refresh(self.crops, entity, self.exporter)
+                    _update_metadata(self.crops, entity)
+                    with self._lock:
+                        if keys:
+                            self.refreshed += 1
+                            self.refreshed_ids.append(location_id)
+                        else:
+                            self.unchanged += 1
+                    touched_keys.extend(keys)
+                    return
+                added, reason = self.deps.add(self.crops, entity, tile_index())
+                if added is None:
+                    line = f"skip {location_id} z={entity.get('Z')}: {reason}"
+                    self._log(line)
+                    skipped_now.add(location_id)
+                    with self._lock:
+                        self.skipped += 1
+                        if len(self.skip_lines) < SKIP_LINES_KEPT:
+                            self.skip_lines.append(line)
+                    return
+                _insert_rows(self.crops, added)
+                known.add(location_id)
+                resolved.add(location_id)
+                touched_keys.extend(window["image_key"] for window in added["windows"])
+                with self._lock:
+                    self.added += 1
+                    self.refreshed_ids.append(location_id)
+            except Exception as exc:  # noqa: BLE001 - one bad row must not stop the run
+                message = f"{location_id}: {exc}"
+                self._log(f"error {message}")
+                with self._lock:
+                    self.failed += 1
+                    if len(self.errors) < ERRORS_KEPT:
+                        self.errors.append(message)
+
+        def flush_page() -> None:
+            if touched_keys:
+                self.deps.drop_stale(self.crops, sorted(set(touched_keys)))
+                touched_keys.clear()
+
+        # Ids skipped by an earlier run are asked for again, in small batches.
+        if previous_skips:
+            self._set(phase="retrying skipped")
+            for start in range(0, len(previous_skips), RETRY_BATCH):
+                if self._cancel.is_set():
+                    break
+                batch = previous_skips[start:start + RETRY_BATCH]
+                clause = " or ".join(f"ID eq {item}" for item in batch)
+                for document in iter_pages(
+                    locations_url(self.odata, clause, self.page_size), self.deps.get_json
+                ):
+                    for entity in _entities(document):
+                        if self._cancel.is_set():
+                            break
+                        handle(entity, retry=True)
+                    flush_page()
+
+        # Everything OData changed since the watermark: one tick per page.
+        self._set(phase="updating")
+        url = locations_url(self.odata, f"LastModified ge {odata_literal(before)}", self.page_size)
+        for document in iter_pages(url, self.deps.get_json):
+            if self._cancel.is_set():
+                break
+            if self.pages == 0:
+                try:
+                    total = int(document.get("@odata.count"))
+                except (TypeError, ValueError):
+                    total = len(_entities(document))
+                self._set(pages=max(1, math.ceil(total / max(1, self.page_size))))
+            for entity in _entities(document):
+                if self._cancel.is_set():
+                    break
+                with self._lock:
+                    self.entities_seen += 1
+                handle(entity, retry=False)
+            flush_page()
+            with self._lock:
+                self.page += 1
+        flush_page()
+
+        clean = not self._cancel.is_set() and self.failed == 0
+        # Retried ids that came back skipped are in skipped_now; ones OData no longer returns are dropped. A
+        # cancelled run may not have reached every retry, so it keeps the whole earlier list.
+        carried = previous_skips if self._cancel.is_set() else []
+        remaining = sorted((set(carried) | skipped_now) - resolved)
+        after = newest if clean else before
+        saved = save_state(
+            self.crops,
+            {
+                "watermark": odata_literal(after),
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "last_counts": {
+                    "refreshed": self.refreshed, "added": self.added, "skipped": self.skipped,
+                    "unchanged": self.unchanged, "failed": self.failed, "clean": clean,
+                },
+                "skipped_ids": remaining,
+            },
+        )
+        self._set(
+            watermark_after=odata_literal(after),
+            state_saved=saved,
+            cancelled=self._cancel.is_set(),
+            phase="cancelled" if self._cancel.is_set() else ("done" if clean else "failed"),
+            finished=time.time(),
+        )
+        if not saved:
+            with self._lock:
+                self.errors.append("could not write update_state.json; the watermark was not saved")
+
+
+# ------------------------------------------------------------------- registry
+
+_jobs: dict[str, UpdateJob] = {}
+_jobs_lock = threading.Lock()
+
+
+def start_job(
+    volume: str,
+    crops: Path,
+    odata: str,
+    exporter: str,
+    *,
+    page_size: int | None = None,
+    deps: Dependencies | None = None,
+) -> tuple[UpdateJob, bool]:
+    """Start the volume's job, or return the one already running. The flag is True for a new job."""
+    with _jobs_lock:
+        current = _jobs.get(volume)
+        if current is not None and current.running:
+            return current, False
+        job = UpdateJob(
+            volume=volume,
+            crops=Path(crops),
+            odata=odata,
+            exporter=exporter,
+            page_size=page_size or PAGE_SIZE,
+            deps=deps or Dependencies(),
+        )
+        _jobs[volume] = job
+    job.start()
+    return job, True
+
+
+def current_job(volume: str) -> UpdateJob | None:
+    with _jobs_lock:
+        return _jobs.get(volume)
+
+
+def idle_status(crops: str | os.PathLike[str]) -> dict[str, Any]:
+    """What the dialog shows before a run: the saved watermark and the last result, if any."""
+    state = load_state(crops)
+    return {
+        "phase": "idle",
+        "running": False,
+        "watermark": state.get("watermark") or "",
+        "lastRun": state.get("last_run") or "",
+        "lastCounts": state.get("last_counts") or {},
+        "skippedPending": len(state.get("skipped_ids") or []),
+    }
