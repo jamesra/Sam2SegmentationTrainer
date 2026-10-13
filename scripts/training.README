@@ -1,0 +1,67 @@
+SAM2 training data versioning (Synology, BTRFS)
+================================================
+
+Layout (all on the same BTRFS volume, /volume1/Data):
+
+  /volume1/Data/Volumes/<VOLUME_NAME>/AnnotationCrops     live export (source)
+  /volume1/Data/SAM2TrainingData/<vN>/<VOLUME_NAME>       frozen training versions
+
+Each version is a copy-on-write (reflink) copy of the previous one with only the changed
+files rewritten. Unchanged files share disk blocks with older versions, so a new version
+costs roughly the size of what changed.
+
+Scripts (run ON the NAS, over ssh)
+----------------------------------
+
+  version-bump <v-previous> <v-next>
+      Reflink-clones SAM2TrainingData/<v-previous> to SAM2TrainingData/<v-next>.
+      Refuses if <v-next> exists unless -f, which deletes <v-next> and re-clones it
+      (anything only in <v-next> is lost). -n for dry run.
+
+  version-sync [-n] [-d] <version> [VOLUME_NAME ...]
+      rsync from Volumes/<VOL>/AnnotationCrops into SAM2TrainingData/<version>/<VOL>,
+      writing only files whose bytes differ (checksum, not timestamp). Default is all
+      volumes already in <version>. -n lists changes only. -d deletes files from <version>
+      that were removed from the source (otherwise they are kept).
+      A volume not present in <v-previous> can be added by naming it explicitly.
+
+Typical workflow
+----------------
+
+  version-bump v2 v3
+  version-sync -n v3          # preview
+  version-sync v3             # apply
+
+Never run version-sync on an older version you want to keep frozen; bump first.
+
+Install
+-------
+
+  mkdir -p ~/bin
+  cp version-bump version-sync ~/bin/ && chmod +x ~/bin/version-bump ~/bin/version-sync
+  echo 'export PATH="$HOME/bin:$PATH"' >> ~/.profile && . ~/.profile
+
+DSM notes: ~/.profile needs the user home service enabled (Control Panel > User & Group >
+Advanced). It is read only by interactive ssh logins; in Task Scheduler or `ssh nas 'cmd'`
+use the full path. Paths can be overridden with DATA_ROOT / TRAIN_ROOT environment
+variables.
+
+Checking space
+--------------
+
+  df -h /volume1                                  # Used should barely move after version-bump
+  btrfs filesystem du -s /volume1/Data/SAM2TrainingData/v3/<VOL>
+      Exclusive = bytes unique to v3 (about the size of the changed files)
+      Set shared = bytes shared with other versions/the source
+
+Caveats
+-------
+
+- Paths are case-sensitive on the NAS (SAM2TrainingData). Windows/SMB hides this; make
+  sure the real folder name matches.
+- version-sync -c reads every file that exists in both places with the same size, so it
+  is disk-bound on large volumes. Files with different sizes are detected without hashing.
+- Reflinks only work within one BTRFS volume. Copying across volumes, or over SMB from
+  Windows, makes full copies.
+- Snapshots/Hyper Backup/replication of shared folders may not preserve block sharing on
+  the target. Check the target's usage before relying on it.

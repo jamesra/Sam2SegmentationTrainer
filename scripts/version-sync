@@ -1,0 +1,81 @@
+#!/bin/sh
+# version-sync [-n] [-d] <version> [VOLUME_NAME ...]
+#
+# Bring SAM2TrainingData/<version>/<VOLUME_NAME> up to date with
+# Volumes/<VOLUME_NAME>/AnnotationCrops, writing only files whose CONTENT differs
+# (rsync --checksum; timestamps are ignored for the decision). Unchanged files are not
+# rewritten, so they stay block-shared with the version they were cloned from.
+# With no VOLUME_NAME, every volume folder already in SAM2TrainingData/<version> is synced.
+# Run ON the Synology, normally right after version-bump.
+#
+#   -n   dry run (list what would change)
+#   -d   also delete files in <version> that no longer exist in the source
+#
+# Env: DATA_ROOT (default /volume1/Data)
+# See training.README.
+
+set -eu
+
+DATA_ROOT="${DATA_ROOT:-/volume1/Data}"
+TRAIN_ROOT="${TRAIN_ROOT:-$DATA_ROOT/SAM2TrainingData}"
+DRY=0
+DELETE=0
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+while getopts "ndh" opt; do
+    case "$opt" in
+        n) DRY=1 ;;
+        d) DELETE=1 ;;
+        h) usage 0 ;;
+        *) usage 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage 1
+
+VERSION=$1
+shift
+case "$VERSION" in
+    v[0-9]*) ;;
+    *) echo "error: version should look like v1, v2, ... (got '$VERSION')" >&2; exit 1 ;;
+esac
+command -v rsync >/dev/null 2>&1 || { echo "error: rsync not found" >&2; exit 1; }
+[ -d "$TRAIN_ROOT/$VERSION" ] || { echo "error: not found: $TRAIN_ROOT/$VERSION (run version-bump first)" >&2; exit 1; }
+
+if [ $# -eq 0 ]; then
+    set -- $(cd "$TRAIN_ROOT/$VERSION" && for d in */; do [ -d "$d" ] && echo "${d%/}"; done)
+fi
+[ $# -gt 0 ] || { echo "error: no volumes given and none found in $TRAIN_ROOT/$VERSION" >&2; exit 1; }
+
+# -r recurse, -t keep mtimes, -c decide by checksum (not size+mtime).
+# No --inplace: rsync writes a temp file and renames, so shared blocks are never rewritten.
+FLAGS="-rtc --itemize-changes"
+[ "$DRY" -eq 1 ] && FLAGS="$FLAGS -n"
+[ "$DELETE" -eq 1 ] && FLAGS="$FLAGS --delete"
+
+rc=0
+for VOL in "$@"; do
+    SRC="$DATA_ROOT/Volumes/$VOL/AnnotationCrops"
+    DST="$TRAIN_ROOT/$VERSION/$VOL"
+    if [ ! -d "$SRC" ]; then
+        echo "skip $VOL: source not found: $SRC" >&2; rc=1; continue
+    fi
+    echo "== $VOL: $SRC -> $DST"
+    [ "$DRY" -eq 1 ] || mkdir -p "$DST"
+    # shellcheck disable=SC2086
+    OUT=$(rsync $FLAGS "$SRC/" "$DST/") || { echo "error: rsync failed for $VOL" >&2; rc=1; continue; }
+    # Show only content changes (>f), new files, and deletions; ignore dir/time-only lines.
+    CH=$(echo "$OUT" | grep -E '^(>f|\*deleting)' || true)
+    [ -n "$CH" ] && echo "$CH" | sed 's/^/   /'
+    N=$(echo "$CH" | grep -c '^>f' || true)
+    D=$(echo "$CH" | grep -c '^\*deleting' || true)
+    echo "   $N file(s) written, $D deleted$([ "$DRY" -eq 1 ] && echo ' (dry run)')"
+    if [ "$DELETE" -eq 0 ] && [ -d "$DST" ]; then
+        # Name-only comparison (no -c), so this is cheap.
+        GONE=$(rsync -rn --delete --itemize-changes "$SRC/" "$DST/" | grep -c '^\*deleting' || true)
+        [ "$GONE" -eq 0 ] || echo "   note: $GONE file(s) in $VERSION no longer exist in the source (use -d to remove)"
+    fi
+done
+
+exit "$rc"

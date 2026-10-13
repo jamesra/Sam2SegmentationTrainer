@@ -1,0 +1,61 @@
+#!/bin/sh
+# version-bump <v-previous> <v-next>
+#
+# Reflink (shared-block) copy of SAM2TrainingData/<v-previous> to SAM2TrainingData/<v-next>.
+# Uses no extra disk space until blocks in either copy are modified. Run ON the Synology.
+#
+#   -n   dry run
+#   -f   if <v-next> already exists, delete it and recreate it from <v-previous>
+#
+# Env: TRAIN_ROOT (default /volume1/Data/SAM2TrainingData)
+# See training.README.
+
+set -eu
+
+TRAIN_ROOT="${TRAIN_ROOT:-/volume1/Data/SAM2TrainingData}"
+DRY=0
+
+usage() { sed -n "2,11p" "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+FORCE=0
+
+while getopts "nfh" opt; do
+    case "$opt" in
+        n) DRY=1 ;;
+        f) FORCE=1 ;;
+        h) usage 0 ;;
+        *) usage 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 2 ] || usage 1
+
+PREV=$1
+NEXT=$2
+for v in "$PREV" "$NEXT"; do
+    case "$v" in
+        v[0-9]*) ;;
+        *) echo "error: version should look like v1, v2, ... (got '$v')" >&2; exit 1 ;;
+    esac
+done
+[ "$PREV" != "$NEXT" ] || { echo "error: versions are the same" >&2; exit 1; }
+
+[ -d "$TRAIN_ROOT/$PREV" ] || { echo "error: not found: $TRAIN_ROOT/$PREV" >&2; exit 1; }
+if [ -e "$TRAIN_ROOT/$NEXT" ] && [ "$FORCE" -eq 0 ]; then
+    echo "error: already exists: $TRAIN_ROOT/$NEXT (use -f to delete and recreate it)" >&2
+    exit 1
+fi
+
+echo "$TRAIN_ROOT/$PREV -> $TRAIN_ROOT/$NEXT (reflink)"
+[ -e "$TRAIN_ROOT/$NEXT" ] && echo "  -f: existing $NEXT will be deleted first"
+[ "$DRY" -eq 1 ] && exit 0
+
+[ -e "$TRAIN_ROOT/$NEXT" ] && rm -rf -- "$TRAIN_ROOT/${NEXT:?}"
+
+# --reflink=always fails rather than silently doing a full copy.
+if ! cp -a --reflink=always "$TRAIN_ROOT/$PREV" "$TRAIN_ROOT/$NEXT"; then
+    echo "error: reflink copy failed (not BTRFS / different volume?). Removing partial $NEXT." >&2
+    rm -rf -- "$TRAIN_ROOT/$NEXT"
+    exit 1
+fi
+echo "done. Next: version-sync $NEXT"
