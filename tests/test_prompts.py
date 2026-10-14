@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
@@ -325,6 +326,24 @@ class BuildPromptTests(unittest.TestCase):
             self.assertTrue(prompt.input_mask[int(round(y)), int(round(x))])
             outside += int(not target[int(round(y)), int(round(x))])
         self.assertGreater(outside, 0)
+
+    def test_merge_correction_click_is_never_inside_the_merged_neighbor(self) -> None:
+        # A small target touching a much larger neighbor: the deepest point of the union is in the neighbor.
+        target = _square(200, 20, 60)
+        neighbor = np.zeros((200, 200), dtype=bool)
+        neighbor[10:190, 60:190] = True
+        region = NegativeRegion(10, KIND_POLYGON, neighbor)
+        cfg = _only(PromptType.CORRECTION)
+        with mock.patch("sam2_segmentation_trainer.data.refine.CORRECTION_KINDS", ("merge",)):
+            for seed in range(60):
+                prompt = build_prompt(
+                    PromptType.CORRECTION, target_mask=target, circle_mask=None, regions=[region], cfg=cfg,
+                    rng=np.random.default_rng(seed),
+                )
+                self.assertTrue((prompt.input_mask & neighbor).any(), seed)  # it really is a merge
+                x, y = prompt.point_coords[0]
+                self.assertFalse(neighbor[int(round(y)), int(round(x))], seed)
+                self.assertTrue(prompt.input_mask[int(round(y)), int(round(x))], seed)
 
     def test_background_points_never_land_in_the_merged_neighbor(self) -> None:
         target = _square(200, 20, 60)

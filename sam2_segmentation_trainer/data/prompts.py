@@ -503,7 +503,14 @@ def build_prompt(
                 excursion_px=cfg.near_correct_excursion_px,
             )
         # The click comes from the mask the user sees, as in production, never from the ground truth.
-        points = sample_points_in_mask(correction, 1, rng, **kwargs)
+        # A merged neighbor is the part the user knows is wrong, and the deepest point of the union is often inside
+        # it, so the click is taken from the rest of the mask.
+        clickable = correction
+        if merged_region is not None:
+            rest = correction & ~np.asarray(merged_region.mask, dtype=bool)
+            if rest.any():
+                clickable = rest
+        points = sample_points_in_mask(clickable, 1, rng, **kwargs)
         if points.shape[0] == 0:
             points = sample_points_in_mask(target_mask, 1, rng, **kwargs)
     else:  # pragma: no cover - enum is exhaustive
