@@ -50,6 +50,10 @@ class EvalRequest:
     noc_max_clicks: int = 20
     noc_target_iou: float = 0.9
     circle_scale: float = DEFAULT_CIRCLE_DIAMETER_SCALE
+    core_band_px: float = 10.0
+    """``val.core_band_px``: the band the goal metrics and the NoC click sampling ignore around the traced edge."""
+    core_recall_target: float = 0.975
+    merge_min_px: int = 500
 
 
 def _load_model(request: EvalRequest, device: torch.device):
@@ -64,7 +68,10 @@ def _load_model(request: EvalRequest, device: torch.device):
 
 def _evaluate_noc(request: EvalRequest, val_ex, tiles, model, device) -> dict:
     """Clicks to reach `noc_target_iou` from one interior point plus simulated corrections, per volume."""
-    dataset = EMSegDataset(val_ex, split="val", image_size=request.image_size, tiles=tiles, val_prompt="point")
+    dataset = EMSegDataset(
+        val_ex, split="val", image_size=request.image_size, tiles=tiles, val_prompt="point",
+        core_band_px=request.core_band_px,
+    )
     loader = DataLoader(
         dataset, batch_size=1, shuffle=False, num_workers=request.num_workers, collate_fn=collate_em
     )
@@ -80,11 +87,15 @@ def _evaluate_noc(request: EvalRequest, val_ex, tiles, model, device) -> dict:
             target_iou=request.noc_target_iou,
             threshold=request.threshold,
             seed=i,
+            core_band_px=request.core_band_px,
+            core_recall_target=request.core_recall_target,
+            merge_min_px=request.merge_min_px,
         ):
             rows.append(row)
             volumes.append(str(batch["meta"][0]["volume"]))
     summary = summarize_noc(rows, volumes, request.noc_max_clicks)
     summary["target_iou"] = request.noc_target_iou
+    summary["core_recall_target"] = request.core_recall_target
     return summary
 
 
@@ -175,6 +186,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--noc-iou", type=float, default=0.9)
     parser.add_argument("--noc-max-clicks", type=int, default=20)
     parser.add_argument(
+        "--core-band-px", type=float, default=10.0,
+        help="val.core_band_px: simulated clicks target errors more than this far from the traced edge",
+    )
+    parser.add_argument(
+        "--core-recall-target", type=float, default=0.975,
+        help="Second NoC stopping rule: core recall at least this with no merge",
+    )
+    parser.add_argument(
         "--circle-scale",
         type=float,
         default=DEFAULT_CIRCLE_DIAMETER_SCALE,
@@ -216,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             noc_max_clicks=args.noc_max_clicks,
             noc_target_iou=args.noc_iou,
             circle_scale=args.circle_scale,
+            core_band_px=args.core_band_px,
+            core_recall_target=args.core_recall_target,
         )
     )
     print(json.dumps(summary, indent=2))

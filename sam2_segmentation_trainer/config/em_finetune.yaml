@@ -249,6 +249,8 @@ iterative:
   rounds_min: 2         # corrective clicks per such batch, drawn uniformly from rounds_min..rounds_max
   rounds_max: 6
   prev_mask_prob: 0.5   # per sample, chance the previous logits are fed back (muSAM: always feeding it over-relies)
+  # Clicks target goal errors, not trace noise: a positive click in the ground truth's core (val.core_band_px inside
+  # its edge) that is not predicted, a negative click in the prediction more than val.core_band_px outside it.
 
 eval:
   # Validation scores the validation split once per prompt, with fixed prompts. Every family reports core recall,

@@ -9,6 +9,7 @@ from torch import nn
 
 from sam2_segmentation_trainer.interactive import (
     error_clicks,
+    error_regions,
     iterative_predict_masks,
     next_click,
     simulate_clicks,
@@ -41,6 +42,49 @@ class NextClickTests(unittest.TestCase):
         x, y, label = next_click(gt.copy(), gt, np.random.default_rng(1))
         self.assertEqual(label, 1)
         self.assertTrue(gt[y, x])
+
+    def test_a_wobble_inside_the_band_gets_no_click_in_the_band(self) -> None:
+        # The prediction follows the trace but wobbles by 8 px: no goal error, and a click lands only on a real one.
+        gt = np.zeros((200, 200), dtype=bool)
+        gt[40:160, 40:160] = True
+        pred = gt.copy()
+        pred[40:160, 40:48] = False  # misses an 8 px strip along the left edge
+        pred[152:160, 40:160] = False  # and the bottom edge
+        pred[30:40, 60:140] = True  # adds an 8 px strip outside the top edge
+        # With nothing but the wobble left, the raw regions are the fallback (the click is harmless).
+        missed, spurious = error_regions(pred, gt, band=10.0)
+        raw_missed, raw_spurious = error_regions(pred, gt, band=0.0)
+        self.assertTrue(raw_missed.any() and raw_spurious.any())
+        self.assertTrue((missed == raw_missed).all() and (spurious == raw_spurious).all())
+        # A real miss deeper than the band does get the click, however the area compares with the wobble.
+        pred[90:110, 90:110] = False
+        missed, spurious = error_regions(pred, gt, band=10.0)
+        self.assertFalse(spurious.any())
+        self.assertTrue(missed[90:110, 90:110].any() and not missed[:, :50].any() and not missed[150:, :].any())
+        for seed in range(10):
+            x, y, label = next_click(pred, gt, np.random.default_rng(seed), band=10.0)
+            self.assertEqual(label, 1)
+            self.assertTrue(90 <= x < 110 and 90 <= y < 110, (x, y))
+
+    def test_a_spurious_blob_beyond_the_band_gets_a_negative_click(self) -> None:
+        gt = np.zeros((200, 200), dtype=bool)
+        gt[60:140, 60:140] = True
+        pred = gt.copy()
+        pred[10:40, 100:130] = True  # 20+ px outside the edge
+        x, y, label = next_click(pred, gt, np.random.default_rng(0), band=10.0)
+        self.assertEqual(label, 0)
+        self.assertTrue(10 <= y < 40 and 100 <= x < 130)
+
+    def test_the_band_is_scaled_to_the_logit_grid(self) -> None:
+        gt = torch.zeros(1, 64, 64)
+        gt[:, 8:56, 8:56] = 1.0
+        low = torch.full((1, 16, 16), -5.0)
+        low[:, 2:14, 2:14] = 5.0  # follows the trace to within a pixel of the 16 grid (4 full px)
+        coords, labels = error_clicks(low, gt, np.random.default_rng(0), core_band_px=8.0)  # 2 px on the 16 grid
+        self.assertEqual(tuple(coords.shape), (1, 2))
+        # Only the rim is off, inside the band: there is no goal error, so the raw regions decide (a positive click
+        # in the missed rim or a negative one in the spill).
+        self.assertIn(int(labels[0]), (0, 1))
 
     def test_error_clicks_scale_to_the_full_size_mask(self) -> None:
         gt = torch.zeros(2, 64, 64)
@@ -197,6 +241,34 @@ class SimulateClicksTests(unittest.TestCase):
         easy = simulate_clicks(model, batch, "cpu", 8, max_clicks=4, target_iou=0.0)
         self.assertTrue(all(r["noc"] == 1 and r["reached"] for r in easy))
 
+    def test_reports_the_goal_stopping_rule_next_to_the_iou_rule(self) -> None:
+        model = _Sam()
+        images, points, labels, gt = _batch()
+        batch = {"image": images, "mask": gt, "point": points, "point_label": labels}
+        rows = simulate_clicks(model, batch, "cpu", 8, max_clicks=3, target_iou=1.1, core_band_px=1.0)
+        for row in rows:
+            self.assertEqual(row["noc"], 3)  # the IoU rule never fires
+            self.assertIn(row["noc_goal"], (1, 2, 3))
+            self.assertEqual(row["reached_goal"], row["noc_goal"] < 3 or row["reached_goal"])
+            self.assertIn("core_recall", row)
+        easy = simulate_clicks(
+            model, batch, "cpu", 8, max_clicks=3, target_iou=0.0, core_band_px=1.0, core_recall_target=0.0
+        )
+        self.assertTrue(all(r["noc"] == 1 and r["noc_goal"] == 1 and r["reached_goal"] for r in easy))
+
+    def test_a_merge_blocks_the_goal_rule(self) -> None:
+        model = _Sam()
+        images, points, labels, gt = _batch()
+        cores = torch.ones(images.shape[0], 8, 8, dtype=torch.int16)  # the whole tile is a neighbor's core
+        batch = {"image": images, "mask": gt, "point": points, "point_label": labels, "neighbor_core": cores}
+        rows = simulate_clicks(
+            model, batch, "cpu", 8, max_clicks=2, target_iou=0.0, core_band_px=1.0, core_recall_target=0.0,
+            merge_min_px=1,
+        )
+        for row in rows:
+            if row["merge"]:
+                self.assertFalse(row["reached_goal"])
+
     def test_summary_groups_by_volume(self) -> None:
         rows = [
             {"noc": 2, "reached": True, "iou": 0.9},
@@ -207,6 +279,14 @@ class SimulateClicksTests(unittest.TestCase):
         self.assertAlmostEqual(summary["overall"]["mean_clicks"], 4.0)
         self.assertAlmostEqual(summary["by_volume"]["RC1"]["failed"], 0.5)
         self.assertEqual(summarize_noc([], [], 20), {"n": 0})
+        goal_rows = [
+            {"noc": 2, "reached": True, "iou": 0.9, "noc_goal": 1, "reached_goal": True},
+            {"noc": 4, "reached": False, "iou": 0.5, "noc_goal": 20, "reached_goal": False},
+        ]
+        both = summarize_noc(goal_rows, ["RC1", "RC1"], 20)
+        self.assertAlmostEqual(both["overall"]["mean_clicks_goal"], 10.5)
+        self.assertAlmostEqual(both["overall"]["failed_goal"], 0.5)
+        self.assertNotIn("mean_clicks_goal", summary["overall"])
 
 
 class RoundsDrawTests(unittest.TestCase):

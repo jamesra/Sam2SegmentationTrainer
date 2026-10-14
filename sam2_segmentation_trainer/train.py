@@ -1575,6 +1575,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                         prev_mask_prob=float(OmegaConf.select(cfg, "iterative.prev_mask_prob", default=0.5)),
                         rng=np.random.default_rng([seed, epoch, step, 9]),
                         variant_index=inputs["variant_index"],
+                        core_band_px=_leak_settings(cfg)[1],
                     )
                 else:
                     pred, iou_preds = predict_masks_mixed(
