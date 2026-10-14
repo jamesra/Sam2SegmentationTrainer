@@ -626,6 +626,81 @@ def _circle_scale(cfg: DictConfig) -> float:
     return float(OmegaConf.select(cfg, "prompt.circle_diameter_scale", default=DEFAULT_CIRCLE_DIAMETER_SCALE))
 
 
+def make_split_from_cfg(cfg: DictConfig, examples, volumes: list[str], even: bool):
+    """The train/validation split the config asks for (``data.split_mode``), and whether ``even`` was applied.
+
+    The same split a new run writes to its ``split.json``; ``sam2-em-eval --goal`` builds it too, so baselines are
+    scored on the validation set a run will use.
+    """
+    missing = [volume for volume in volumes if not any(ex.volume == volume for ex in examples)]
+    if even and missing:
+        raise RuntimeError(f"even split requires every volume to have usable examples; missing {missing}")
+    split_mode = str(cfg.data.get("split_mode", "location")).strip().lower()
+    if split_mode == "zslab":
+        zslab = cfg.data.get("zslab") or {}
+        if even:
+            print("data.even_per_volume is ignored for split_mode=zslab")
+        split = make_zslab_split(
+            examples,
+            val_fraction=1.0 - float(cfg.data.train_split),
+            slab_count=int(zslab.get("slab_count", 5)),
+            guard_sections=int(zslab.get("guard_sections", 1)),
+        )
+        even = False
+        for volume in sorted(split.val_z):
+            print(
+                f"  {volume}: val sections {_z_runs(split.val_z[volume])}; "
+                f"guard {_z_runs(split.guard_z.get(volume, ()))}"
+            )
+    elif split_mode == "location":
+        split = make_location_split(
+            examples,
+            train_fraction=float(cfg.data.train_split),
+            seed=int(cfg.training.seed),
+            even_per_volume=even,
+        )
+    else:
+        raise ValueError(f"data.split_mode must be zslab or location, got {split_mode!r}")
+    return split, even
+
+
+def build_validation_suite(
+    cfg: DictConfig,
+    val_ex,
+    tile_context,
+    *,
+    approved,
+    prompt_cfg: PromptConfig | None,
+    missing_tiles=None,
+    num_workers: int | None = None,
+) -> ValidationSuite:
+    """The validation suite a run uses, from the config (``eval:`` and ``val:`` sections)."""
+    val_modes = [str(m) for m in OmegaConf.select(cfg, "eval.val_prompts", default=list(DEFAULT_VAL_PROMPTS))]
+    return ValidationSuite(
+        val_ex,
+        modes=val_modes,
+        primary=str(OmegaConf.select(cfg, "eval.primary_val_prompt", default=val_modes[0])),
+        image_size=int(cfg.data.image_size),
+        num_workers=int(cfg.training.num_workers) if num_workers is None else int(num_workers),
+        missing_tiles=missing_tiles,
+        tiles=tile_context,
+        prompt_cfg=prompt_cfg,
+        seed=int(cfg.training.seed),
+        circle_scale=_circle_scale(cfg),
+        full_tile_threshold=_full_tile_settings(cfg)[0],
+        edge_tau_px=_tolerance_tau(cfg),
+        edge_weight_min=_edge_loss_settings(cfg)[1],
+        edge_tau_depth_frac=_tau_depth_frac(cfg),
+        core_band_px=_leak_settings(cfg)[1],
+        merge_min_px=int(OmegaConf.select(cfg, "val.merge_min_px", default=MERGE_MIN_PX)),
+        core_recall_target=float(OmegaConf.select(cfg, "val.core_recall_target", default=0.975)),
+        approved=approved,
+        epoch_subset=float(OmegaConf.select(cfg, "val.epoch_subset", default=0.25)),
+        batch_size=int(OmegaConf.select(cfg, "val.batch_size", default=4)),
+        metric_threads=int(OmegaConf.select(cfg, "val.metric_threads", default=4)),
+    )
+
+
 def _circle_guard(cfg: DictConfig, prompt_cfg: PromptConfig) -> dict:
     """Keyword arguments for :func:`build_tile_context`: the circle scale, and a failure when circles are absent."""
     return {
@@ -1115,37 +1190,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         even_applied = False
         print(f"reused existing split {legacy_split}")
     else:
-        missing = [volume for volume in volumes if not any(ex.volume == volume for ex in examples)]
-        if even and missing:
-            raise RuntimeError(
-                f"even split requires every volume to have usable examples; missing {missing}"
-            )
-        split_mode = str(cfg.data.get("split_mode", "location")).strip().lower()
-        if split_mode == "zslab":
-            zslab = cfg.data.get("zslab") or {}
-            if even:
-                print("data.even_per_volume is ignored for split_mode=zslab")
-            split = make_zslab_split(
-                examples,
-                val_fraction=1.0 - float(cfg.data.train_split),
-                slab_count=int(zslab.get("slab_count", 5)),
-                guard_sections=int(zslab.get("guard_sections", 1)),
-            )
-            even = False
-            for volume in sorted(split.val_z):
-                print(
-                    f"  {volume}: val sections {_z_runs(split.val_z[volume])}; "
-                    f"guard {_z_runs(split.guard_z.get(volume, ()))}"
-                )
-        elif split_mode == "location":
-            split = make_location_split(
-                examples,
-                train_fraction=float(cfg.data.train_split),
-                seed=int(cfg.training.seed),
-                even_per_volume=even,
-            )
-        else:
-            raise ValueError(f"data.split_mode must be zslab or location, got {split_mode!r}")
+        split, even = make_split_from_cfg(cfg, examples, volumes, even)
         split_path = run_split
         save_split(split, run_split)
         even_applied = even
@@ -1213,31 +1258,16 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         approved=approved,
         approved_weight=float(OmegaConf.select(cfg, "data.approved_weight", default=1.0)),
     )
-    val_modes = [str(m) for m in OmegaConf.select(cfg, "eval.val_prompts", default=list(DEFAULT_VAL_PROMPTS))]
-    val_primary = str(OmegaConf.select(cfg, "eval.primary_val_prompt", default=val_modes[0]))
-    val_suite = ValidationSuite(
+    val_suite = build_validation_suite(
+        cfg,
         val_ex,
-        modes=val_modes,
-        primary=val_primary,
-        image_size=image_size,
-        num_workers=num_workers,
-        missing_tiles=missing_tiles,
-        tiles=tile_context,
-        prompt_cfg=prompt_cfg if mixed_prompts else None,
-        seed=seed,
-        circle_scale=_circle_scale(cfg),
-        full_tile_threshold=_full_tile_settings(cfg)[0],
-        edge_tau_px=_tolerance_tau(cfg),
-        edge_weight_min=_edge_loss_settings(cfg)[1],
-        edge_tau_depth_frac=_tau_depth_frac(cfg),
-        core_band_px=_leak_settings(cfg)[1],
-        merge_min_px=int(OmegaConf.select(cfg, "val.merge_min_px", default=MERGE_MIN_PX)),
-        core_recall_target=core_recall_target,
+        tile_context,
         approved=approved,
-        epoch_subset=float(OmegaConf.select(cfg, "val.epoch_subset", default=0.25)),
-        batch_size=int(OmegaConf.select(cfg, "val.batch_size", default=4)),
-        metric_threads=int(OmegaConf.select(cfg, "val.metric_threads", default=4)),
+        prompt_cfg=prompt_cfg if mixed_prompts else None,
+        missing_tiles=missing_tiles,
+        num_workers=num_workers,
     )
+    val_modes, val_primary = val_suite.modes, val_suite.primary
     val_ds = val_suite.dataset
     print(
         f"validation: every epoch the fixed subset of {val_suite.subset_size} of {len(val_ds)} samples "

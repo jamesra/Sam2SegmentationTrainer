@@ -54,6 +54,10 @@ class EvalRequest:
     """``val.core_band_px``: the band the goal metrics and the NoC click sampling ignore around the traced edge."""
     core_recall_target: float = 0.975
     merge_min_px: int = 500
+    goal: bool = False
+    """Score the full validation split with the training validation suite (every family's goal metrics)."""
+    overrides: tuple[str, ...] = ()
+    """Config overrides (``section.key=value``) for the ``goal`` run, like the trainer's command line."""
 
 
 def _load_model(request: EvalRequest, device: torch.device):
@@ -99,8 +103,62 @@ def _evaluate_noc(request: EvalRequest, val_ex, tiles, model, device) -> dict:
     return summary
 
 
+def evaluate_goal(request: EvalRequest) -> dict:
+    """One full validation pass with the trainer's own suite: the goal metrics of every prompt family.
+
+    This is what a training run logs as ``val_full``, so the zero-shot model and earlier checkpoints can be scored
+    the same way as a new run. The split is ``request.split_path`` (it is created from the config when missing, so
+    pass the new run's own ``split.json`` to get its validation set).
+    """
+    import dataclasses
+
+    from sam2_segmentation_trainer import train
+    from sam2_segmentation_trainer.data.manifest import take_model_sized
+    from sam2_segmentation_trainer.data.prompts import PromptConfig
+    from sam2_segmentation_trainer.data.splits import save_split
+    from sam2_segmentation_trainer.validation import format_summary
+
+    cfg = train.load_train_cfg(list(request.overrides))
+    prompt_cfg = PromptConfig.from_cfg(cfg)
+    examples = index_volumes(volumes=request.volumes, root=request.data_dir, skip_missing=True)
+    examples, _wrong_size = take_model_sized(examples, request.image_size)
+    if request.split_path.is_file():
+        split = load_split(request.split_path)
+    else:
+        split, _even = train.make_split_from_cfg(cfg, examples, request.volumes, bool(cfg.data.get("even_per_volume", False)))
+        request.split_path.parent.mkdir(parents=True, exist_ok=True)
+        save_split(split, request.split_path)
+        print(f"wrote split {request.split_path}")
+    _train_ex, val_ex = split.partition(examples)
+    tiles = build_tile_context(examples, **train._circle_guard(cfg, prompt_cfg))
+    approved = train.load_approved_set(cfg, request.data_dir)
+    suite = train.build_validation_suite(
+        cfg, val_ex, tiles, approved=approved, prompt_cfg=prompt_cfg, num_workers=request.num_workers
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _load_model(request, device)
+    print(f"scoring {len(suite.dataset)} validation samples, families {suite.modes}")
+    outcome = suite.run(model, device, request.image_size, request.threshold, full=True)
+    results = outcome.full or outcome.subset
+    target = suite.core_recall_target
+    print(format_summary(0, results, suite.primary, target, label="full", detail=True))
+    summary = {
+        "model": "zero-shot" if request.finetuned is None else str(request.finetuned),
+        "split": str(request.split_path),
+        "samples": len(suite.dataset),
+        "core_band_px": suite.core_band_px,
+        "core_recall_target": target,
+        "families": {mode: dataclasses.asdict(result) for mode, result in results.items()},
+    }
+    request.out_dir.mkdir(parents=True, exist_ok=True)
+    (request.out_dir / "goal_metrics.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def evaluate(request: EvalRequest) -> dict:
     """Score the val split under each prompt. Returns ``{prompt: summary}`` and writes ``metrics.json``."""
+    if request.goal:
+        return evaluate_goal(request)
     unknown = [p for p in request.prompts if p not in VAL_PROMPTS]
     if unknown:
         raise ValueError(f"unknown prompt(s) {unknown}; choose from {list(VAL_PROMPTS)}")
@@ -183,6 +241,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also report NoC: clicks needed to reach --noc-iou with simulated corrective clicks",
     )
+    parser.add_argument(
+        "--goal",
+        action="store_true",
+        help="Score the FULL validation split with the trainer's validation suite and print every prompt family's "
+        "goal metrics (core recall, merge, spill, ...); writes goal_metrics.json. Needs --split (created from the "
+        "config when the file is missing, so the new run's own split.json can be given before the run starts).",
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Config override for --goal, e.g. --set data.split_mode=zslab (repeatable)",
+    )
     parser.add_argument("--noc-iou", type=float, default=0.9)
     parser.add_argument("--noc-max-clicks", type=int, default=20)
     parser.add_argument(
@@ -237,6 +310,8 @@ def main(argv: list[str] | None = None) -> int:
             circle_scale=args.circle_scale,
             core_band_px=args.core_band_px,
             core_recall_target=args.core_recall_target,
+            goal=args.goal,
+            overrides=tuple(args.overrides),
         )
     )
     print(json.dumps(summary, indent=2))

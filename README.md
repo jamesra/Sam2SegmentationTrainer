@@ -243,6 +243,11 @@ sam2-em-eval --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --
 # Scores every validation prompt; add --noc for clicks to reach 90% IoU, and --split <run>/split.json to
 # score the run's own validation split. The zero-shot baseline to beat (base weights only):
 sam2-em-eval --zero-shot --split /storage4/Sam2Trainer/runs/sam2_em_v1/split.json --out /outputs/eval_zero_shot
+# Goal metrics of every prompt family on the FULL validation split (what a run logs as val_full), for any model: the
+# baselines a new run must beat. --split may name a run's split.json that does not exist yet; it is then created from
+# the config, and the run reuses it.
+sam2-em-eval --goal --zero-shot --split /storage4/Sam2Trainer/runs/sam2_em_v4/split.json --out /outputs/goal_zero_shot
+sam2-em-eval --goal --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v3/best_model.pt --split /storage4/Sam2Trainer/runs/sam2_em_v4/split.json --out /outputs/goal_v3
 sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --point 512,400 --out /outputs/pred.png
 
 # SegmentationServer loads Meta {"model": state_dict}, not the raw trainer file.
