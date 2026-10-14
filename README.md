@@ -257,7 +257,9 @@ sam2-em-export-serve \
   --out /path/to/best_TEM_model.pt
 # The file is {"model": state_dict, "prompt_encoding": {...}}: build_sam2 reads only "model"; the other key records
 # EDGE_TAU_PX, EDGE_TAU_DEPTH_FRAC, SEED_LOGIT, CORRECTION_LOGIT, LOGIT_CLIP, LOW_RES, circle_diameter_scale and a
-# prompt_encoding version string (--circle-diameter-scale records the run's prompt.circle_diameter_scale).
+# prompt_encoding version string. The values come from the run's own saved config.yaml (next to --checkpoint, or
+# --run-dir); without one the library defaults are written with a warning. Training prints a warning at start when
+# a prompt.* value differs from the annotation_crops.prompt_encoding constants the server implements.
 ```
 
 **Do not serve a v4 model until the server builds `mask_input` with `annotation_crops/prompt_encoding.py` and the

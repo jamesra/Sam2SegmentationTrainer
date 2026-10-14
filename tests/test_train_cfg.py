@@ -82,6 +82,22 @@ class TrainCfgTests(unittest.TestCase):
             list(cfg.eval.val_prompts), ["circle_mask", "correction", "near_correct", "point", "centroid"]
         )
 
+    def test_training_start_warns_when_the_encoding_differs_from_the_library_constants(self) -> None:
+        import contextlib
+        import io
+
+        from sam2_segmentation_trainer.train import warn_encoding_differences
+
+        with contextlib.redirect_stdout(io.StringIO()) as quiet:
+            self.assertEqual(warn_encoding_differences(load_train_cfg()), [])
+        self.assertEqual(quiet.getvalue(), "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            messages = warn_encoding_differences(load_train_cfg(["prompt.edge_tau_px=6", "prompt.correction_logit=4"]))
+        self.assertEqual(len(messages), 2)
+        self.assertIn("WARNING: prompt.edge_tau_px is 6.0", out.getvalue())
+        self.assertIn("prompt.correction_logit is 4.0", out.getvalue())
+
     def test_out_of_memory_is_recognised_including_the_driver_mapping_failure(self) -> None:
         from sam2_segmentation_trainer.train import _is_oom
 

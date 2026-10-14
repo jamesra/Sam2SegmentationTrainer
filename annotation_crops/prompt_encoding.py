@@ -54,18 +54,56 @@ PROMPT_ENCODING_VERSION = "edge-confidence-v4"
 exported model carries it so a server can refuse a model whose encoding it does not implement."""
 
 
-def encoding_metadata(circle_diameter_scale: float) -> dict[str, float | int | str]:
-    """The constants a server must use to build ``mask_input`` for a model trained with this encoding."""
+def encoding_metadata(
+    circle_diameter_scale: float,
+    *,
+    edge_tau_px: float = EDGE_TAU_PX,
+    edge_tau_depth_frac: float = EDGE_TAU_DEPTH_FRAC,
+    seed_logit: float = SEED_LOGIT,
+    correction_logit: float = CORRECTION_LOGIT,
+) -> dict[str, float | int | str]:
+    """The constants a server must use to build ``mask_input`` for a model trained with this encoding.
+
+    The four configurable values default to this module's constants; an exporter passes the ones the run trained
+    with. ``LOGIT_CLIP`` and ``LOW_RES`` are not configurable.
+    """
     return {
         "prompt_encoding": PROMPT_ENCODING_VERSION,
-        "EDGE_TAU_PX": EDGE_TAU_PX,
-        "EDGE_TAU_DEPTH_FRAC": EDGE_TAU_DEPTH_FRAC,
-        "SEED_LOGIT": SEED_LOGIT,
-        "CORRECTION_LOGIT": CORRECTION_LOGIT,
+        "EDGE_TAU_PX": float(edge_tau_px),
+        "EDGE_TAU_DEPTH_FRAC": float(edge_tau_depth_frac),
+        "SEED_LOGIT": float(seed_logit),
+        "CORRECTION_LOGIT": float(correction_logit),
         "LOGIT_CLIP": LOGIT_CLIP,
         "LOW_RES": LOW_RES,
         "circle_diameter_scale": float(circle_diameter_scale),
     }
+
+
+def encoding_differences(
+    *,
+    edge_tau_px: float,
+    edge_tau_depth_frac: float,
+    seed_logit: float,
+    correction_logit: float,
+    circle_diameter_scale: float,
+    default_circle_diameter_scale: float,
+) -> list[str]:
+    """Messages for each value that differs from this module's constants (the ones a server implements)."""
+    pairs = (
+        ("prompt.edge_tau_px", edge_tau_px, EDGE_TAU_PX, "EDGE_TAU_PX"),
+        ("prompt.edge_tau_depth_frac", edge_tau_depth_frac, EDGE_TAU_DEPTH_FRAC, "EDGE_TAU_DEPTH_FRAC"),
+        ("prompt.seed_logit", seed_logit, SEED_LOGIT, "SEED_LOGIT"),
+        ("prompt.correction_logit", correction_logit, CORRECTION_LOGIT, "CORRECTION_LOGIT"),
+        (
+            "prompt.circle_diameter_scale", circle_diameter_scale, default_circle_diameter_scale,
+            "DEFAULT_CIRCLE_DIAMETER_SCALE",
+        ),
+    )
+    return [
+        f"{key} is {value} but annotation_crops {name} is {library}"
+        for key, value, library, name in pairs
+        if abs(float(value) - float(library)) > 1e-9
+    ]
 
 
 def window(mask: np.ndarray, margin: int) -> tuple[slice, slice] | None:
