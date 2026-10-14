@@ -9,10 +9,14 @@ training:
   # Large checkpoints (last.pt / best_model) — default /storage4/Sam2Trainer via env.
   checkpoint_dir: null
   num_epochs: 15
-  # Batch 2 with 8 accumulation steps (effective 16), activation checkpointing off: measured on an RTX 4500 Ada
-  # (22.5 GB), 3 prompt variants, cuDNN autotuner off, 0.286 s per sample at a 14.8 GB peak, against 0.324 s per
-  # sample for batch 4 with checkpointing (7.0 GB). Batch 4 without checkpointing does not fit (driver mapping
-  # failure in the first forward pass).
+  # Batch 2 with 8 accumulation steps (effective 16), activation checkpointing off. Measured on an RTX 4500 Ada
+  # (22.5 GB), 3 prompt variants, cuDNN autotuner off, training steps only, alternating runs A B A B with the GPU
+  # clocks logged (scripts/compare_throughput.sh): this setting took 0.2765 and 0.2755 s per sample (0.553 and
+  # 0.551 s per batch, 14.8 GB peak); batch 4 with checkpointing took 0.314 and 0.339 s per sample (1.256 and
+  # 1.356 s per batch, 7.0 GB peak). So it is 15.5% faster per sample, and its slowest run beat B's fastest by
+  # 12%. SM clocks averaged about 2700 MHz in all four runs, the only throttle reason was the software power cap
+  # (in 10-30% of busy samples, in both settings), and no other process was using the GPU. Batch 4 without
+  # checkpointing does not fit (driver mapping failure in the first forward pass).
   batch_size: 2
   num_workers: 4
   prefetch_factor: 2
@@ -225,9 +229,10 @@ model:
   # Train the prompt encoder's mask_downscaling network (about 4.7K parameters) so it learns the continuous
   # seed / correction / negative mask prompt. Only applies with prompt.enabled. Changing it needs -refresh, not resume.
   unfreeze_mask_cnn: true
-  # Off: at batch 2 it is 12% faster per sample than checkpointing at batch 4 (0.286 vs 0.324 s) and peaks at 14.8 GB
-  # of 22.5. Checkpointing half of the blocks at batch 4 measured 0.296 s per sample at 15.6 GB; a quarter thrashed
-  # the allocator at 20.5 GB (0.75 s per sample). On a smaller card turn it back on (and use batch 4).
+  # Off: with batch 2 it is 15.5% faster per sample than checkpointing at batch 4 (0.276 vs 0.327 s, see
+  # training.batch_size) and peaks at 14.8 GB of 22.5. Checkpointing half of the blocks at batch 4 measured 0.296 s
+  # per sample at 15.6 GB; a quarter thrashed the allocator at 20.5 GB (0.75 s per sample). On a smaller card turn
+  # it back on (and use batch 4).
   activation_checkpointing: false
   # Share of the 48 Hiera blocks that are checkpointed (spread evenly through the trunk) when activation
   # checkpointing is on. 1.0 = all.
