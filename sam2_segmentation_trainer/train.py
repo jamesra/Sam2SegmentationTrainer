@@ -41,6 +41,7 @@ from sam2_segmentation_trainer.data.dataset import (
     MissingTileFlag,
     collate_em,
 )
+from sam2_segmentation_trainer.data.approved import ApprovedSet, approved_counts, load_approved
 from sam2_segmentation_trainer.data.prompts import PromptConfig
 from sam2_segmentation_trainer.data.tiles import (
     TileContext,
@@ -719,40 +720,16 @@ def _tolerance_tau(cfg: DictConfig) -> float:
     return tau if tau > 0.0 else 8.0
 
 
-def load_approved_set(cfg: DictConfig) -> frozenset:
-    """``(location_id, image_key)`` pairs from ``data.approved_path`` (``approved.json``), or an empty set.
+def load_approved_set(cfg: DictConfig, data_dir: Path | None = None) -> ApprovedSet:
+    """The gallery's approved masks (see :mod:`sam2_segmentation_trainer.data.approved`).
 
-    The file is the gallery's list of approved masks, entries ``{"location_id": ..., "image_key": ...}`` (a
-    ``[location_id, image_key]`` pair works too). A missing path warns and skips the Approved row.
+    ``data.approved_path`` null reads ``{data_root}/{volume}/approved.json`` for every configured volume; it may
+    also be a file, a directory, or a list of those. Counts are logged per volume, and a total of 0 warns.
     """
     raw = OmegaConf.select(cfg, "data.approved_path", default=None)
-    if not raw:
-        return frozenset()
-    path = Path(str(raw))
-    if not path.is_file():
-        print(f"WARNING: data.approved_path {path} not found; Approved masks will not be reported or weighted")
-        return frozenset()
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    keys: set[tuple[int, str]] = set()
-    for item in payload if isinstance(payload, list) else []:
-        try:
-            if isinstance(item, dict):
-                keys.add((int(item["location_id"]), str(item.get("image_key") or "")))
-            else:
-                location_id, image_key = item
-                keys.add((int(location_id), str(image_key or "")))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return frozenset(keys)
-
-
-def approved_counts(examples, approved: frozenset) -> dict[str, int]:
-    """How many of ``examples`` are approved, per volume."""
-    counts: dict[str, int] = {}
-    for ex in examples:
-        if (int(ex.location_id), ex.image_key) in approved:
-            counts[ex.volume] = counts.get(ex.volume, 0) + 1
-    return dict(sorted(counts.items()))
+    if raw is not None and not isinstance(raw, str):
+        raw = [str(item) for item in raw]
+    return load_approved(raw, [str(v) for v in cfg.data.volumes], data_dir if data_dir is not None else data_root())
 
 
 def _loss_inputs(batch: dict, device) -> dict:
@@ -1203,12 +1180,11 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         ),
     )
 
-    approved = load_approved_set(cfg)
+    approved = load_approved_set(cfg, data_dir)
     core_recall_target = float(OmegaConf.select(cfg, "val.core_recall_target", default=0.975))
     if approved:
         print(
-            f"approved masks: {len(approved)} in approved.json; "
-            f"train per volume {approved_counts(train_ex, approved)}; "
+            f"approved samples: train per volume {approved_counts(train_ex, approved)}; "
             f"val per volume {approved_counts(val_ex, approved)}"
         )
     batch_size = int(cfg.training.batch_size)

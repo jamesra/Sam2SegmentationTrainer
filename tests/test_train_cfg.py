@@ -82,36 +82,6 @@ class TrainCfgTests(unittest.TestCase):
             list(cfg.eval.val_prompts), ["circle_mask", "correction", "near_correct", "point", "centroid"]
         )
 
-    def test_approved_set_reads_both_formats_and_skips_a_missing_file(self) -> None:
-        import json
-        from tempfile import TemporaryDirectory
-
-        from sam2_segmentation_trainer.train import approved_counts, load_approved_set
-
-        with TemporaryDirectory() as tmp:
-            path = Path(tmp) / "approved.json"
-            path.write_text(
-                json.dumps(
-                    [{"location_id": 7, "image_key": "RC1_0_a"}, [8, "RC2_1_b"], {"location_id": 9}, "junk", {"x": 1}]
-                ),
-                encoding="utf-8",
-            )
-            cfg = load_train_cfg([f"data.approved_path={path.as_posix()}"])
-            self.assertEqual(load_approved_set(cfg), frozenset({(7, "RC1_0_a"), (8, "RC2_1_b"), (9, "")}))
-            missing = load_train_cfg([f"data.approved_path={(Path(tmp) / 'nope.json').as_posix()}"])
-            self.assertEqual(load_approved_set(missing), frozenset())
-            self.assertEqual(load_approved_set(load_train_cfg()), frozenset())
-
-            class Example:
-                def __init__(self, volume, location_id, image_key):
-                    self.volume, self.location_id, self.image_key = volume, location_id, image_key
-
-            counts = approved_counts(
-                [Example("RC1", 7, "RC1_0_a"), Example("RC1", 7, "other"), Example("RC2", 8, "RC2_1_b")],
-                frozenset({(7, "RC1_0_a"), (8, "RC2_1_b")}),
-            )
-            self.assertEqual(counts, {"RC1": 1, "RC2": 1})
-
     def test_out_of_memory_is_recognised_including_the_driver_mapping_failure(self) -> None:
         from sam2_segmentation_trainer.train import _is_oom
 

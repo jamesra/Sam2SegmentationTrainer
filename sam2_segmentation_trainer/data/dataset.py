@@ -22,6 +22,7 @@ from annotation_crops.negatives import (
 )
 from annotation_crops.prompt_encoding import EDGE_TAU_DEPTH_FRAC
 
+from sam2_segmentation_trainer.data.approved import as_approved, is_approved
 from sam2_segmentation_trainer.data.augment import (
     build_train_transform,
     build_val_transform,
@@ -241,7 +242,7 @@ class EMSegDataset(Dataset):
         self.leak_weight = float(leak_weight)
         self.leak_core_px = float(leak_core_px)
         self.core_band_px = float(core_band_px)
-        self.approved = frozenset(approved or ())
+        self.approved = as_approved(approved)
         self.approved_weight = float(approved_weight)
         self.circle_scale = float(circle_scale)
         self.full_tile_threshold = None if full_tile_threshold is None else float(full_tile_threshold)
@@ -461,7 +462,7 @@ class EMSegDataset(Dataset):
         }
 
     def _is_approved(self, example: CropExample) -> bool:
-        return (int(example.location_id), example.image_key) in self.approved
+        return is_approved(self.approved, example)
 
     def _needs_neighbors(self) -> bool:
         """Whether this dataset reads the tile's other annotations even without a mixed prompt (leak, cores)."""

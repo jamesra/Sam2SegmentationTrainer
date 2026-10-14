@@ -202,9 +202,12 @@ data:
   # Validation scores them apart (val/iou_fulltile) and leaves them out of val/iou.
   full_tile_threshold: 0.99
   full_tile_keep_fraction: 0.25
-  # approved.json from the gallery: a list of {"location_id", "image_key"} entries (or [location_id, image_key]
-  # pairs). Those masks are reported as their own row in validation, and counted per volume at start-up. null or a
-  # missing file: warn and skip the row. Keep the file next to the export so runs are reproducible.
+  # The gallery's approved masks. null: read {data_root}/{volume}/approved.json for every volume in data.volumes
+  # (flat or AnnotationCrops layout). Or a file, a directory, or a list of those. Entries are
+  # {"location_id", "image_key"}; an empty image_key approves every window of that location in that volume
+  # (location ids are only unique within a volume). Counts are logged per volume at start-up and a total of 0 warns.
+  # Approved masks are reported as their own validation row, always join the validation subset, and get
+  # approved_weight in training.
   approved_path: null
   # Training weight of Approved masks (2.0 to try).
   approved_weight: 1.0

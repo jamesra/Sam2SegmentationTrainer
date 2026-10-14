@@ -29,6 +29,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from annotation_crops.prompt_encoding import window
+from sam2_segmentation_trainer.data.approved import as_approved, is_approved
 from sam2_segmentation_trainer.data.dataset import VAL_PROMPTS, EMSegDataset, collate_em
 from sam2_segmentation_trainer.goal_metrics import (
     CORE_BAND_PX,
@@ -432,7 +433,7 @@ def select_validation_subset(
     examples = list(examples)
     if fraction >= 1.0 or not examples:
         return examples
-    approved = approved or frozenset()
+    approved = as_approved(approved)
 
     def draw(example) -> float:
         text = f"{seed}|{example.volume}|{example.image_key}|{example.location_id}".encode("utf-8")
@@ -447,7 +448,7 @@ def select_validation_subset(
         for example in sorted(members, key=draw)[:count]:
             chosen.add(id(example))
     for example in examples:
-        if (int(example.location_id), example.image_key) in approved:
+        if is_approved(approved, example):
             chosen.add(id(example))
     return [example for example in examples if id(example) in chosen]
 
@@ -517,7 +518,7 @@ class ValidationSuite:
         self.core_recall_target = float(core_recall_target)
         self.epoch_subset = float(epoch_subset)
         self.seed = int(seed)
-        self.approved = frozenset(approved or ())
+        self.approved = as_approved(approved)
         self._dataset_args = dict(
             split="val",
             image_size=image_size,
