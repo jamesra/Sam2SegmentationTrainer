@@ -341,14 +341,17 @@ def correction_mask(
     max_shift_px: int = 30,
     wobble_px: tuple[float, float] = (10.0, 20.0),
     excursion_px: tuple[float, float] = (15.0, 50.0),
+    merge_reach_px: float = 20.0,
 ) -> tuple[np.ndarray, int | None]:
     """A mask for the model to correct, and the index in ``neighbors`` of a neighbor merged into it (else None).
 
     One of :data:`CORRECTION_KINDS` is drawn (``merge`` only when ``neighbors`` is non-empty):
     grow (tracing outside the membrane), wheel-style scale, outline wobble (an elastic warp with a mean
     displacement of ``U(wobble_px)`` and local excursions up to ``excursion_px[1]``), a CascadePSP-style
-    simplified outline followed by a random grow or shrink, or a union with part of an annotated neighbor. The
-    result always differs from ``mask`` and is never empty; a draw that came out equal falls back to a grow.
+    simplified outline followed by a random grow or shrink, or a union with part of an annotated neighbor. A merge
+    picks among the neighbors within ``merge_reach_px`` of ``mask`` (the ones a tracer could plausibly leak into),
+    or any neighbor when none is that close. The result always differs from ``mask`` and is never empty; a draw
+    that came out equal falls back to a grow.
     """
     mask = np.asarray(mask, dtype=bool)
     kinds = [k for k in CORRECTION_KINDS if k != "merge" or neighbors]
@@ -370,7 +373,10 @@ def correction_mask(
     elif kind == "cascade":
         out = _simplify_and_morph(mask, rng, polygon_tolerance, max_shift_px)
     else:
-        merged = int(rng.integers(len(neighbors)))
+        reach = grow_mask(mask, merge_reach_px)
+        near = [i for i, other in enumerate(neighbors) if (reach & np.asarray(other, dtype=bool)).any()]
+        pool = near or list(range(len(neighbors)))
+        merged = pool[int(rng.integers(len(pool)))]
         other = np.asarray(neighbors[merged], dtype=bool)
         if rng.random() < 0.5:
             other = straight_cut_seed(other, rng, (0.3, 0.9)) if other.any() else other

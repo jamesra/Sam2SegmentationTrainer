@@ -484,7 +484,14 @@ def combined_loss(
 
     ``sample_weight`` (``[B]``, or ``[N]`` without ``variant_index``) scales each sample's loss, for
     ``data.approved_weight``; ``stats["sample_losses"]`` stays unweighted.
+
+    The terms are computed in fp32 whatever the autocast dtype of the predictions: the dice and containment sums
+    run over a million pixels per row, which bf16 cannot add exactly.
     """
+    pred = pred.float()
+    iou_preds = iou_preds.float()
+    if edge_weight is not None:
+        edge_weight = edge_weight.float()
     loss_focal_ps = focal_loss_per_sample(pred, target, weight=edge_weight)
     loss_dice_ps = dice_loss(pred, target, edge_weight)
     loss_iou_ps = iou_prediction_loss_per_sample(

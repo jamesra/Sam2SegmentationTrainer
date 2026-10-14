@@ -95,6 +95,32 @@ class CorrectionTests(unittest.TestCase):
         self.assertGreater(merged_seen, 5)
         self.assertEqual(len(CORRECTION_KINDS), 5)
 
+    def test_a_merge_prefers_neighbors_within_reach(self) -> None:
+        mask = _blob()
+        near = np.zeros_like(mask)
+        near[60:70, 100:125] = True  # touches the blob's right side (within 20 px)
+        far = np.zeros_like(mask)
+        far[0:8, 0:8] = True
+        self.assertLess(distance_transform_edt(~mask)[near].min(), 20.0)
+        self.assertGreater(distance_transform_edt(~mask)[far].min(), 20.0)
+        picked = [
+            correction_mask(mask, np.random.default_rng(s), neighbors=[far, near])[1] for s in range(200)
+        ]
+        merges = [index for index in picked if index is not None]
+        self.assertGreater(len(merges), 10)
+        self.assertEqual(set(merges), {1})  # never the far one while a near one exists
+
+    def test_with_only_far_neighbors_any_of_them_can_be_merged(self) -> None:
+        mask = _blob()
+        far = np.zeros_like(mask)
+        far[0:8, 0:8] = True
+        other = np.zeros_like(mask)
+        other[120:128, 0:8] = True
+        merges = {
+            correction_mask(mask, np.random.default_rng(s), neighbors=[far, other])[1] for s in range(200)
+        } - {None}
+        self.assertEqual(merges, {0, 1})
+
     def test_without_neighbors_nothing_is_merged(self) -> None:
         mask = _blob()
         for seed in range(30):
