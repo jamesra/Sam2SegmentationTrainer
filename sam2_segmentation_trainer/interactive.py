@@ -41,15 +41,13 @@ def error_regions(pred: np.ndarray, gt: np.ndarray, band: float = 0.0) -> tuple[
 
     With ``band`` > 0 (px of this grid) they are the goal errors: ``missed`` is the part of ``gt`` at least ``band``
     inside its edge that is not predicted, ``spurious`` the prediction more than ``band`` outside ``gt``. When both
-    are empty, or ``band`` is 0, the raw differences are returned.
+    are empty, both are returned empty: what is left is trace noise in the edge band, and :func:`next_click` then
+    takes its "no error" path. Only ``band`` 0 gives the raw differences.
     """
     pred = np.asarray(pred, dtype=bool)
     gt = np.asarray(gt, dtype=bool)
-    if band > 0.0 and gt.any():
-        missed = (edge_distance(gt) >= band) & ~pred
-        spurious = pred & ~grow_mask(gt, band)
-        if missed.any() or spurious.any():
-            return missed, spurious
+    if band > 0.0:
+        return (edge_distance(gt) >= band) & ~pred, pred & ~grow_mask(gt, band)
     return gt & ~pred, pred & ~gt
 
 
@@ -60,8 +58,8 @@ def next_click(
 
     The region is chosen by area from the missed pixels (a positive click) and the spurious ones (a negative
     click), as :func:`error_regions` defines them for ``band``, and the click lands at its deepest interior pixel.
-    With no error the click is a positive one inside the target, so an already perfect prediction still gets a
-    harmless extra hint.
+    With no error (with a band: no goal error) the click is a positive one at the deepest target pixel, so an
+    already good prediction still gets a harmless extra hint.
     """
     pred = np.asarray(pred, dtype=bool)
     gt = np.asarray(gt, dtype=bool)

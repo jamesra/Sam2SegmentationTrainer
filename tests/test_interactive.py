@@ -51,11 +51,15 @@ class NextClickTests(unittest.TestCase):
         pred[40:160, 40:48] = False  # misses an 8 px strip along the left edge
         pred[152:160, 40:160] = False  # and the bottom edge
         pred[30:40, 60:140] = True  # adds an 8 px strip outside the top edge
-        # With nothing but the wobble left, the raw regions are the fallback (the click is harmless).
+        # With nothing but the wobble left there is no goal error: no raw fallback, the "no error" click is used.
         missed, spurious = error_regions(pred, gt, band=10.0)
         raw_missed, raw_spurious = error_regions(pred, gt, band=0.0)
-        self.assertTrue(raw_missed.any() and raw_spurious.any())
-        self.assertTrue((missed == raw_missed).all() and (spurious == raw_spurious).all())
+        self.assertTrue(raw_missed.any() and raw_spurious.any())  # band 0 keeps the raw differences
+        self.assertFalse(missed.any() or spurious.any())
+        for seed in range(10):
+            x, y, label = next_click(pred, gt, np.random.default_rng(seed), band=10.0)
+            self.assertEqual(label, 1)
+            self.assertTrue(abs(x - 99.5) <= 1 and abs(y - 99.5) <= 1, (x, y))  # the deepest target pixel
         # A real miss deeper than the band does get the click, however the area compares with the wobble.
         pred[90:110, 90:110] = False
         missed, spurious = error_regions(pred, gt, band=10.0)
