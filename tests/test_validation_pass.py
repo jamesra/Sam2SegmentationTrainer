@@ -117,7 +117,7 @@ class FamilyDatasetTests(unittest.TestCase):
             self.assertEqual(tuple(by_family[name]["dense_mask"].shape), (256, 256))
         for name in ("correction", "near_correct"):
             self.assertIsNotNone(by_family[name]["prompt_input"])
-        self.assertEqual(set(item["gt_terms"]), {"core", "grown", "components", "area"})
+        self.assertEqual(set(item["gt_terms"]), {"core", "grown", "components", "area", "depth"})
         self.assertEqual(tuple(item["neighbor_core"].shape), (32, 32))
 
     def test_prompts_do_not_depend_on_family_order_or_position(self) -> None:

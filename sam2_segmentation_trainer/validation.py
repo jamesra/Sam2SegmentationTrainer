@@ -36,6 +36,7 @@ from sam2_segmentation_trainer.goal_metrics import (
     CORE_RECALL_TARGET,
     MERGE_MIN_PX,
     MIN_COMPONENT_PX,
+    DepthBin,
     GoalSummary,
     SelectionKey,
     add_goal_fields,
@@ -43,6 +44,7 @@ from sam2_segmentation_trainer.goal_metrics import (
     sample_goal_metrics,
     sample_no_harm,
     selection_key,
+    summarize_by_depth,
     summarize_goal,
 )
 from sam2_segmentation_trainer.metrics import boundary_f1_multi, iou_dice_pr, tolerant_iou
@@ -95,6 +97,10 @@ class ModeResult:
     no_harm: float | None = None
     by_volume: dict[str, float] = field(default_factory=dict)
     by_category: dict[str, float] = field(default_factory=dict)
+    goal_by_volume: dict[str, GoalSummary] = field(default_factory=dict)
+    goal_by_category: dict[str, GoalSummary] = field(default_factory=dict)
+    recall_by_depth: dict[str, DepthBin] = field(default_factory=dict)
+    """Core recall by the ground truth's maximum depth (see ``goal_metrics.DEPTH_BINS``)."""
     approved_by_volume: dict[str, int] = field(default_factory=dict)
     fulltile_iou: float | None = None
     fulltile_n: int = 0
@@ -123,6 +129,14 @@ def summarize_mode(records: Sequence[dict[str, Any]], *, target: float = CORE_RE
     result.bf10 = float(np.mean([r.get("bf10", 0.0) for r in scored]))
     result.bf20 = float(np.mean([r.get("bf20", 0.0) for r in scored]))
     result.goal = summarize_goal(scored, target=target)
+    result.recall_by_depth = summarize_by_depth(scored)
+    for field_name, goals in (("volume", result.goal_by_volume), ("category", result.goal_by_category)):
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for record in scored:
+            name = str(record.get(field_name) or "").strip()
+            if name:
+                groups.setdefault(name, []).append(record)
+        goals.update({name: summarize_goal(rows, target=target) for name, rows in sorted(groups.items())})
     with_input = [r for r in scored if "input_core_gt" in r]
     if with_input:
         result.input_goal = summarize_goal(with_input, prefix="input_", target=target)
@@ -252,6 +266,7 @@ def score_sample(
     }
     if truth is None:
         truth = ground_truth_terms(gt_np, band, MIN_COMPONENT_PX)
+    record["gt_depth"] = truth.get("depth")
     add_goal_fields(record, sample_goal_metrics(pred_np, gt_np, neighbor_core, band=band, merge_min_px=merge_min_px, cache=truth))
     if input_np is not None and bool(input_np.any()):
         record["input_iou"] = tolerant_iou(input_np, gt_np, weight_np)
@@ -661,6 +676,23 @@ def _log_goal(writer, root: str, mode: str, goal: GoalSummary, epoch: int) -> No
         writer.add_scalar(f"{root}/{tag}/{mode}", getattr(goal, attribute), epoch)
 
 
+BREAKDOWN_TAGS = ("core_recall", "core_recall_p10", "merge_rate", "spill")
+"""The goal metrics logged per category and per volume on full passes."""
+
+
+def _log_breakdown(writer, root: str, mode: str, result: ModeResult, epoch: int) -> None:
+    """Per-category (``<root>_cat``), per-volume (``<root>_vol``) and per-depth (``<root>_depth``) goal metrics."""
+    for suffix, groups in (("cat", result.goal_by_category), ("vol", result.goal_by_volume)):
+        for name, goal in groups.items():
+            for tag in BREAKDOWN_TAGS:
+                writer.add_scalar(f"{root}_{suffix}/{tag}/{mode}/{name}", getattr(goal, tag), epoch)
+    for name, bin_ in result.recall_by_depth.items():
+        writer.add_scalar(f"{root}_depth/n/{mode}/{name}", bin_.n, epoch)
+        writer.add_scalar(f"{root}_depth/with_core/{mode}/{name}", bin_.with_core, epoch)
+        for tag, value in (("core_recall", bin_.core_recall), ("mean_recall", bin_.mean_recall), ("core_recall_p10", bin_.p10)):
+            writer.add_scalar(f"{root}_depth/{tag}/{mode}/{name}", value, epoch)
+
+
 def log_results(
     writer,
     epoch: int,
@@ -678,7 +710,9 @@ def log_results(
     ``<root>_approved/<metric>/<mode>``. The per-epoch subset pass logs under ``val_subset`` and the full pass
     under ``val_full``, so the two never mix; with ``root="val_subset"`` the old names ``val/iou`` and
     ``val_iou/{volume}`` are also written, carrying the primary mode's tolerant IoU (a diagnostic) for existing
-    dashboards. ``label`` names the pass in the summary line.
+    dashboards. ``label`` names the pass in the summary line. A full pass (``root="val_full"``) also logs the
+    goal metrics per category (``val_full_cat/<metric>/<mode>/<category>``), per volume (``val_full_vol/...``) and
+    core recall by the ground truth's maximum depth (``val_full_depth/<metric>/<mode>/<bin>``).
     """
     for mode, result in results.items():
         writer.add_scalar(f"{root}/iou/{mode}", result.iou, epoch)
@@ -686,6 +720,8 @@ def log_results(
         writer.add_scalar(f"{root}/bf10/{mode}", result.bf10, epoch)
         writer.add_scalar(f"{root}/bf20/{mode}", result.bf20, epoch)
         _log_goal(writer, root, mode, result.goal, epoch)
+        if root == "val_full":
+            _log_breakdown(writer, root, mode, result, epoch)
         if result.input_goal is not None:
             _log_goal(writer, f"{root}/input", mode, result.input_goal, epoch)
             for tag, attribute in _GOAL_TAGS:
@@ -711,7 +747,7 @@ def log_results(
         writer.add_scalar("val/iou", main.iou, epoch)
         for volume, score in main.by_volume.items():
             writer.add_scalar(f"val_iou/{volume}", score, epoch)
-    return format_summary(epoch, results, primary, target, label=label)
+    return format_summary(epoch, results, primary, target, label=label, detail=root == "val_full")
 
 
 def _goal_text(goal: GoalSummary) -> str:
@@ -722,10 +758,24 @@ def _goal_text(goal: GoalSummary) -> str:
     )
 
 
+def _depth_text(bins: dict[str, DepthBin]) -> str:
+    names = {"lt20": "<20 px", "20_60": "20-60 px", "ge60": ">=60 px"}
+    return ", ".join(
+        f"{names.get(name, name)}: {b.mean_recall:.3f} (n={b.n}, {b.n - b.with_core} without a core)"
+        for name, b in bins.items()
+    )
+
+
 def format_summary(
-    epoch: int, results: dict[str, ModeResult], primary: str, target: float, *, label: str | None = None
+    epoch: int,
+    results: dict[str, ModeResult],
+    primary: str,
+    target: float,
+    *,
+    label: str | None = None,
+    detail: bool = False,
 ) -> str:
-    """The one-line transcript summary of an epoch's validation."""
+    """The one-line transcript summary of an epoch's validation; ``detail`` adds the recall by ground-truth depth."""
     main = results[primary]
     name = f"{label} " if label else ""
     text = (
@@ -749,4 +799,6 @@ def format_summary(
         text += "; other prompts: " + "; ".join(others)
     if main.fulltile_iou is not None:
         text += f"; fully masked tiles ({main.fulltile_n}): IoU {main.fulltile_iou:.4f}"
+    if detail and main.recall_by_depth:
+        text += f"; mean per-sample core recall by depth, {_depth_text(main.recall_by_depth)}"
     return text

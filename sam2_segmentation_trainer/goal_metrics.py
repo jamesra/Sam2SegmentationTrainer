@@ -56,11 +56,13 @@ def ground_truth_terms(gt: np.ndarray, band: float, min_component: int) -> dict[
     several predictions (the output and the input mask) against one ground truth without recomputing it."""
     gt = np.asarray(gt).astype(bool)
     has = bool(gt.any())
+    depth = edge_distance(gt) if has else None
     return {
-        "core": (edge_distance(gt) >= band) if has else np.zeros(gt.shape, dtype=bool),
+        "core": (depth >= band) if has else np.zeros(gt.shape, dtype=bool),
         "grown": grow_mask(gt, band) if has else np.zeros(gt.shape, dtype=bool),
         "components": _components(gt, min_component),
         "area": int(gt.sum()),
+        "depth": float(depth.max()) if has else 0.0,
     }
 
 
@@ -136,6 +138,41 @@ class GoalSummary:
     merge_rate: float = 0.0
     spill: float = 0.0
     frag: float = 0.0
+
+
+DEPTH_BINS = (("lt20", 0.0, 20.0), ("20_60", 20.0, 60.0), ("ge60", 60.0, float("inf")))
+"""Bins of a ground truth's maximum depth (px from its edge): thin processes, medium cells, large cells. A profile
+under about 20 px wide has a maximum depth under 10 and no core at all."""
+
+
+@dataclass(slots=True)
+class DepthBin:
+    """Core recall of the samples whose ground truth has a maximum depth in one :data:`DEPTH_BINS` bin."""
+
+    n: int = 0
+    with_core: int = 0
+    """Samples that have a core (the others have no recall)."""
+    core_recall: float = 0.0
+    """Pooled over the bin's core pixels."""
+    mean_recall: float = 0.0
+    """The mean of the per-sample core recall: every sample counts the same, thin or large."""
+    p10: float = 0.0
+
+
+def summarize_by_depth(records: Sequence[dict[str, Any]]) -> dict[str, DepthBin]:
+    """Per-sample core recall stratified by ``gt_depth``; pooled recall is dominated by large cells."""
+    out: dict[str, DepthBin] = {}
+    for name, low, high in DEPTH_BINS:
+        rows = [r for r in records if r.get("gt_depth") is not None and low <= r["gt_depth"] < high]
+        summary = DepthBin(n=len(rows))
+        recalls = [r["recall"] for r in rows if r.get("recall") is not None]
+        summary.with_core = len(recalls)
+        if recalls:
+            summary.core_recall = sum(r["core_hit"] for r in rows) / max(sum(r["core_gt"] for r in rows), 1)
+            summary.mean_recall = float(np.mean(recalls))
+            summary.p10 = float(np.percentile(recalls, 10))
+        out[name] = summary
+    return out
 
 
 def summarize_goal(
