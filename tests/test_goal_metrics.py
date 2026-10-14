@@ -99,6 +99,34 @@ class SampleMetricsTests(unittest.TestCase):
             pred[rows[order][:take], cols[order][:take]] = True
         self.assertFalse(sample_goal_metrics(pred, GT, labels)["merge"])
 
+    def test_a_stray_blob_into_a_tile_clipped_neighbor_is_not_a_merge(self) -> None:
+        # The neighbor runs off the tile: only a 10 x 40 strip of its core is visible (400 px).
+        labels = np.zeros(GT.shape, dtype=np.int16)
+        labels[100:140, 280:290] = 1
+        blob = GT.copy()
+        blob[100:106, 280:290] = True  # 60 px: 15% of the visible core, far from a real leak
+        m = sample_goal_metrics(blob, GT, labels)
+        self.assertEqual(m["leak_px"], 60)
+        self.assertFalse(m["merge"])
+        # A neighbor with a big visible core needs at least merge_min_px, whatever 5% of it is.
+        labels = np.zeros(GT.shape, dtype=np.int16)
+        labels[20:120, 170:290] = 1  # 12,000 px: 5% is 600
+        for covered, expected in ((550, False), (610, True)):
+            pred = GT.copy()
+            flat = np.flatnonzero(labels == 1)[:covered]
+            pred.reshape(-1)[flat] = True
+            self.assertEqual(sample_goal_metrics(pred, GT, labels)["merge"], expected, covered)
+        # 5% of a 8,000 px core is 400: the 500 px floor decides.
+        labels = np.zeros(GT.shape, dtype=np.int16)
+        labels[20:120, 170:250] = 1
+        for covered, expected in ((450, False), (520, True)):
+            pred = GT.copy()
+            pred.reshape(-1)[np.flatnonzero(labels == 1)[:covered]] = True
+            self.assertEqual(sample_goal_metrics(pred, GT, labels)["merge"], expected, covered)
+        pred = GT.copy()
+        pred.reshape(-1)[np.flatnonzero(labels == 1)[:450]] = True
+        self.assertTrue(sample_goal_metrics(pred, GT, labels, merge_min_px=100)["merge"])
+
     def test_fragmentation_counts_components_of_at_least_200_pixels(self) -> None:
         pred = GT.copy()
         pred[10:30, 200:220] = True  # 400 px: a second piece

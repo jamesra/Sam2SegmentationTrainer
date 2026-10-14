@@ -6,7 +6,8 @@ band of ``b`` px (``val.core_band_px``, 10) around the traced edge:
 
 * **core recall**: the share of ground-truth pixels at least ``b`` inside the edge that are predicted;
 * **leak**: the share of predicted pixels inside a neighbor's core (at least ``b`` inside the neighbor);
-* **merge**: the sample's prediction covers at least ``merge_share`` (5%) of any one neighbor's core;
+* **merge**: the sample's prediction covers at least ``merge_share`` (5%) of any one neighbor's visible core and at
+  least ``merge_min_px`` (500) px of it, so a stray blob into a neighbor clipped by the tile edge is not a merge;
 * **spill**: predicted area more than ``b`` outside the ground truth, as a share of the ground-truth area (it
   catches leaks into cells nobody annotated, which leak cannot see);
 * **fragmentation**: the prediction has more connected components (of at least ``min_component`` px) than the
@@ -28,6 +29,8 @@ from sam2_segmentation_trainer.data.refine import grow_mask
 
 CORE_BAND_PX = 10.0
 MERGE_SHARE = 0.05
+MERGE_MIN_PX = 500
+"""Pixels of one neighbor's core a prediction must cover before it counts as a merge (``val.merge_min_px``)."""
 MIN_COMPONENT_PX = 200
 CORE_RECALL_TARGET = 0.975
 NO_HARM_RECALL = 0.005
@@ -68,6 +71,7 @@ def sample_goal_metrics(
     *,
     band: float = CORE_BAND_PX,
     merge_share: float = MERGE_SHARE,
+    merge_min_px: int = MERGE_MIN_PX,
     min_component: int = MIN_COMPONENT_PX,
     cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -102,7 +106,8 @@ def sample_goal_metrics(
             covered = np.bincount(inside, minlength=top + 1)[1:]
             totals = np.bincount(labels.ravel(), minlength=top + 1)[1:]
             present = totals > 0
-            merge = bool(np.any(covered[present] >= merge_share * totals[present]))
+            needed = np.maximum(merge_share * totals[present], float(merge_min_px))
+            merge = bool(np.any(covered[present] >= needed))
     return {
         "core_gt": core_gt,
         "core_hit": core_hit,

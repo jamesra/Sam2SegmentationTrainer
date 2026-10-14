@@ -287,6 +287,9 @@ val:
   # Pixels within this many px of a traced edge are ignored by core recall, leak and spill, and a neighbor's core
   # is the part of it at least this far inside. Traces are about 9 px from the membrane on average.
   core_band_px: 10
+  # A merge (the checkpoint-selecting rate) needs the prediction to cover this many px of one neighbor's visible core,
+  # as well as 5% of it. A stray blob into a neighbor clipped by the tile edge is not a merge.
+  merge_min_px: 500
   # Checkpoint gate. Among epochs whose pooled core recall on the primary prompt is at least this, best_model.pt
   # is the one with the lowest merge rate (spill breaks ties); if none reaches it, the highest core recall.
   core_recall_target: 0.975

@@ -61,7 +61,7 @@ from sam2_segmentation_trainer.data.manifest import (
     volume_counts,
 )
 from sam2_segmentation_trainer.data.fulltile import cap_full_tiles, is_full_tile
-from sam2_segmentation_trainer.goal_metrics import EARLY_STOPPING_MIN_DELTA, SelectionKey, improves
+from sam2_segmentation_trainer.goal_metrics import EARLY_STOPPING_MIN_DELTA, MERGE_MIN_PX, SelectionKey, improves
 from sam2_segmentation_trainer.interactive import iterative_predict_masks
 from sam2_segmentation_trainer.validation import (
     DEFAULT_VAL_PROMPTS,
@@ -299,6 +299,7 @@ def _time_validation_suite(
             image_size,
             threshold,
             core_band_px=val_suite.core_band_px,
+            merge_min_px=val_suite.merge_min_px,
             metric_threads=val_suite.metric_threads,
             timings=timings,
         )
@@ -1230,6 +1231,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         edge_weight_min=_edge_loss_settings(cfg)[1],
         edge_tau_depth_frac=_tau_depth_frac(cfg),
         core_band_px=_leak_settings(cfg)[1],
+        merge_min_px=int(OmegaConf.select(cfg, "val.merge_min_px", default=MERGE_MIN_PX)),
         core_recall_target=core_recall_target,
         approved=approved,
         epoch_subset=float(OmegaConf.select(cfg, "val.epoch_subset", default=0.25)),

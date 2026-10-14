@@ -34,6 +34,7 @@ from sam2_segmentation_trainer.data.dataset import VAL_PROMPTS, EMSegDataset, co
 from sam2_segmentation_trainer.goal_metrics import (
     CORE_BAND_PX,
     CORE_RECALL_TARGET,
+    MERGE_MIN_PX,
     MIN_COMPONENT_PX,
     GoalSummary,
     SelectionKey,
@@ -209,6 +210,7 @@ def score_sample(
     input_np: np.ndarray | None,
     mode: str | None,
     band: float,
+    merge_min_px: int = MERGE_MIN_PX,
     truth: dict[str, Any] | None = None,
     crop: bool = True,
 ) -> dict[str, Any]:
@@ -250,11 +252,12 @@ def score_sample(
     }
     if truth is None:
         truth = ground_truth_terms(gt_np, band, MIN_COMPONENT_PX)
-    add_goal_fields(record, sample_goal_metrics(pred_np, gt_np, neighbor_core, band=band, cache=truth))
+    add_goal_fields(record, sample_goal_metrics(pred_np, gt_np, neighbor_core, band=band, merge_min_px=merge_min_px, cache=truth))
     if input_np is not None and bool(input_np.any()):
         record["input_iou"] = tolerant_iou(input_np, gt_np, weight_np)
         add_goal_fields(
-            record, sample_goal_metrics(input_np, gt_np, neighbor_core, band=band, cache=truth), "input_"
+            record, sample_goal_metrics(input_np, gt_np, neighbor_core, band=band, merge_min_px=merge_min_px, cache=truth),
+            "input_"
         )
     return record
 
@@ -269,6 +272,7 @@ def collect_records(
     overlays_per_volume: int = 0,
     mode: str | None = None,
     core_band_px: float = CORE_BAND_PX,
+    merge_min_px: int = MERGE_MIN_PX,
     timings: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, np.ndarray]]]:
     """Score every batch of ``loader``, one prompt per sample. Returns per-sample records and overlay strips.
@@ -309,6 +313,7 @@ def collect_records(
                         input_np=None if inputs is None else inputs[index].numpy() > 0,
                         mode=mode,
                         band=core_band_px,
+                        merge_min_px=merge_min_px,
                     )
                     if timings is not None:
                         timings["metrics_s"] = timings.get("metrics_s", 0.0) + time.perf_counter() - started
@@ -335,6 +340,7 @@ def collect_family_records(
     threshold: float,
     *,
     core_band_px: float = CORE_BAND_PX,
+    merge_min_px: int = MERGE_MIN_PX,
     metric_threads: int = 4,
     overlays_per_volume: int = 0,
     overlay_family: str | None = None,
@@ -390,6 +396,7 @@ def collect_family_records(
                         input_np=input_np,
                         mode=family,
                         band=core_band_px,
+                        merge_min_px=merge_min_px,
                         truth=terms[b],
                     )
                     pending.append((family, future))
@@ -492,6 +499,7 @@ class ValidationSuite:
         edge_weight_min: float = 0.05,
         edge_tau_depth_frac: float = 0.25,
         core_band_px: float = CORE_BAND_PX,
+        merge_min_px: int = MERGE_MIN_PX,
         core_recall_target: float = CORE_RECALL_TARGET,
         approved: frozenset | set | None = None,
         epoch_subset: float = 1.0,
@@ -515,6 +523,7 @@ class ValidationSuite:
         self.batch_size = max(1, int(batch_size))
         self.metric_threads = max(1, int(metric_threads))
         self.core_band_px = float(core_band_px)
+        self.merge_min_px = int(merge_min_px)
         self.core_recall_target = float(core_recall_target)
         self.epoch_subset = float(epoch_subset)
         self.seed = int(seed)
@@ -608,6 +617,7 @@ class ValidationSuite:
             image_size,
             threshold,
             core_band_px=self.core_band_px,
+            merge_min_px=self.merge_min_px,
             metric_threads=self.metric_threads,
             overlays_per_volume=overlays_per_volume,
             overlay_family=self.primary,
