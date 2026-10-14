@@ -294,7 +294,7 @@ Removed: `prompt.prob_full_mask`, `prompt.prob_negative_only`, `negative.allow_c
 
 **Phase C: correction training.**
 1. Correction masks from the model's own predictions, used for about half of the correction samples (as in μSAM). Open.
-2. Correction clicks sampled from the error region (as in SAM, SAM 2 and RITM). **Done** (`iterative.*`): 20% of batches run 2–6 rounds of predict, click, feed back the previous logits, with only the last pass carrying gradients. Clicks target goal errors (a positive click in the part of the core the prediction misses, a negative one beyond the core band), and fall back to the raw error regions when there are none.
+2. Correction clicks sampled from the error region (as in SAM, SAM 2 and RITM). **Done** (`iterative.*`): 20% of batches run 2–6 rounds of predict, click, feed back the previous logits, with only the last pass carrying gradients. Clicks target goal errors (a positive click in the part of the core the prediction misses, a negative one beyond the core band), and with no goal error the click is a positive one at the deepest target pixel (never a click on edge-band noise).
 
 **Phase D: production.**
 1. The server uses the shared encoding.

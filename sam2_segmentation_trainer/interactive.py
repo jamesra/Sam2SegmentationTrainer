@@ -8,8 +8,9 @@ clicks (NoC@90) the standard interactive-segmentation benchmarks report.
 
 Clicks target the errors the project cares about, not trace noise: with a core band ``b`` the missed region is the
 part of the ground truth at least ``b`` px inside its edge that the prediction lacks, and the spurious region is the
-prediction more than ``b`` px outside the ground truth (see ``goal_metrics``). Raw error regions are used only when
-both are empty. A band of 0 gives the raw regions.
+prediction more than ``b`` px outside the ground truth (see ``goal_metrics``). When both are empty the
+click is the usual positive one at the deepest target pixel, never a click on edge-band noise. Only a band of 0
+gives the raw regions.
 """
 
 from __future__ import annotations
