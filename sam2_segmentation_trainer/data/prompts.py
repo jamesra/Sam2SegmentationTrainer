@@ -1,11 +1,13 @@
-"""Prompt construction for mixed-prompt SAM2 training (points, boxes, dense masks, negative context).
+"""Prompt construction for mixed-prompt SAM2 training (points, boxes, seeds, masks to correct, negative context).
 
 Everything here works on numpy arrays that are already augmented, in tile pixel space with the origin at the
 top-left (x right, y down), so it needs neither torch nor SAM2 and can be tested alone.
 
 Prompt meanings follow ``.claude/rules/sam2-prompt-semantics.md``: a box is only a hint that the object is most
-likely inside, so no loss here forces predictions into it; a dense mask is a strong per-pixel statement
-("everything inside is foreground, or background for the -1 regions") that the engine may grow beyond.
+likely inside, so no loss here forces predictions into it. A dense mask is one of two things
+(docs/mask_refinement_plan.md): a *seed*, trusted inside the cell, that the engine grows beyond, or a *mask to
+correct*, a suggestion that may be wrong. The full ground-truth mask is never a prompt. Mask values are scaled by
+the edge confidence curve, built by :mod:`annotation_crops.prompt_encoding`, which the server shares.
 """
 
 from __future__ import annotations
@@ -17,27 +19,29 @@ from typing import Any, Collection, Mapping
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from sam2_segmentation_trainer.data.corrupt import corrupt_mask
-from annotation_crops.negatives import (
-    KIND_CIRCLE,
-    NegativeRegion,
-    combine_signed,
-    stamp_negative_regions,
+from annotation_crops.negatives import KIND_CIRCLE, KIND_POLYGON, NegativeRegion
+from annotation_crops.prompt_encoding import (
+    CORRECTION_LOGIT,
+    EDGE_TAU_DEPTH_FRAC,
+    EDGE_TAU_PX,
+    LOW_RES,
+    SEED_LOGIT,
+    edge_confidence,
+    encode_mask_input,
+    negative_canvas,
+    window,
+)
+from sam2_segmentation_trainer.data.refine import (
+    correction_mask,
+    fit_adjacent_seed,
+    near_correct_mask,
+    subset_seed,
 )
 
-LOW_RES = 256
-"""Side of SAM2's ``mask_input`` for a 1024 image (4x the 64x64 image embedding)."""
+__all__ = ["LOW_RES"]
 
-MASK_PROMPT_LOGIT = 10.0
-"""Logit a signed mask value of +/-1 is fed to the prompt encoder as.
-
-SAM2's ``mask_downscaling`` network was trained on the low-resolution *logits* of earlier predictions, and the
-segmentation server's ``_as_sam2_mask_input`` passes such logits clipped to +/-20. So +1 becomes
-``+MASK_PROMPT_LOGIT``, -1 becomes ``-MASK_PROMPT_LOGIT`` and 0 (unknown) stays 0. Whatever later turns a 1-bit
-foreground or background mask Feature into ``mask_input`` at inference must use these same values, or the
-trained mask network sees a different scale than it was trained on.
-"""
-
+MASK_PROMPT_LOGIT = SEED_LOGIT
+"""Logit a fully trusted seed pixel is fed to the prompt encoder as (alias of ``SEED_LOGIT``)."""
 
 _MAX_CANDIDATES = 20000
 """Interior pixels considered when placing points; larger sets are randomly thinned to keep this cheap."""
@@ -49,14 +53,23 @@ class PromptType(str, Enum):
     POINTS = "points"
     BOX = "box"
     BOX_POINTS = "box_points"
-    CIRCLE_MASK = "circle_mask"
-    FULL_MASK = "full_mask"
-    NEGATIVE_ONLY = "negative_only"
-    CORRUPTED_MASK = "corrupted_mask"
+    CIRCLE_SEED = "circle_seed"
+    ADJACENT_SEED = "adjacent_seed"
+    SUBSET_SEED = "subset_seed"
+    CORRECTION = "correction"
+    NEAR_CORRECT = "near_correct"
 
 
-FULL_TILE_PROMPTS = frozenset({PromptType.POINTS, PromptType.CIRCLE_MASK})
-"""Prompt types a fully masked tile may draw: nothing that hands the model the answer or a boundary to find."""
+SEED_PROMPTS = frozenset({PromptType.CIRCLE_SEED, PromptType.ADJACENT_SEED, PromptType.SUBSET_SEED})
+"""Families whose dense mask is a trusted seed (the mask-containment loss applies to their core)."""
+
+FULL_TILE_PROMPTS = frozenset({PromptType.POINTS, PromptType.CIRCLE_SEED})
+"""Prompt types a fully masked tile may draw: it has no edge to refine, so no box, correction or cut seed."""
+
+
+def _pair(value: Any) -> tuple[float, float]:
+    low, high = (float(v) for v in value)
+    return low, high
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,10 +79,25 @@ class PromptConfig:
     prob_points_only: float = 0.10
     prob_box_only: float = 0.05
     prob_box_points: float = 0.05
-    prob_circle_mask: float = 0.45
-    prob_full_mask: float = 0.30
-    prob_negative_only: float = 0.05
-    prob_corrupted_mask: float = 0.0
+    prob_circle_seed: float = 0.40
+    prob_adjacent_seed: float = 0.15
+    prob_subset_seed: float = 0.10
+    prob_correction: float = 0.10
+    prob_near_correct: float = 0.05
+    variants_per_sample: int = 3
+    edge_tau_px: float = EDGE_TAU_PX
+    edge_tau_depth_frac: float = EDGE_TAU_DEPTH_FRAC
+    seed_logit: float = SEED_LOGIT
+    correction_logit: float = CORRECTION_LOGIT
+    adjacent_fit_inside: float = 0.98
+    adjacent_fit_grow_px: float = 10.0
+    adjacent_scale_range: tuple[float, float] = (0.7, 1.0)
+    erode_px: tuple[float, float] = (10.0, 40.0)
+    dilate_px: tuple[float, float] = (5.0, 50.0)
+    scale_range: tuple[float, float] = (0.8, 1.25)
+    correction_wobble_px: tuple[float, float] = (10.0, 20.0)
+    near_correct_wobble_px: tuple[float, float] = (5.0, 12.0)
+    near_correct_excursion_px: tuple[float, float] = (15.0, 30.0)
     box_jitter_frac: float = 0.15
     box_points_max: int = 3
     min_edge_px: float = 15.0
@@ -78,12 +106,8 @@ class PromptConfig:
     bg_point_prob_circle: float = 0.25
     bg_point_prob_polygon: float = 0.15
     cache_size: int = 64
-    allow_circle_targets: bool = False
-    circle_target_fraction: float = 0.05
     drop_overlapping_circles: bool = False
-    corrupt_max_shift_px: int = 12
-    corrupt_stroke_keep_min: float = 0.40
-    corrupt_stroke_keep_max: float = 0.90
+    corrupt_max_shift_px: int = 30
     corrupt_polygon_tolerance: float = 0.04
 
     def probabilities(self) -> dict[PromptType, float]:
@@ -92,10 +116,11 @@ class PromptConfig:
             PromptType.POINTS: self.prob_points_only,
             PromptType.BOX: self.prob_box_only,
             PromptType.BOX_POINTS: self.prob_box_points,
-            PromptType.CIRCLE_MASK: self.prob_circle_mask,
-            PromptType.FULL_MASK: self.prob_full_mask,
-            PromptType.NEGATIVE_ONLY: self.prob_negative_only,
-            PromptType.CORRUPTED_MASK: self.prob_corrupted_mask,
+            PromptType.CIRCLE_SEED: self.prob_circle_seed,
+            PromptType.ADJACENT_SEED: self.prob_adjacent_seed,
+            PromptType.SUBSET_SEED: self.prob_subset_seed,
+            PromptType.CORRECTION: self.prob_correction,
+            PromptType.NEAR_CORRECT: self.prob_near_correct,
         }
 
     def validate(self) -> None:
@@ -110,15 +135,37 @@ class PromptConfig:
             raise ValueError("prompt.line_frac_min/line_frac_max must satisfy 0 <= min <= max <= 1")
         if self.box_points_max < 1:
             raise ValueError("prompt.box_points_max must be >= 1")
-        if not 0.0 <= self.corrupt_stroke_keep_min <= self.corrupt_stroke_keep_max <= 1.0:
-            raise ValueError("prompt.corrupt_stroke_keep_min/max must satisfy 0 <= min <= max <= 1")
+        if self.variants_per_sample < 1:
+            raise ValueError("prompt.variants_per_sample must be >= 1")
+        if self.edge_tau_px < 0.0:
+            raise ValueError("prompt.edge_tau_px must be >= 0 (0 disables the edge curve)")
+        if self.seed_logit <= 0.0 or self.correction_logit <= 0.0:
+            raise ValueError("prompt.seed_logit and prompt.correction_logit must be > 0")
+        if not 0.0 < self.adjacent_fit_inside <= 1.0:
+            raise ValueError("prompt.adjacent_fit_inside must be within (0, 1]")
+        if self.adjacent_fit_grow_px < 0.0:
+            raise ValueError("prompt.adjacent_fit_grow_px must be >= 0")
+        if self.edge_tau_depth_frac < 0.0:
+            raise ValueError("prompt.edge_tau_depth_frac must be >= 0 (0 disables the thin-process cap)")
+        for name in (
+            "adjacent_scale_range",
+            "erode_px",
+            "dilate_px",
+            "scale_range",
+            "correction_wobble_px",
+            "near_correct_wobble_px",
+            "near_correct_excursion_px",
+        ):
+            low, high = getattr(self, name)
+            if not 0.0 < low <= high:
+                raise ValueError(f"prompt.{name} must satisfy 0 < low <= high")
         if self.corrupt_max_shift_px < 1:
             raise ValueError("prompt.corrupt_max_shift_px must be >= 1")
         if self.corrupt_polygon_tolerance <= 0.0:
             raise ValueError("prompt.corrupt_polygon_tolerance must be > 0")
         if not isinstance(self.drop_overlapping_circles, bool):
             raise ValueError("negative.drop_overlapping_circles must be true or false")
-        for name in ("bg_point_prob_circle", "bg_point_prob_polygon", "circle_target_fraction"):
+        for name in ("bg_point_prob_circle", "bg_point_prob_polygon"):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"negative.{name} must be within [0, 1]")
 
@@ -142,7 +189,12 @@ class PromptConfig:
                 continue
             default = getattr(defaults, name)
             raw = merged[name]
-            kwargs[name] = bool(raw) if isinstance(default, bool) else type(default)(raw)
+            if isinstance(default, tuple):
+                kwargs[name] = _pair(raw)
+            elif isinstance(default, bool):
+                kwargs[name] = bool(raw)
+            else:
+                kwargs[name] = type(default)(raw)
         config = cls(**kwargs)
         config.validate()
         return config
@@ -154,9 +206,11 @@ class PromptSample:
 
     ``point_coords``/``point_labels`` are foreground (1) and background (0) points, possibly none.
     ``box`` is (x1, y1, x2, y2) or None. ``dense_logits`` is the 256x256 float mask prompt (see
-    :data:`MASK_PROMPT_LOGIT`) or None, meaning "use the learned no-mask embedding".
-    ``foreground_region`` is the full-resolution +1 area of the dense mask (after negatives are carved out) for
-    the mask-containment loss, or None when the dense mask has no foreground.
+    :mod:`annotation_crops.prompt_encoding`) or None, meaning "use the learned no-mask embedding".
+    ``foreground_weight`` is the full-resolution trust of a seed (its edge confidence, zero where a negative
+    covers it) for the mask-containment loss, or None when the prompt has no seed.
+    ``input_mask`` is the full-resolution boolean seed or mask to correct, for scoring how far the model moved
+    away from it; None when the prompt has no such mask.
     """
 
     prompt_type: PromptType
@@ -164,7 +218,8 @@ class PromptSample:
     point_labels: np.ndarray
     box: np.ndarray | None = None
     dense_logits: np.ndarray | None = None
-    foreground_region: np.ndarray | None = None
+    foreground_weight: np.ndarray | None = None
+    input_mask: np.ndarray | None = None
 
 
 def benford_count(rng: np.random.Generator, max_count: int = 9) -> int:
@@ -193,14 +248,16 @@ def sample_points_in_mask(
     """
     if count <= 0 or not mask.any():
         return np.zeros((0, 2), dtype=np.float32)
-    depth = distance_transform_edt(mask)
+    box = window(mask, 1)
+    depth = distance_transform_edt(mask[box])
     peak = float(depth.max())
     threshold = min(float(min_edge_px), peak * 0.5)
-    candidates = np.argwhere(depth >= max(threshold, 0.5))[:, ::-1].astype(np.float32)
+    offset = np.array([box[1].start, box[0].start], dtype=np.float32)
+    candidates = np.argwhere(depth >= max(threshold, 0.5))[:, ::-1].astype(np.float32) + offset
     if candidates.shape[0] > _MAX_CANDIDATES:
         candidates = candidates[rng.choice(candidates.shape[0], _MAX_CANDIDATES, replace=False)]
     first_y, first_x = np.unravel_index(int(np.argmax(depth)), depth.shape)
-    points: list[np.ndarray] = [np.array([first_x, first_y], dtype=np.float32)]
+    points: list[np.ndarray] = [np.array([first_x, first_y], dtype=np.float32) + offset]
     for _ in range(count - 1):
         chosen = np.stack(points)
         gaps = np.linalg.norm(candidates[:, None, :] - chosen[None, :, :], axis=2)
@@ -218,6 +275,18 @@ def sample_points_in_mask(
     return np.stack(points).astype(np.float32)
 
 
+def _padded_depth(mask: np.ndarray) -> np.ndarray:
+    """Distance to the nearest background pixel with the array border counted as background (0 outside the mask).
+
+    Only the mask's bounding box is transformed, which is exact.
+    """
+    depth = np.zeros(mask.shape, dtype=np.float64)
+    box = window(mask, 1)
+    if box is not None:
+        depth[box] = distance_transform_edt(np.pad(mask[box], 1))[1:-1, 1:-1]
+    return depth
+
+
 def interior_point_xy(mask: np.ndarray) -> tuple[float, float] | None:
     """The deepest interior pixel of a boolean mask as (x, y), or None for an empty mask.
 
@@ -226,7 +295,7 @@ def interior_point_xy(mask: np.ndarray) -> tuple[float, float] | None:
     """
     if not mask.any():
         return None
-    depth = distance_transform_edt(np.pad(mask.astype(bool), 1))[1:-1, 1:-1]
+    depth = _padded_depth(mask.astype(bool))
     y, x = np.unravel_index(int(np.argmax(depth)), depth.shape)
     return float(x), float(y)
 
@@ -235,11 +304,11 @@ def inscribed_circle_xyr(mask: np.ndarray, scale: float = 0.95) -> tuple[float, 
     """Largest circle inside a boolean mask as (center_x, center_y, radius), radius times ``scale``.
 
     Stands in for the exporter's inscribed circle (``circle_annotations.json``, ``source = inscribed``) when a
-    validation sample has none in its tile. The mask is padded with background, so the circle stays in the visible part.
+    sample has none in its tile. The mask is padded with background, so the circle stays in the visible part.
     """
     if not mask.any():
         return None
-    depth = distance_transform_edt(np.pad(mask.astype(bool), 1))[1:-1, 1:-1]
+    depth = _padded_depth(mask.astype(bool))
     y, x = np.unravel_index(int(np.argmax(depth)), depth.shape)
     # Distance is to the nearest background pixel center; half a pixel less keeps the disc off it.
     radius = max(float(depth[y, x]) - 0.5, 0.5) * float(scale)
@@ -274,52 +343,37 @@ def jittered_box(
     )
 
 
-def nearest_resize(array: np.ndarray, size: int) -> np.ndarray:
-    """Nearest-neighbor resize of a 2-D array to ``size`` x ``size``.
-
-    Samples the source pixel under each output pixel center, so a signed -1/0/+1 canvas keeps exactly those
-    values; averaging would invent fractional values that mix foreground and background.
-    """
-    height, width = array.shape
-    rows = np.minimum(((np.arange(size) + 0.5) * height / size).astype(np.int64), height - 1)
-    cols = np.minimum(((np.arange(size) + 0.5) * width / size).astype(np.int64), width - 1)
-    return array[np.ix_(rows, cols)]
-
-
-def to_low_res_logits(signed: np.ndarray) -> np.ndarray:
-    """Signed int8 canvas -> 256x256 float32 ``mask_input`` (see :data:`MASK_PROMPT_LOGIT`)."""
-    return nearest_resize(signed, LOW_RES).astype(np.float32) * np.float32(MASK_PROMPT_LOGIT)
-
-
 def choose_prompt_type(
     cfg: PromptConfig,
     rng: np.random.Generator,
     *,
-    can_circle_mask: bool,
-    has_negatives: bool,
+    can_circle_seed: bool = True,
+    can_adjacent_seed: bool = False,
     allowed: Collection[PromptType] | None = None,
+    exclude: Collection[PromptType] = (),
 ) -> PromptType:
     """Draw a prompt type, dropping types the sample cannot support and renormalizing the rest.
 
-    ``circle_mask`` needs a circle for the target whose center is in the tile; ``negative_only`` needs at least
-    one other annotation. Their probability mass moves to the remaining types in proportion. With ``allowed``
-    every other type is dropped too (fully masked tiles use only points and circle masks). If nothing is left
-    the sample gets a points prompt when that is allowed, else a full mask prompt.
+    ``circle_seed`` needs a circle; ``adjacent_seed`` needs a linked polygon from a neighbouring section. While
+    no adjacent shape is available its probability moves to the circle seed, as the plan says. With ``allowed``
+    every other type is dropped too (fully masked tiles use only points and circle seeds), and ``exclude`` drops
+    types already drawn for another variant of the same sample. If nothing is left the sample gets a points
+    prompt when that is allowed, else a circle seed.
     """
     weights = dict(cfg.probabilities())
-    if not can_circle_mask:
-        weights[PromptType.CIRCLE_MASK] = 0.0
-    if not has_negatives:
-        weights[PromptType.NEGATIVE_ONLY] = 0.0
-    if allowed is not None:
-        for kind in weights:
-            if kind not in allowed:
-                weights[kind] = 0.0
+    if not can_adjacent_seed:
+        weights[PromptType.CIRCLE_SEED] += weights[PromptType.ADJACENT_SEED]
+        weights[PromptType.ADJACENT_SEED] = 0.0
+    if not can_circle_seed:
+        weights[PromptType.CIRCLE_SEED] = 0.0
+    for kind in weights:
+        if kind in exclude or (allowed is not None and kind not in allowed):
+            weights[kind] = 0.0
     total = sum(weights.values())
     if total <= 0.0:
-        if allowed is not None and PromptType.POINTS in allowed:
+        if allowed is None or PromptType.POINTS in allowed:
             return PromptType.POINTS
-        return PromptType.FULL_MASK
+        return PromptType.CIRCLE_SEED
     types = list(weights)
     return types[int(rng.choice(len(types), p=np.array([weights[t] for t in types]) / total))]
 
@@ -328,22 +382,17 @@ def _background_points(
     regions: list[NegativeRegion],
     cfg: PromptConfig,
     rng: np.random.Generator,
-    *,
-    force_one: bool,
 ) -> np.ndarray:
     """Background points from the negative regions.
 
     Each region is rolled independently (circle regions at ``bg_point_prob_circle``, polygon regions at
-    ``bg_point_prob_polygon``) and, when it wins, yields a Benford-distributed 1..9 points. ``force_one``
-    guarantees at least one region contributes, for prompts that have no foreground point.
+    ``bg_point_prob_polygon``) and, when it wins, yields a Benford-distributed 1..9 points.
     """
     chosen: list[NegativeRegion] = [
         region
         for region in regions
         if rng.random() < (cfg.bg_point_prob_circle if region.kind == KIND_CIRCLE else cfg.bg_point_prob_polygon)
     ]
-    if force_one and not chosen and regions:
-        chosen = [regions[int(rng.integers(len(regions)))]]
     sets = [
         sample_points_in_mask(
             region.mask,
@@ -359,6 +408,11 @@ def _background_points(
     return np.concatenate(sets) if sets else np.zeros((0, 2), dtype=np.float32)
 
 
+def negative_region_canvases(regions: list[NegativeRegion], cfg: PromptConfig) -> list[np.ndarray]:
+    """The confidence-scaled negative canvas of each region, for ``build_prompt(negative_canvases=...)``."""
+    return [negative_canvas(r.mask, cfg.edge_tau_px, cfg.seed_logit, cfg.edge_tau_depth_frac) for r in regions]
+
+
 def build_prompt(
     prompt_type: PromptType,
     *,
@@ -367,25 +421,45 @@ def build_prompt(
     regions: list[NegativeRegion],
     cfg: PromptConfig,
     rng: np.random.Generator,
+    adjacent_shape: np.ndarray | None = None,
+    negative_canvases: list[np.ndarray] | None = None,
 ) -> PromptSample:
     """Assemble the prompt for one sample from augmented masks.
 
-    ``target_mask`` is the ground truth (boolean). ``circle_mask`` is the target's annotation circle, required
-    for :attr:`PromptType.CIRCLE_MASK`. ``regions`` are the other annotations in the tile. Whatever the type, the
-    negatives always ride along: as a -1 area in the dense mask and, per the configured probabilities, as
-    background points. With no negatives and no foreground mask the dense prompt is None so the encoder uses its
-    learned no-mask embedding rather than an all-zero mask.
+    ``target_mask`` is the ground truth (boolean); every family is trained against it. ``circle_mask`` is the
+    target's circle, required for :attr:`PromptType.CIRCLE_SEED`. ``adjacent_shape`` is a boolean raster of the
+    linked polygon from a neighbouring section (any frame), for :attr:`PromptType.ADJACENT_SEED`; a shape that
+    cannot be fitted inside the cell falls back to the circle seed. ``regions`` are the other annotations in the
+    tile. Whatever the type, the negatives ride along: as a negative area in the dense mask and, per the
+    configured probabilities, as background points. A neighbor merged into a mask to correct is left out of the
+    negative area, otherwise the prompt would label the error. With no negatives and no dense foreground the
+    dense prompt is None so the encoder uses its learned no-mask embedding rather than an all-zero mask.
+
+    ``negative_canvases`` are :func:`negative_region_canvases` of ``regions``, computed once by a caller that
+    builds several variants of one sample; they save an edge distance transform per region and variant.
     """
     shape = target_mask.shape
-    negative = stamp_negative_regions(regions, shape)
     kwargs = dict(
         min_edge_px=cfg.min_edge_px, line_frac_min=cfg.line_frac_min, line_frac_max=cfg.line_frac_max
     )
-    background = _background_points(
-        regions, cfg, rng, force_one=prompt_type is PromptType.NEGATIVE_ONLY
-    )
-    foreground_canvas: np.ndarray | None = None
+    seed: np.ndarray | None = None
+    correction: np.ndarray | None = None
+    merged_region: NegativeRegion | None = None
     box: np.ndarray | None = None
+
+    if prompt_type is PromptType.ADJACENT_SEED:
+        if adjacent_shape is not None:
+            seed = fit_adjacent_seed(
+                adjacent_shape,
+                target_mask,
+                rng,
+                fit_inside=cfg.adjacent_fit_inside,
+                scale_range=cfg.adjacent_scale_range,
+                grow_px=cfg.adjacent_fit_grow_px,
+            )
+        if seed is None or not seed.any():
+            prompt_type = PromptType.CIRCLE_SEED
+            seed = None
 
     if prompt_type is PromptType.POINTS:
         points = sample_points_in_mask(target_mask, benford_count(rng), rng, **kwargs)
@@ -396,47 +470,78 @@ def build_prompt(
         count = int(rng.integers(1, cfg.box_points_max + 1))
         points = sample_points_in_mask(target_mask, count, rng, **kwargs)
         box = jittered_box(target_mask, rng, cfg.box_jitter_frac)
-    elif prompt_type is PromptType.CIRCLE_MASK:
+    elif prompt_type is PromptType.CIRCLE_SEED:
         if circle_mask is None or not circle_mask.any():
-            raise ValueError("circle_mask prompt needs a non-empty circle mask")
-        foreground_canvas = circle_mask.astype(np.int8)
-        ys, xs = np.nonzero(circle_mask)
+            raise ValueError("circle_seed prompt needs a non-empty circle mask")
+        seed = circle_mask.astype(bool)
+        ys, xs = np.nonzero(seed)
         points = np.array([[xs.mean(), ys.mean()]], dtype=np.float32)
-    elif prompt_type is PromptType.FULL_MASK:
-        foreground_canvas = target_mask.astype(np.int8)
-        points = sample_points_in_mask(target_mask, 1, rng, **kwargs)
-    elif prompt_type is PromptType.CORRUPTED_MASK:
-        foreground_canvas = corrupt_mask(
-            target_mask,
-            rng,
-            max_shift_px=cfg.corrupt_max_shift_px,
-            stroke_keep_min=cfg.corrupt_stroke_keep_min,
-            stroke_keep_max=cfg.corrupt_stroke_keep_max,
-            polygon_tolerance=cfg.corrupt_polygon_tolerance,
-        ).astype(np.int8)
-        points = sample_points_in_mask(target_mask, 1, rng, **kwargs)
-    elif prompt_type is PromptType.NEGATIVE_ONLY:
-        points = np.zeros((0, 2), dtype=np.float32)
-        if not background.shape[0]:
-            raise ValueError("negative_only prompt needs at least one negative region")
+    elif prompt_type is PromptType.ADJACENT_SEED:
+        points = sample_points_in_mask(seed, 1, rng, **kwargs)
+    elif prompt_type is PromptType.SUBSET_SEED:
+        seed = subset_seed(target_mask, rng, erode_px=cfg.erode_px)
+        points = sample_points_in_mask(seed, 1, rng, **kwargs)
+    elif prompt_type in (PromptType.CORRECTION, PromptType.NEAR_CORRECT):
+        if prompt_type is PromptType.CORRECTION:
+            polygons = [r for r in regions if r.kind == KIND_POLYGON]
+            correction, merged = correction_mask(
+                target_mask,
+                rng,
+                neighbors=[r.mask for r in polygons],
+                dilate_px=cfg.dilate_px,
+                scale_range=cfg.scale_range,
+                polygon_tolerance=cfg.corrupt_polygon_tolerance,
+                max_shift_px=cfg.corrupt_max_shift_px,
+                wobble_px=cfg.correction_wobble_px,
+            )
+            merged_region = polygons[merged] if merged is not None else None
+        else:
+            correction = near_correct_mask(
+                target_mask,
+                rng,
+                wobble_px=cfg.near_correct_wobble_px,
+                excursion_px=cfg.near_correct_excursion_px,
+            )
+        # The click comes from the mask the user sees, as in production, never from the ground truth.
+        points = sample_points_in_mask(correction, 1, rng, **kwargs)
+        if points.shape[0] == 0:
+            points = sample_points_in_mask(target_mask, 1, rng, **kwargs)
     else:  # pragma: no cover - enum is exhaustive
         raise ValueError(f"unknown prompt type {prompt_type!r}")
 
+    # After the correction is drawn, so a neighbor merged into it never gets a background point.
+    background = _background_points([r for r in regions if r is not merged_region], cfg, rng)
     coords = np.concatenate([points, background]) if background.shape[0] else points
     labels = np.concatenate(
         [np.ones(points.shape[0], dtype=np.int32), np.zeros(background.shape[0], dtype=np.int32)]
     )
-    signed = combine_signed(foreground_canvas, negative)
-    has_dense = bool(signed.any())
-    # A corrupted mask is deliberately wrong in places, so it must not feed the "never predict background here"
-    # containment loss; every other dense foreground is trustworthy.
-    trusted = foreground_canvas is not None and prompt_type is not PromptType.CORRUPTED_MASK
-    foreground_region = (signed > 0) if trusted and bool((signed > 0).any()) else None
+    negatives = [r.mask for r in regions if r is not merged_region]
+    shared = negative_canvases is not None and merged_region is None
+    dense = encode_mask_input(
+        shape,
+        seed=seed,
+        correction=correction,
+        negatives=[] if shared else negatives,
+        negative_canvases=negative_canvases if shared else (),
+        tau=cfg.edge_tau_px,
+        seed_logit=cfg.seed_logit,
+        correction_logit=cfg.correction_logit,
+        depth_frac=cfg.edge_tau_depth_frac,
+    )
+    weight: np.ndarray | None = None
+    if seed is not None and seed.any():
+        weight = edge_confidence(seed, cfg.edge_tau_px, cfg.edge_tau_depth_frac)
+        if negatives:
+            weight = weight * ~np.any(np.stack(negatives), axis=0)
+        if not weight.any():
+            weight = None
+    input_mask = seed if seed is not None else correction
     return PromptSample(
         prompt_type=prompt_type,
         point_coords=coords.astype(np.float32, copy=False),
         point_labels=labels,
         box=box,
-        dense_logits=to_low_res_logits(signed) if has_dense else None,
-        foreground_region=foreground_region,
+        dense_logits=dense,
+        foreground_weight=weight,
+        input_mask=None if input_mask is None else np.asarray(input_mask, dtype=bool),
     )

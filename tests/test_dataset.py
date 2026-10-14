@@ -25,11 +25,14 @@ class DatasetTests(unittest.TestCase):
             item = ds[0]
             self.assertEqual(tuple(item["image"].shape), (3, 32, 32))
             self.assertEqual(tuple(item["mask"].shape), (32, 32))
-            self.assertEqual(tuple(item["point"].shape), (1, 2))
+            self.assertEqual(len(item["variants"]), 1)
+            self.assertEqual(tuple(item["variants"][0]["point"].shape), (1, 2))
             self.assertTrue(item["image"].abs().mean() > 0)
             batch = collate_em([ds[0], ds[1]])
             self.assertEqual(tuple(batch["image"].shape), (2, 3, 32, 32))
             self.assertEqual(batch["point"].dtype, torch.float32)
+            self.assertEqual(batch["variant_index"].tolist(), [0, 1])
+            self.assertIsNone(batch["edge_weight"])
             self.assertTrue(item["category_name"])
 
     def test_train_augment_keeps_shapes(self) -> None:

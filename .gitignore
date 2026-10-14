@@ -41,3 +41,6 @@ _window_span_scan.py
 # source, so only generated files in it are ignored.
 annotation_crops/*
 !annotation_crops/*.py
+
+# Throughput benchmark outputs (sam2-em-train --benchmark ... | tee benchmarks/...)
+benchmarks/

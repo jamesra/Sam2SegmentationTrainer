@@ -12,10 +12,18 @@ class TrainCfgTests(unittest.TestCase):
         self.assertEqual(cfg.model.freeze_mode, "none")
         self.assertEqual(list(cfg.data.volumes), ["RC1", "RC2", "RPC1", "RPC2"])
         self.assertEqual(cfg.model.config, "configs/sam2.1/sam2.1_hiera_l.yaml")
-        self.assertTrue(bool(cfg.model.activation_checkpointing))
+        self.assertFalse(bool(cfg.model.activation_checkpointing))
+        self.assertEqual(int(cfg.training.batch_size), 2)
+        self.assertEqual(int(cfg.training.gradient_accumulation_steps), 8)
+        self.assertEqual(float(cfg.training.early_stopping_min_delta), 0.002)
+        self.assertEqual(float(cfg.val.epoch_subset), 0.25)
+        self.assertEqual(int(cfg.val.full_every_n_epochs), 3)
+        self.assertEqual(int(cfg.val.batch_size), 4)
+        self.assertEqual(int(cfg.val.metric_threads), 4)
+        self.assertEqual(int(cfg.training.val_every_n_epochs), 1)
         self.assertTrue(bool(cfg.training.resume))
         self.assertEqual(int(cfg.training.save_every_n_steps), 200)
-        self.assertEqual(float(cfg.training.early_stopping_min_delta), 0.0)
+        self.assertEqual(int(cfg.training.early_stopping_patience), 2)
         self.assertIsNone(cfg.training.checkpoint_dir)
         self.assertEqual(str(cfg.training.run_name), "auto")
         self.assertFalse(bool(cfg.data.even_per_volume))
@@ -33,26 +41,95 @@ class TrainCfgTests(unittest.TestCase):
             cfg.prompt.prob_points_only,
             cfg.prompt.prob_box_only,
             cfg.prompt.prob_box_points,
-            cfg.prompt.prob_circle_mask,
-            cfg.prompt.prob_full_mask,
-            cfg.prompt.prob_negative_only,
-            cfg.prompt.prob_corrupted_mask,
+            cfg.prompt.prob_circle_seed,
+            cfg.prompt.prob_adjacent_seed,
+            cfg.prompt.prob_subset_seed,
+            cfg.prompt.prob_correction,
+            cfg.prompt.prob_near_correct,
         ]
         self.assertAlmostEqual(sum(float(p) for p in probs), 1.0)
-        self.assertEqual(float(cfg.prompt.prob_full_mask), 0.0)
-        self.assertEqual(float(cfg.prompt.prob_negative_only), 0.0)
-        self.assertEqual(float(cfg.prompt.prob_corrupted_mask), 0.25)
-        self.assertEqual(float(cfg.prompt.prob_circle_mask), 0.45)
+        self.assertEqual(float(cfg.prompt.prob_circle_seed), 0.40)
+        self.assertEqual(float(cfg.prompt.prob_adjacent_seed), 0.15)
+        self.assertEqual(int(cfg.prompt.variants_per_sample), 3)
+        self.assertEqual(float(cfg.prompt.edge_tau_px), 8.0)
+        self.assertEqual(float(cfg.prompt.edge_tau_depth_frac), 0.25)
+        self.assertEqual(list(cfg.prompt.erode_px), [10, 40])
+        self.assertEqual(list(cfg.prompt.dilate_px), [5, 50])
+        self.assertEqual(list(cfg.prompt.correction_wobble_px), [10, 20])
+        self.assertEqual(list(cfg.prompt.near_correct_wobble_px), [5, 12])
+        self.assertEqual(list(cfg.prompt.near_correct_excursion_px), [15, 30])
+        self.assertEqual(float(cfg.prompt.adjacent_fit_grow_px), 10.0)
+        self.assertEqual(float(cfg.prompt.seed_logit), 10.0)
+        self.assertEqual(float(cfg.prompt.correction_logit), 3.0)
+        self.assertEqual(float(cfg.loss.edge_tau_px), 8.0)
+        self.assertEqual(float(cfg.loss.leak_weight), 3.0)
+        self.assertEqual(float(cfg.val.core_band_px), 10.0)
+        self.assertEqual(float(cfg.val.core_recall_target), 0.975)
+        self.assertIsNone(cfg.data.approved_path)
+        self.assertEqual(float(cfg.data.approved_weight), 1.0)
+        self.assertFalse(bool(cfg.training.cudnn_benchmark))
+        self.assertEqual(float(cfg.model.activation_checkpointing_fraction), 1.0)
+        self.assertEqual(float(cfg.loss.edge_weight_min), 0.05)
+        for removed in ("prob_full_mask", "prob_negative_only", "prob_circle_mask", "prob_corrupted_mask"):
+            self.assertNotIn(removed, cfg.prompt)
+        for removed in ("allow_circle_targets", "circle_target_fraction"):
+            self.assertNotIn(removed, cfg.negative)
         self.assertEqual(float(cfg.loss.mask_contain_weight), 0.5)
         self.assertEqual(float(cfg.loss.containment_warmup_epochs), 2.0)
         self.assertTrue(bool(cfg.model.unfreeze_mask_cnn))
-        self.assertFalse(bool(cfg.negative.allow_circle_targets))
         self.assertEqual(int(cfg.negative.cache_size), 64)
+        self.assertEqual(
+            list(cfg.eval.val_prompts), ["circle_mask", "correction", "near_correct", "point", "centroid"]
+        )
+
+    def test_approved_set_reads_both_formats_and_skips_a_missing_file(self) -> None:
+        import json
+        from tempfile import TemporaryDirectory
+
+        from sam2_segmentation_trainer.train import approved_counts, load_approved_set
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "approved.json"
+            path.write_text(
+                json.dumps(
+                    [{"location_id": 7, "image_key": "RC1_0_a"}, [8, "RC2_1_b"], {"location_id": 9}, "junk", {"x": 1}]
+                ),
+                encoding="utf-8",
+            )
+            cfg = load_train_cfg([f"data.approved_path={path.as_posix()}"])
+            self.assertEqual(load_approved_set(cfg), frozenset({(7, "RC1_0_a"), (8, "RC2_1_b"), (9, "")}))
+            missing = load_train_cfg([f"data.approved_path={(Path(tmp) / 'nope.json').as_posix()}"])
+            self.assertEqual(load_approved_set(missing), frozenset())
+            self.assertEqual(load_approved_set(load_train_cfg()), frozenset())
+
+            class Example:
+                def __init__(self, volume, location_id, image_key):
+                    self.volume, self.location_id, self.image_key = volume, location_id, image_key
+
+            counts = approved_counts(
+                [Example("RC1", 7, "RC1_0_a"), Example("RC1", 7, "other"), Example("RC2", 8, "RC2_1_b")],
+                frozenset({(7, "RC1_0_a"), (8, "RC2_1_b")}),
+            )
+            self.assertEqual(counts, {"RC1": 1, "RC2": 1})
+
+    def test_out_of_memory_is_recognised_including_the_driver_mapping_failure(self) -> None:
+        from sam2_segmentation_trainer.train import _is_oom
+
+        self.assertTrue(_is_oom(RuntimeError("CUDA out of memory. Tried to allocate 2 GiB")))
+        self.assertTrue(
+            _is_oom(
+                RuntimeError(
+                    "CUDA driver error: device not ready. The CUDA driver logged these messages: "
+                    "Failed to create GPU mapping"
+                )
+            )
+        )
+        self.assertFalse(_is_oom(RuntimeError("shape mismatch")))
 
     def test_prompt_probabilities_must_sum_to_one(self) -> None:
         with self.assertRaises(ValueError):
             load_train_cfg(["prompt.prob_points_only=0.5"])
-        cfg = load_train_cfg(["prompt.prob_points_only=0.20", "prompt.prob_circle_mask=0.40"])
+        cfg = load_train_cfg(["prompt.prob_points_only=0.20", "prompt.prob_circle_seed=0.30"])
         self.assertAlmostEqual(float(cfg.prompt.prob_points_only), 0.20)
 
     def test_next_run_name_increments(self) -> None:
@@ -107,6 +184,8 @@ class TrainCfgTests(unittest.TestCase):
         self.assertTrue(args.benchmark)
         self.assertEqual(args.benchmark_steps, 50)
         self.assertEqual(args.benchmark_val_steps, 20)
+        self.assertFalse(args.benchmark_no_val)
+        self.assertTrue(parse_train_args(["--benchmark", "--benchmark-no-val"]).benchmark_no_val)
         self.assertEqual(args.overrides, ["training.batch_size=2"])
         cfg = load_train_cfg(
             list(args.overrides)

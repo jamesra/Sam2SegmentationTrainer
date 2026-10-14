@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import zlib
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,6 +20,7 @@ from annotation_crops.negatives import (
     drop_circles_over_target,
     rasterize_circle,
 )
+from annotation_crops.prompt_encoding import EDGE_TAU_DEPTH_FRAC
 
 from sam2_segmentation_trainer.data.augment import (
     build_train_transform,
@@ -33,17 +35,36 @@ from sam2_segmentation_trainer.data.prompts import (
     FULL_TILE_PROMPTS,
     build_prompt,
     choose_prompt_type,
+    negative_region_canvases,
     inscribed_circle_xyr,
     interior_point_xy,
 )
 from sam2_segmentation_trainer.data.fulltile import is_full_tile
+from sam2_segmentation_trainer.goal_metrics import MIN_COMPONENT_PX, ground_truth_terms
 from sam2_segmentation_trainer.data.tiles import TileContext
+from sam2_segmentation_trainer.data.weights import (
+    apply_leak_weight,
+    edge_weight_map,
+    leak_mask,
+    neighbor_core_labels,
+)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-VAL_PROMPTS = ("centroid", "point", "circle_mask")
-"""Validation prompts: the legacy mask centroid, the deepest interior point, and the inscribed circle (production)."""
+VAL_PROMPTS = ("centroid", "point", "circle_mask", "correction", "near_correct")
+"""Validation prompts: the legacy mask centroid, the deepest interior point, the inscribed circle seed
+(production), a mask to correct, and a near-correct mask (the "do no harm" check)."""
+
+VAL_FAMILY_CODES = {name: code for code, name in enumerate(VAL_PROMPTS)}
+"""A fixed number per validation family, so a family's prompt seed does not depend on which families run."""
+
+VAL_MIXED_TYPES = {
+    "circle_mask": PromptType.CIRCLE_SEED,
+    "correction": PromptType.CORRECTION,
+    "near_correct": PromptType.NEAR_CORRECT,
+}
+"""Validation prompts that go through the mixed pipeline, and the prompt family each forces."""
 
 
 class MissingTileFlag:
@@ -134,16 +155,50 @@ def imagenet_normalize(rgb_uint8: np.ndarray) -> torch.Tensor:
     return (tensor - mean) / std
 
 
+def _variant_from_prompt(prompt) -> dict[str, Any]:
+    """The collate-ready dict of one built prompt (see :func:`build_prompt`)."""
+    return {
+        "point": torch.from_numpy(prompt.point_coords).reshape(-1, 2),
+        "point_label": torch.from_numpy(prompt.point_labels),
+        "boxes": None if prompt.box is None else torch.from_numpy(prompt.box),
+        "dense_mask": None if prompt.dense_logits is None else torch.from_numpy(prompt.dense_logits),
+        "prompt_fg": (
+            None
+            if prompt.foreground_weight is None
+            else torch.from_numpy(prompt.foreground_weight.astype(np.float16))
+        ),
+        "prompt_input": None if prompt.input_mask is None else torch.from_numpy(prompt.input_mask.astype(np.uint8)),
+        "prompt_type": prompt.prompt_type.value,
+    }
+
+
 class EMSegDataset(Dataset):
     """Crops with a prompt per sample.
 
     Without ``tiles`` and ``prompt_cfg`` every sample is the original single-centroid-point prompt, which is
     what validation and evaluation use so their IoU stays comparable across runs. With both, each sample draws
-    a prompt type (points, box, box and points, circle mask, full mask, negative only) and carries the other
-    annotations in its tile as negative context; see :mod:`sam2_segmentation_trainer.data.prompts`.
+    ``prompt_cfg.variants_per_sample`` prompt variants against one augmented image (points, box, box and
+    points, circle seed, subset seed, mask to correct, near-correct mask) and carries the other annotations in
+    its tile as negative context; see :mod:`sam2_segmentation_trainer.data.prompts`. The image is encoded once
+    and every variant reuses its embeddings.
 
-    Prompt draws are seeded from ``(seed, epoch, index)`` so a resumed epoch sees the same prompts. The mask
+    Variant ``k`` is seeded from ``(seed, epoch, index, k)`` so a resumed epoch sees the same prompts. The mask
     cache is per process, so each DataLoader worker keeps its own.
+
+    ``edge_tau_px > 0`` adds the per-pixel edge weight ``max(edge_weight_min, 1 - exp(-d / tau))`` of the
+    ground-truth mask to each item (``edge_weight``), for the edge-tolerant loss and tolerant validation; ``tau``
+    is capped per mask by ``edge_tau_depth_frac`` times its depth. ``leak_weight > 1`` multiplies that weight on
+    pixels at least ``leak_core_px`` inside another annotation and outside the target (a merge costs more than an
+    equal area of edge error). ``core_band_px > 0`` adds ``neighbor_core``, an int16 map of the neighbors' cores,
+    for the validation metrics. ``approved`` is a set of ``(location_id, image_key)`` pairs: those items are
+    flagged in their meta and get ``approved_weight`` as their training weight.
+
+    ``val_families`` (validation) makes each item carry one prompt variant per family, all against one loaded
+    image, so the validator encodes the image once and decodes every family from it. Each family's prompt is
+    seeded from ``(seed, sample, family)`` where the sample is identified by its volume, image key and location
+    id, not by its position, so results do not depend on batch composition, family order or which samples are in
+    the pass. Items also carry ``gt_terms``, the ground-truth side of the goal metrics, computed once here in
+    the worker.
     """
 
     def __init__(
@@ -160,10 +215,34 @@ class EMSegDataset(Dataset):
         val_prompt: str | None = None,
         circle_scale: float = 0.95,
         full_tile_threshold: float | None = None,
+        edge_tau_px: float = 0.0,
+        edge_weight_min: float = 0.05,
+        edge_tau_depth_frac: float = EDGE_TAU_DEPTH_FRAC,
+        leak_weight: float = 1.0,
+        leak_core_px: float = 10.0,
+        core_band_px: float = 0.0,
+        approved: frozenset | set | None = None,
+        approved_weight: float = 1.0,
+        val_families: Sequence[str] | None = None,
     ):
         if val_prompt is not None and val_prompt not in VAL_PROMPTS:
             raise ValueError(f"val_prompt must be one of {VAL_PROMPTS}, got {val_prompt!r}")
+        families = tuple(dict.fromkeys(val_families or ()))
+        unknown = [f for f in families if f not in VAL_PROMPTS]
+        if unknown:
+            raise ValueError(f"val_families must be among {VAL_PROMPTS}, got {unknown}")
+        if families and val_prompt is not None:
+            raise ValueError("pass either val_prompt (one family per item) or val_families (all of them)")
         self.val_prompt = val_prompt
+        self.val_families = families
+        self.edge_tau_px = float(edge_tau_px)
+        self.edge_weight_min = float(edge_weight_min)
+        self.edge_tau_depth_frac = float(edge_tau_depth_frac)
+        self.leak_weight = float(leak_weight)
+        self.leak_core_px = float(leak_core_px)
+        self.core_band_px = float(core_band_px)
+        self.approved = frozenset(approved or ())
+        self.approved_weight = float(approved_weight)
         self.circle_scale = float(circle_scale)
         self.full_tile_threshold = None if full_tile_threshold is None else float(full_tile_threshold)
         self.examples = list(examples)
@@ -202,8 +281,10 @@ class EMSegDataset(Dataset):
             index = (int(idx) + offset) % n
             example = self.examples[index]
             try:
-                if self.val_prompt == "circle_mask":
-                    return self._mixed_item(example, index, forced=PromptType.CIRCLE_MASK)
+                if self.val_families:
+                    return self._families_item(example)
+                if self.val_prompt in VAL_MIXED_TYPES:
+                    return self._mixed_item(example, index, forced=VAL_MIXED_TYPES[self.val_prompt])
                 if self.val_prompt is not None:
                     return self._item_from_example(example, self.val_prompt)
                 if self.mixed_prompts:
@@ -230,12 +311,16 @@ class EMSegDataset(Dataset):
             )
             mask = (mask > 127).astype(np.uint8)
 
-        augmented = self.transform(image=rgb, mask=mask)
+        shape = (int(rgb.shape[0]), int(rgb.shape[1]))
+        regions = self._other_annotations(example, shape) if self._needs_neighbors() else []
+        augmented = self.transform(image=rgb, masks=[mask] + [r.mask.astype(np.uint8) for r in regions])
         image_aug = augmented["image"]
-        mask_aug = augmented["mask"]
-        if mask_aug.ndim == 3:
-            mask_aug = mask_aug[:, :, 0]
-        mask_bin = (np.asarray(mask_aug) > 0).astype(np.uint8)
+        mask_bin = (np.asarray(augmented["masks"][0]) > 0).astype(np.uint8)
+        regions_aug = [
+            NegativeRegion(region.location_id, region.kind, np.asarray(m) > 0)
+            for region, m in zip(regions, augmented["masks"][1:])
+            if np.asarray(m).any()
+        ]
 
         centroid = interior_point_xy(mask_bin) if point_mode == "point" else mask_centroid_xy(mask_bin)
         if centroid is None:
@@ -252,61 +337,238 @@ class EMSegDataset(Dataset):
             category_name=str(ann.get("category_name") or ann.get("structure_label") or ""),
             split_key=example.split_key,
             full_tile=is_full_tile(example, self.full_tile_threshold),
+            approved=self._is_approved(example),
         )
-        return {
-            "image": image,
-            "mask": torch.from_numpy(mask_bin.astype(np.int64)),
+        variant = {
             "point": point,
             "point_label": torch.tensor([1], dtype=torch.int32),
             "boxes": None,
             "dense_mask": None,
             "prompt_fg": None,
+            "prompt_input": None,
             "prompt_type": point_mode,
+        }
+        return {
+            "image": image,
+            "mask": torch.from_numpy(mask_bin.astype(np.int64)),
+            **self._weights(mask_bin > 0, regions_aug, meta),
+            "variants": [variant],
             "orig_hw": (int(mask_bin.shape[0]), int(mask_bin.shape[1])),
             "sample_meta": meta,
             **meta.as_dict(),
         }
 
-    def _mixed_item(
-        self, example: CropExample, index: int, *, forced: PromptType | None = None
-    ) -> dict[str, Any]:
-        """One sample with a drawn prompt type, negative context, and the matching dense mask and points.
-
-        Raises KeyError for a sample that cannot form a prompt (empty target after augmentation, or a circle
-        target with no other annotation), so ``__getitem__`` moves on to the next example.
-        """
+    def _families_item(self, example: CropExample) -> dict[str, Any]:
+        """One validation sample with a prompt variant per family in ``val_families``, against one loaded image."""
         tiles = self.tiles if self.tiles is not None else TileContext()
         prompt_cfg = self.prompt_cfg if self.prompt_cfg is not None else PromptConfig()
-        epoch = 0 if forced is not None else (self.epoch.get() if self.epoch is not None else 0)
-        rng = np.random.default_rng([self.seed, epoch, int(index)])
         key = (example.volume, example.image_key)
-
         gray = _load_gray_uint8(example.image_path)
         rgb = to_rgb_uint8(gray)
         shape = (int(rgb.shape[0]), int(rgb.shape[1]))
-        ann: dict[str, Any] = {}
+        mask, ann = load_binary_mask(example)
+        if mask.shape[:2] != shape:
+            mask = np.array(
+                Image.fromarray(mask * 255, mode="L").resize((shape[1], shape[0]), resample=Image.NEAREST)
+            )
+            mask = (mask > 127).astype(np.uint8)
+        target = mask > 0
         circle_mask: np.ndarray | None = None
-        if example.target_circle is not None:
-            target = rasterize_circle(shape, *example.target_circle)
-            own = tiles.circle_for(key, example.location_id)
-            ann = {"category_name": own.structure_label if own is not None else ""}
-        else:
-            mask, ann = load_binary_mask(example)
-            if mask.shape[:2] != shape:
-                mask = np.array(
-                    Image.fromarray(mask * 255, mode="L").resize((shape[1], shape[0]), resample=Image.NEAREST)
-                )
-                mask = (mask > 127).astype(np.uint8)
-            target = mask > 0
+        if "circle_mask" in self.val_families:
             own = tiles.circle_for(key, example.location_id)
             if own is not None and own.center_in(shape):
                 disc = rasterize_circle(shape, own.center_x, own.center_y, own.radius)
                 circle_mask = disc if disc.any() else None
-            if circle_mask is None and forced is PromptType.CIRCLE_MASK:
-                fitted = inscribed_circle_xyr(target, self.circle_scale)
-                if fitted is None:
-                    raise KeyError(f"{example.split_key} has no mask to fit a circle to")
-                circle_mask = rasterize_circle(shape, *fitted)
+        regions = self._other_annotations(example, shape)
+        if prompt_cfg.drop_overlapping_circles:
+            regions = drop_circles_over_target(regions, target)
+
+        layers = [target.astype(np.uint8)] + [r.mask.astype(np.uint8) for r in regions]
+        if circle_mask is not None:
+            layers.append(circle_mask.astype(np.uint8))
+        augmented = self.transform(image=rgb, masks=layers)
+        image_aug = augmented["image"]
+        masks_aug = [np.asarray(m) > 0 for m in augmented["masks"]]
+        target_aug = masks_aug[0]
+        if not target_aug.any():
+            raise KeyError(f"{example.split_key} target is empty after augmentation")
+        regions_aug = [
+            NegativeRegion(region.location_id, region.kind, m)
+            for region, m in zip(regions, masks_aug[1 : 1 + len(regions)])
+            if m.any()
+        ]
+        circle_aug = masks_aug[-1] if circle_mask is not None else None
+        if "circle_mask" in self.val_families and (circle_aug is None or not circle_aug.any()):
+            fitted = inscribed_circle_xyr(target_aug, self.circle_scale)
+            if fitted is None:
+                raise KeyError(f"{example.split_key} has no mask to fit a circle to")
+            circle_aug = rasterize_circle(shape, *fitted)
+
+        sample_id = zlib.crc32(f"{example.volume}|{example.image_key}|{example.location_id}".encode("utf-8"))
+        mixed = [f for f in self.val_families if f in VAL_MIXED_TYPES]
+        canvases = negative_region_canvases(regions_aug, prompt_cfg) if mixed and regions_aug else None
+        variants: list[dict[str, Any]] = []
+        for family in self.val_families:
+            if family in VAL_MIXED_TYPES:
+                prompt = build_prompt(
+                    VAL_MIXED_TYPES[family],
+                    target_mask=target_aug,
+                    circle_mask=circle_aug,
+                    regions=regions_aug,
+                    cfg=prompt_cfg,
+                    rng=np.random.default_rng([self.seed, sample_id, VAL_FAMILY_CODES[family]]),
+                    negative_canvases=canvases,
+                )
+                variant = _variant_from_prompt(prompt)
+            else:
+                point = interior_point_xy(target_aug) if family == "point" else mask_centroid_xy(target_aug)
+                if point is None:
+                    point = bbox_center_xy(ann, shape[1], shape[0])
+                variant = {
+                    "point": torch.tensor([[point[0], point[1]]], dtype=torch.float32),
+                    "point_label": torch.tensor([1], dtype=torch.int32),
+                    "boxes": None,
+                    "dense_mask": None,
+                    "prompt_fg": None,
+                    "prompt_input": None,
+                    "prompt_type": family,
+                }
+            variant["val_family"] = family
+            variants.append(variant)
+
+        meta = SampleMeta(
+            volume=example.volume,
+            image_key=example.image_key,
+            location_id=example.location_id,
+            downsample=example.downsample,
+            category_name=str(ann.get("category_name") or ann.get("structure_label") or ""),
+            split_key=example.split_key,
+            full_tile=is_full_tile(example, self.full_tile_threshold),
+            approved=self._is_approved(example),
+        )
+        terms = (
+            ground_truth_terms(target_aug, self.core_band_px, MIN_COMPONENT_PX) if self.core_band_px > 0.0 else None
+        )
+        return {
+            "image": imagenet_normalize(np.ascontiguousarray(image_aug)),
+            "mask": torch.from_numpy(target_aug.astype(np.int64)),
+            **self._weights(target_aug, regions_aug, meta),
+            "variants": variants,
+            "gt_terms": terms,
+            "orig_hw": (int(target_aug.shape[0]), int(target_aug.shape[1])),
+            "sample_meta": meta,
+            **meta.as_dict(),
+        }
+
+    def _is_approved(self, example: CropExample) -> bool:
+        return (int(example.location_id), example.image_key) in self.approved
+
+    def _needs_neighbors(self) -> bool:
+        """Whether this dataset reads the tile's other annotations even without a mixed prompt (leak, cores)."""
+        return self.tiles is not None and (self.core_band_px > 0.0 or self.leak_weight != 1.0)
+
+    def _other_annotations(self, example: CropExample, shape: tuple[int, int]) -> list[NegativeRegion]:
+        tiles = self.tiles if self.tiles is not None else TileContext()
+        key = (example.volume, example.image_key)
+        regions = collect_negative_regions(
+            example.image_key,
+            example.location_id,
+            tiles.neighbor_ids(key),
+            tiles.circles_in(key),
+            example.mask_path.parent,
+            shape,
+            self._mask_cache,
+        )
+        return regions
+
+    def _weights(
+        self, target: np.ndarray, regions: Sequence[NegativeRegion], meta: SampleMeta
+    ) -> dict[str, Any]:
+        """The loss-side items of a sample: edge weight, training weight and (validation) neighbor cores.
+
+        ``edge_weight`` is the tolerant weight of the ground truth (float16) times ``leak_weight`` on neighbor
+        cores; None when both are off. ``neighbor_core`` is None unless ``core_band_px > 0``.
+        """
+        weight = edge_weight_map(target, self.edge_tau_px, self.edge_weight_min, self.edge_tau_depth_frac)
+        masks = [r.mask for r in regions]
+        if self.leak_weight != 1.0 and masks:
+            weight = apply_leak_weight(
+                weight, leak_mask(masks, target, self.leak_core_px), self.leak_weight, target.shape
+            )
+        cores = None
+        if self.core_band_px > 0.0:
+            cores = torch.from_numpy(neighbor_core_labels(masks, target, self.core_band_px))
+        return {
+            "edge_weight": None if weight is None else torch.from_numpy(weight.astype(np.float16)),
+            "sample_weight": self.approved_weight if meta.approved else 1.0,
+            "neighbor_core": cores,
+        }
+
+    def _plan_types(
+        self,
+        cfg: PromptConfig,
+        index: int,
+        epoch: int,
+        *,
+        full_tile: bool,
+        forced: PromptType | None,
+        has_adjacent: bool = False,
+    ) -> list[PromptType]:
+        """The prompt family of each variant. Variant 0 is the production prompt: a circle seed, or, when the
+        sample has an adjacent-section shape, an adjacent seed with probability ``a / (a + c)``.
+
+        The others are drawn from the mix without replacement (so the ``prob_*`` shares steer variants 1 onwards
+        only); a fully masked tile has only two families to draw from, so it gets at most two variants.
+        """
+        if forced is not None:
+            return [forced]
+        allowed = FULL_TILE_PROMPTS if full_tile else None
+        first = PromptType.CIRCLE_SEED
+        adjacent, circle = cfg.prob_adjacent_seed, cfg.prob_circle_seed
+        if has_adjacent and not full_tile and adjacent + circle > 0.0:
+            draw = np.random.default_rng([self.seed, epoch, int(index), 0, 1]).random()
+            if draw < adjacent / (adjacent + circle):
+                first = PromptType.ADJACENT_SEED
+        chosen = [first]
+        for k in range(1, cfg.variants_per_sample):
+            rng = np.random.default_rng([self.seed, epoch, int(index), k, 1])
+            kind = choose_prompt_type(
+                cfg, rng, allowed=allowed, exclude=set(chosen) | {PromptType.ADJACENT_SEED}
+            )
+            if kind in chosen:
+                break
+            chosen.append(kind)
+        return chosen
+
+    def _mixed_item(
+        self, example: CropExample, index: int, *, forced: PromptType | None = None
+    ) -> dict[str, Any]:
+        """One sample with prompt variants, negative context, and the matching dense masks and points.
+
+        Raises KeyError for a sample that cannot form a prompt (empty target after augmentation), so
+        ``__getitem__`` moves on to the next example.
+        """
+        tiles = self.tiles if self.tiles is not None else TileContext()
+        prompt_cfg = self.prompt_cfg if self.prompt_cfg is not None else PromptConfig()
+        epoch = 0 if forced is not None else (self.epoch.get() if self.epoch is not None else 0)
+        key = (example.volume, example.image_key)
+        full_tile = is_full_tile(example, self.full_tile_threshold)
+
+        gray = _load_gray_uint8(example.image_path)
+        rgb = to_rgb_uint8(gray)
+        shape = (int(rgb.shape[0]), int(rgb.shape[1]))
+        mask, ann = load_binary_mask(example)
+        if mask.shape[:2] != shape:
+            mask = np.array(
+                Image.fromarray(mask * 255, mode="L").resize((shape[1], shape[0]), resample=Image.NEAREST)
+            )
+            mask = (mask > 127).astype(np.uint8)
+        target = mask > 0
+        own = tiles.circle_for(key, example.location_id)
+        circle_mask: np.ndarray | None = None
+        if own is not None and own.center_in(shape):
+            disc = rasterize_circle(shape, own.center_x, own.center_y, own.radius)
+            circle_mask = disc if disc.any() else None
 
         regions = collect_negative_regions(
             example.image_key,
@@ -319,28 +581,18 @@ class EMSegDataset(Dataset):
         )
         if prompt_cfg.drop_overlapping_circles:
             regions = drop_circles_over_target(regions, target)
-        if forced is not None:
-            if example.target_circle is not None:
-                raise KeyError(f"circle-only target {example.split_key} cannot be validated with {forced.value}")
-            prompt_type = forced
-        elif example.target_circle is not None:
-            if not regions:
-                raise KeyError(f"circle target {example.split_key} has no other annotation in its tile")
-            prompt_type = PromptType.NEGATIVE_ONLY
-        else:
-            prompt_type = choose_prompt_type(
-                prompt_cfg,
-                rng,
-                can_circle_mask=circle_mask is not None,
-                has_negatives=bool(regions),
-                allowed=FULL_TILE_PROMPTS if is_full_tile(example, self.full_tile_threshold) else None,
-            )
-        use_circle = prompt_type is PromptType.CIRCLE_MASK
+        adjacent_shape = None if full_tile else tiles.adjacent_shape(key, example.location_id)
+        types = self._plan_types(
+            prompt_cfg, index, epoch, full_tile=full_tile, forced=forced, has_adjacent=adjacent_shape is not None
+        )
 
         # The target, every negative and the circle go through the same geometric transform as the image, so
         # prompts stay registered to it (elastic warps and flips included).
         layers = [target.astype(np.uint8)] + [r.mask.astype(np.uint8) for r in regions]
-        if use_circle and circle_mask is not None:
+        # An adjacent seed that cannot be fitted falls back to the circle seed, so it needs the circle too.
+        needs_circle = PromptType.CIRCLE_SEED in types or PromptType.ADJACENT_SEED in types
+        use_circle = needs_circle and circle_mask is not None
+        if use_circle:
             layers.append(circle_mask.astype(np.uint8))
         augmented = self.transform(image=rgb, masks=layers)
         image_aug = augmented["image"]
@@ -353,23 +605,44 @@ class EMSegDataset(Dataset):
             for region, mask in zip(regions, masks_aug[1 : 1 + len(regions)])
             if mask.any()
         ]
-        circle_aug = masks_aug[-1] if use_circle and circle_mask is not None else None
-        if use_circle and (circle_aug is None or not circle_aug.any()):
-            prompt_type = (
-                PromptType.POINTS if is_full_tile(example, self.full_tile_threshold) else PromptType.FULL_MASK
-            )
-            circle_aug = None
-        if prompt_type is PromptType.NEGATIVE_ONLY and not regions_aug:
-            raise KeyError(f"{example.split_key} lost every negative region after augmentation")
+        circle_aug = masks_aug[-1] if use_circle else None
+        if needs_circle and (circle_aug is None or not circle_aug.any()):
+            # No annotation circle in this tile (or it left the image): fit the largest circle inside the target.
+            fitted = inscribed_circle_xyr(target_aug, self.circle_scale)
+            if fitted is None:
+                raise KeyError(f"{example.split_key} has no mask to fit a circle to")
+            circle_aug = rasterize_circle(shape, *fitted)
 
-        prompt = build_prompt(
-            prompt_type,
-            target_mask=target_aug,
-            circle_mask=circle_aug,
-            regions=regions_aug,
-            cfg=prompt_cfg,
-            rng=rng,
-        )
+        canvases = negative_region_canvases(regions_aug, prompt_cfg) if len(types) > 1 and regions_aug else None
+        variants: list[dict[str, Any]] = []
+        for k, kind in enumerate(types):
+            prompt = build_prompt(
+                kind,
+                target_mask=target_aug,
+                circle_mask=circle_aug,
+                regions=regions_aug,
+                cfg=prompt_cfg,
+                rng=np.random.default_rng([self.seed, epoch, int(index), k]),
+                adjacent_shape=adjacent_shape,
+                negative_canvases=canvases,
+            )
+            variants.append(
+                {
+                    "point": torch.from_numpy(prompt.point_coords).reshape(-1, 2),
+                    "point_label": torch.from_numpy(prompt.point_labels),
+                    "boxes": None if prompt.box is None else torch.from_numpy(prompt.box),
+                    "dense_mask": None if prompt.dense_logits is None else torch.from_numpy(prompt.dense_logits),
+                    "prompt_fg": (
+                        None
+                        if prompt.foreground_weight is None
+                        else torch.from_numpy(prompt.foreground_weight.astype(np.float16))
+                    ),
+                    "prompt_input": (
+                        None if prompt.input_mask is None else torch.from_numpy(prompt.input_mask.astype(np.uint8))
+                    ),
+                    "prompt_type": prompt.prompt_type.value,
+                }
+            )
         meta = SampleMeta(
             volume=example.volume,
             image_key=example.image_key,
@@ -377,21 +650,14 @@ class EMSegDataset(Dataset):
             downsample=example.downsample,
             category_name=str(ann.get("category_name") or ann.get("structure_label") or ""),
             split_key=example.split_key,
-            full_tile=is_full_tile(example, self.full_tile_threshold),
+            full_tile=full_tile,
+            approved=self._is_approved(example),
         )
         return {
             "image": imagenet_normalize(np.ascontiguousarray(image_aug)),
             "mask": torch.from_numpy(target_aug.astype(np.int64)),
-            "point": torch.from_numpy(prompt.point_coords).reshape(-1, 2),
-            "point_label": torch.from_numpy(prompt.point_labels),
-            "boxes": None if prompt.box is None else torch.from_numpy(prompt.box),
-            "dense_mask": None if prompt.dense_logits is None else torch.from_numpy(prompt.dense_logits),
-            "prompt_fg": (
-                None
-                if prompt.foreground_region is None
-                else torch.from_numpy(prompt.foreground_region.astype(np.uint8))
-            ),
-            "prompt_type": prompt.prompt_type.value,
+            **self._weights(target_aug, regions_aug, meta),
+            "variants": variants,
             "orig_hw": (int(target_aug.shape[0]), int(target_aug.shape[1])),
             "sample_meta": meta,
             **meta.as_dict(),
@@ -399,40 +665,66 @@ class EMSegDataset(Dataset):
 
 
 def collate_em(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Stack a batch whose samples may carry different numbers of points.
+    """Stack a batch of samples, each with one or more prompt variants.
+
+    ``image``, ``mask`` and ``edge_weight`` (None unless every sample has one) are per sample, ``[B, ...]``.
+    Everything else is per variant, ``[N, ...]``, with ``variant_index`` (long ``[N]``) naming the sample each
+    variant belongs to. With one variant per sample ``N == B`` and ``variant_index`` is ``arange(B)``.
 
     ``point``/``point_label`` are padded to the largest count with label -1, which SAM2 treats as "not a
-    point". ``boxes`` and ``dense_mask`` stay lists with None for samples without one, because the prompt
-    encoder takes one tensor per call; the training loop groups samples by which prompts they have.
-    ``prompt_fg`` is the +1 region of each dense mask at full resolution (zeros when there is none), used by
-    the mask-containment loss. ``meta`` keeps its original keys; ``prompt_type`` is a parallel list.
+    point". ``boxes`` and ``dense_mask`` stay lists with None for variants without one, because the prompt
+    encoder takes one tensor per call; the training loop groups variants by which prompts they have.
+    ``prompt_fg`` is the trust of each seed at full resolution (float16, zeros when there is none), used by the
+    mask-containment loss. ``prompt_input`` is the seed or mask to correct as uint8 (None when no variant has
+    one). ``meta`` and ``orig_hw`` are repeated for each variant of a sample; ``prompt_type`` is a parallel list.
     """
-    count = len(batch)
-    most = max(int(item["point"].shape[0]) for item in batch)
+    rows = [(b, variant) for b, item in enumerate(batch) for variant in item["variants"]]
+    count = len(rows)
+    most = max(int(variant["point"].shape[0]) for _b, variant in rows)
     points = torch.zeros((count, most, 2), dtype=torch.float32)
     labels = torch.full((count, most), -1, dtype=torch.int32)
-    for row, item in enumerate(batch):
-        n = int(item["point"].shape[0])
+    for row, (_b, variant) in enumerate(rows):
+        n = int(variant["point"].shape[0])
         if n:
-            points[row, :n] = item["point"]
-            labels[row, :n] = item["point_label"]
+            points[row, :n] = variant["point"]
+            labels[row, :n] = variant["point_label"]
     masks = torch.stack([item["mask"] for item in batch], dim=0)
+    blank = torch.zeros_like(batch[0]["mask"], dtype=torch.uint8)
     prompt_fg = torch.stack(
         [
-            item["prompt_fg"] if item.get("prompt_fg") is not None else torch.zeros_like(item["mask"], dtype=torch.uint8)
-            for item in batch
+            variant["prompt_fg"] if variant.get("prompt_fg") is not None else blank.to(torch.float16)
+            for _b, variant in rows
         ],
         dim=0,
     )
+    prompt_input = None
+    if any(variant.get("prompt_input") is not None for _b, variant in rows):
+        prompt_input = torch.stack(
+            [variant["prompt_input"] if variant.get("prompt_input") is not None else blank for _b, variant in rows],
+            dim=0,
+        )
+    edge_weight = None
+    if all(item.get("edge_weight") is not None for item in batch):
+        edge_weight = torch.stack([item["edge_weight"] for item in batch], dim=0)
+    neighbor_core = None
+    if all(item.get("neighbor_core") is not None for item in batch):
+        neighbor_core = torch.stack([item["neighbor_core"] for item in batch], dim=0)
     return {
         "image": torch.stack([item["image"] for item in batch], dim=0),
         "mask": masks,
+        "edge_weight": edge_weight,
+        "sample_weight": torch.tensor([float(item.get("sample_weight", 1.0)) for item in batch], dtype=torch.float32),
+        "neighbor_core": neighbor_core,
+        "gt_terms": [item.get("gt_terms") for item in batch],
+        "val_family": [variant.get("val_family") for _b, variant in rows],
+        "variant_index": torch.tensor([b for b, _v in rows], dtype=torch.long),
         "point": points,
         "point_label": labels,
-        "boxes": [item.get("boxes") for item in batch],
-        "dense_mask": [item.get("dense_mask") for item in batch],
+        "boxes": [variant.get("boxes") for _b, variant in rows],
+        "dense_mask": [variant.get("dense_mask") for _b, variant in rows],
         "prompt_fg": prompt_fg,
-        "prompt_type": [item.get("prompt_type", "centroid") for item in batch],
-        "orig_hw": [item["orig_hw"] for item in batch],
-        "meta": [item["sample_meta"].as_dict() for item in batch],
+        "prompt_input": prompt_input,
+        "prompt_type": [variant.get("prompt_type", "centroid") for _b, variant in rows],
+        "orig_hw": [batch[b]["orig_hw"] for b, _v in rows],
+        "meta": [batch[b]["sample_meta"].as_dict() for b, _v in rows],
     }

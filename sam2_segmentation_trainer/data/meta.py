@@ -23,6 +23,8 @@ class SampleMeta:
     split_key: str
     full_tile: bool = False
     """The target fills at least ``data.full_tile_threshold`` of the tile; validation scores these apart."""
+    approved: bool = False
+    """The mask is in ``approved.json``; validation reports these as a reference set."""
 
     def as_dict(self) -> dict[str, Any]:
         """Mapping stored on a collated batch. Keys match this record."""
@@ -34,6 +36,7 @@ class SampleMeta:
             "category_name": self.category_name,
             "split_key": self.split_key,
             "full_tile": self.full_tile,
+            "approved": self.approved,
         }
 
     @property

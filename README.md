@@ -76,7 +76,7 @@ Training reads RC1, RC2, RPC1, and RPC2 under `$SAM2_DATA_ROOT` (default `/data-
 - `images/` — tile PNG/JPEG plus COCO-RLE sidecar JSON
 - `masks/` — required raster `{imageKey}_{locationId}.png` (examples without a mask PNG are skipped; no RLE fallback)
 - `overlays/` — viewing only, not used for training
-- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (the true radius, since the exporter records `diameter_scale` 1.0; a file from an older exporter has its scale baked in), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter, which no longer takes `-CircleDiameterScale`. The trainer shrinks the radii to `prompt.circle_diameter_scale` (0.95) when it loads them, rescaling by that value over the file's own `diameter_scale`, so changing the scale needs no re-export. `sam2-em-eval` has `--circle-scale` for the same value. Training needs it while circle-mask prompts are on: with `prompt.prob_circle_mask > 0` a volume without a usable file stops the run (`data.require_circle_file`, set `false` to warn only). Crops whose key has a negative origin (`X-512-512`) are read correctly by the exporter since the key decoder accepts them.
+- `circle_annotations.json` — optional. Circle annotations keyed by `imageKey`, in that crop's pixel space: `location_id`, `center_x`, `center_y`, `radius` (the true radius, since the exporter records `diameter_scale` 1.0; a file from an older exporter has its scale baked in), `structure_label`, `has_polygon_mask`, and `source` (`annotated` for a location that is still a circle, `inscribed` for the largest circle inside a polygon). Written by the nornir exporter, which no longer takes `-CircleDiameterScale`. The trainer shrinks the radii to `prompt.circle_diameter_scale` (0.95) when it loads them, rescaling by that value over the file's own `diameter_scale`, so changing the scale needs no re-export. `sam2-em-eval` has `--circle-scale` for the same value. Training needs it while circle-mask prompts are on: with `prompt.prob_circle_seed > 0` a volume without a usable file stops the run (`data.require_circle_file`, set `false` to warn only). Crops whose key has a negative origin (`X-512-512`) are read correctly by the exporter since the key decoder accepts them.
 
 One tile image can hold several `locationId`s (disk-efficient shared crops). The loader expands those to one training example per annotation. Every annotation is kept at its native downsample (D1–D128). Each new run stores its own `split.json` and `inputs.json` (volumes, per-volume train/val counts, data root) under the run directory. Every usable sample is kept. Validation is split by section (`data.split_mode: zslab`): within each volume, five contiguous runs of sections spaced evenly through the volume hold about 10% of its samples, and one section on each side of every run (`data.zslab.guard_sections`) is used by neither side. All crop windows of a section land on one side, so adjacent sections and overlapping windows never cross the split. `data.split_mode=location` restores the original random 90/10 over locations. An existing run keeps the split in its `split.json`; use `-refresh` to get the new one.
 
@@ -121,12 +121,21 @@ SAM2 is trained class-agnostic. Viking labels such as `MC` / `ConePR` are kept o
 
 ### Prompts in training
 
-Each training sample draws one prompt type (`prompt:` in `em_finetune.yaml`; they must sum to 1.0): points only (15%), box only (5%), box and points (10%), circle mask (45%), corrupted mask (25%). Full mask and negative only are available but set to 0. `prompt.enabled: false` goes back to one centroid point.
+Each training sample is encoded once and decoded with `prompt.variants_per_sample` (3) prompt variants against the same ground-truth polygon (`prompt:` in `em_finetune.yaml`; the shares must sum to 1.0). Variant 1 is always the production prompt, a circle seed (once adjacent-section shapes exist, an adjacent seed with probability `prob_adjacent_seed / (prob_adjacent_seed + prob_circle_seed)`); the others are drawn from the mix without replacement. **The shares below therefore steer variants 2 and 3 only**: the realised mix has more circle seeds than the table says. TensorBoard logs it per epoch as `train/prompt_mix/<family>` (share) and `train/prompt_count/<family>` (count). The loss averages a sample's variants first. Variant `k` is seeded from `(seed, epoch, index, k)`, so a resumed epoch replays exactly. `prompt.enabled: false` goes back to one centroid point. The full ground-truth mask is never a prompt: that is a copy task. The design is in `docs/mask_refinement_plan.md`.
 
-- **Circle mask:** the annotation circle is the dense mask prompt (+1), one foreground point sits at its center, and the loss compares to the full polygon. The model learns to grow from the circle to the boundary.
-- **Corrupted mask:** the ground-truth mask degraded the way hand painting is (grown or shrunk by up to `corrupt_max_shift_px`, partly painted with strokes, or traced as a coarse polygon; `data/corrupt.py`), plus one interior point. It does not feed the mask-containment loss because it is deliberately wrong in places.
-- **Full mask (off):** the whole ground-truth mask as the prompt is a copy task: the model can lower the loss by echoing its input. Kept for experiments.
-- **Negative only (off):** no foreground prompt; background points and the negative mask only. With more than one unannotated cell in a tile nothing says which one is the target, so it trains guessing. `negative.allow_circle_targets` stays false.
+| Family | Share | What it is |
+| --- | --- | --- |
+| Points only | 10% | 1-9 positive points |
+| Box only | 5% | jittered box |
+| Box and points | 5% | box plus 1-3 points |
+| Circle seed | 40% | inscribed circle x `circle_diameter_scale`, plus its center point (production) |
+| Adjacent-section seed | 15% | linked polygon from z +-1-2 scaled to fit inside the cell grown by 10 px (the annotator fits it to the visible membrane; needs the exporter's `shapes.jsonl`, not written yet; its share moves to the circle seed) |
+| Shrunk or cut seed | 10% | a subset of the truth: eroded 10-40 px, then optionally cut by a straight line or along the cell from an interior anchor |
+| Mask to correct | 10% | the truth grown 5-50 px, scaled 0.8-1.25, wobbled (mean 10-20 px, local excursions up to 50 px), simplified then grown or shrunk by up to 30 px, or merged with part of a neighbor |
+| Near-correct mask | 5% | the truth as a good human trace would draw it: outline wobble of 5-12 px on average plus 1-3 local bulges or dents of 15-30 px (never more than 30 px off); the model must leave it at least as good. Its click comes from this mask, as in production |
+
+- **Seeds and masks to correct:** a seed is trusted inside the cell and the engine grows beyond it (`data/refine.py`); a mask to correct is a suggestion that may be wrong, fed at a lower strength. Only seeds feed the mask-containment loss.
+- **Edge confidence:** traces are about 9 px (20 nm) from the membrane on average, interiors are trusted. Every dense value is scaled by `c(d) = 1 - exp(-d / tau_eff)`, `d` the pixel distance to the mask's edge, `tau_eff = min(prompt.edge_tau_px, prompt.edge_tau_depth_frac * D)` with `D` the mask's maximum depth, computed per mask (target, each seed, each neighbor). With `edge_tau_px` 8 that is 95% about 24 px inside the line, and a process 20 px wide gets `tau_eff` about 2.5 so it is not all edge. The array border is not an edge, so a mask cut by the tile stays confident there. Excursions of 30-50 px are not covered by any symmetric band; they stay as sparse label noise.
 - **Fully masked tiles:** where the target covers at least `data.full_tile_threshold` (0.99) of the tile, training keeps a deterministic `data.full_tile_keep_fraction` (0.25) of the tiles per location and gives them only point or circle-mask prompts. Production still meets such tiles, so they are not removed.
 - **Corrective clicks (`iterative:`):** `iterative.batch_fraction` (0.2) of the batches predict, sample a click from where the prediction is wrong (a missed area gives a positive click, a spurious one a negative click), and re-run with the previous low-resolution logits plus the click, `rounds_min` to `rounds_max` times. Only the last pass has gradients, and the previous logits are fed back for `prev_mask_prob` of the samples (`sam2_segmentation_trainer/interactive.py`). A ground-truth mask is never the prompt.
 - **Circle negatives over the target:** a neighbor's circle that reaches into the target contradicts the ground truth. `sam2-em-validate --circle-overlap 2000` measures how often; `negative.drop_overlapping_circles` leaves such circles out (off by default).
@@ -135,13 +144,36 @@ Each training sample draws one prompt type (`prompt:` in `em_finetune.yaml`; the
 
 ### Validation
 
-The validation split (see the layout section) is scored once per prompt in `eval.val_prompts`, each with a fixed, reproducible prompt: `circle_mask` (the inscribed circle, what production starts from), `point` (the deepest interior pixel) and `centroid` (the original prompt; it falls outside C-shaped cells in 2-6% of masks). `eval.primary_val_prompt` (`circle_mask`) picks `best_model.pt` and drives early stopping; `val/iou` follows it. TensorBoard also gets `val/iou/<prompt>`, `val/bf/<prompt>` (boundary F1), `val_iou/<prompt>/<volume>` and `val_iou_cat/<prompt>/<category>`. Fully masked tiles are scored apart as `val/iou_fulltile/<prompt>` and left out of the headline number.
+The goal is to identify cells and their connectivity: at least 97.5% of each cell's interior captured, no merges into neighbors. The validation split (see the layout section) is scored once per prompt in `eval.val_prompts`, each with a fixed, reproducible prompt, and every family reports the goal metrics. All of them ignore a band of `val.core_band_px` (10) around the traced edge, because the trace itself is about 9 px from the membrane:
+
+| Metric | What it is |
+| --- | --- |
+| Core recall | the share of ground-truth pixels at least 10 px inside the edge that are predicted. Reported pooled, as the per-sample 10th percentile, and as the share of samples at or above 97.5% |
+| Leak | the share of predicted pixels inside a neighbor's core (at least 10 px inside that neighbor) |
+| Merge rate | the share of samples whose prediction covers at least 5% of any one neighbor's core |
+| Spill | predicted area more than 10 px outside the ground truth, divided by the ground-truth area (leaks into cells nobody annotated) |
+| Fragmentation | the share of samples whose prediction has more components (of at least 200 px) than the ground truth |
+
+| Prompt | What it checks |
+| --- | --- |
+| `circle_mask` | the inscribed circle as a seed (what production starts from); the primary family |
+| `correction` | a mask to correct; the input mask's metrics and the change from them are reported too |
+| `near_correct` | a good human trace; "do no harm" is the share of samples whose core recall drops at most 0.5 points and whose spill rises at most 0.5% of the ground truth |
+| `point` | one point at the deepest interior pixel |
+| `centroid` | the original prompt (falls outside C-shaped cells in 2-6% of masks): raw IoU, for continuity with earlier runs |
+
+Tolerant IoU (ignoring pixels whose loss weight is below 0.5) and boundary F1 at 10 and 20 px are kept as diagnostics only; their values are not comparable with `val/iou` of earlier runs. TensorBoard gets `val/<metric>/<prompt>` for `core_recall`, `core_recall_p10`, `core_recall_ok`, `leak`, `merge_rate`, `spill` and `frag`; for the refinement prompts also `val/input/<metric>/<prompt>` and `val/delta_<metric>/<prompt>`; `val/no_harm/near_correct`; and the diagnostics `val/iou/<prompt>`, `val/raw_iou/<prompt>`, `val/bf10/<prompt>`, `val/bf20/<prompt>`, `val_iou/<prompt>/<volume>` and `val_iou_cat/<prompt>/<category>`. Fully masked tiles are scored apart as `val/iou_fulltile/<prompt>` and left out of the headline.
+
+- **Approved masks:** `data.approved_path` points at the gallery's `approved.json` (a list of `{"location_id", "image_key"}` entries). Those masks are reported as their own row (`val_approved/<metric>/<prompt>`, count in `val_approved/n/<prompt>`), how many there are per volume is printed at start-up, and `data.approved_weight` (1.0) is their training weight. A missing file warns and skips the row. Keep a copy next to the export so runs are reproducible.
+- **Checkpoint and early stopping:** among epochs whose pooled core recall on the primary prompt is at least `val.core_recall_target` (0.975), `best_model.pt` is the one with the lowest merge rate, spill breaking ties; if none reaches it, the highest core recall. A change smaller than the noise floor does not count as better: at the target the merge rate must fall by at least `training.early_stopping_min_delta` (0.002), or, if it moved by less than that, the spill must; below the target the core recall must rise by at least 0.0005; crossing the target always counts. The comparison is against the best epoch so far, so many tiny gains add up. `training.early_stopping_patience` (2) epochs without a better one stop the run. The numbers that decide are the per-epoch subset's.
+- **Cost and the subset:** one validation pass loads each sample once, runs the image encoder once and decodes every family from that embedding (batches of `val.batch_size` images, so `batch_size x families` prompts), with the metrics in `val.metric_threads` threads while the GPU does the next batch. Each family's prompt is seeded from the run seed, the sample (volume, image key, location id) and the family, so results do not depend on batch composition, family order or which samples are in the pass. Every epoch validates a fixed subset (`val.epoch_subset`, 25% of each volume, drawn once from the run seed, stratified by volume, always holding every Approved sample) without the legacy `centroid` family. The full split, centroid included, runs every `val.full_every_n_epochs` (3) epochs and after the last (and before an early stop). TensorBoard keeps them apart: `val_subset/...` and `val_full/...` (the old `val/iou` follows the subset). `sam2-em-train -benchmark` times both passes and projects the run.
+
 - **Box:** a hint that the object is most likely inside (each edge jittered outward by up to `box_jitter_frac`). Nothing penalizes predictions that leave the box.
-- **Negative context:** every other annotation in the tile (neighbor masks, plus circles that have no mask) is a -1 area of the dense mask and, with probability `negative.bg_point_prob_*`, becomes 1-9 background points. Where a +1 area and a -1 area overlap the value is 0 (unknown). With no negatives and no foreground mask the dense prompt is omitted so the encoder uses its learned no-mask embedding, not an all-zero mask.
-- **Dense mask scale:** the signed mask is downsampled (nearest) to the 256x256 `mask_input` and fed as logits of +/-10 (`data/prompts.py` `MASK_PROMPT_LOGIT`). The segmentation server does not yet turn a 1-bit mask Feature into `mask_input`; when it does it must use the same values.
-- **Losses:** `loss.mask_contain_weight` penalizes predicting background where a mask prompt said foreground (zero when the model respects it; ramps up over `loss.containment_warmup_epochs`). There is no box counterpart, and no hard clamp on box exteriors.
+- **Negative context:** every other annotation in the tile (neighbor masks, plus circles that have no mask) is a negative area of the dense mask, scaled by that neighbor's own edge confidence, and, with probability `negative.bg_point_prob_*`, becomes 1-9 background points. A neighbor merged into a mask to correct is left out, otherwise the prompt would label the error. With no negatives and no dense foreground the dense prompt is omitted so the encoder uses its learned no-mask embedding, not an all-zero mask.
+- **Dense mask scale:** `annotation_crops/prompt_encoding.py` builds the 256x256 `mask_input`: seeds at `+prompt.seed_logit` (10) x c(d), masks to correct at `+prompt.correction_logit` (3) x c(d), negatives at -10 x c(d), unknown 0; overlaps sum and clip to +-10; the canvas is reduced by area averaging. The segmentation server does not yet use this module; when it builds `mask_input` it must use the same function and constants.
+- **Losses:** labels stay hard 0/1. `loss.edge_tau_px` (8) weights each pixel by `w(d) = max(loss.edge_weight_min, 1 - exp(-d / tau_eff))`, `d` the distance to the ground-truth edge on both sides and `tau_eff` capped by the target's own depth, in the focal, dice and IoU-head terms (the IoU target ignores pixels with weight below 0.5); 0 turns the edge weighting off. **Leak penalty:** `loss.leak_weight` (3, 1 turns it off) multiplies the focal and dice weight of pixels at least `val.core_band_px` inside another annotation and outside the target, neighbor-merge samples included, because a merge breaks connectivity. `loss.mask_contain_weight` penalizes predicting background where a seed said foreground, weighted by the seed's confidence, so it acts on the trusted core (zero when the model respects it; ramps up over `loss.containment_warmup_epochs`). It never applies to masks to correct. There is no box counterpart, and no hard clamp on box exteriors.
 - **Prompt encoder:** still frozen except its `mask_downscaling` network (`model.unfreeze_mask_cnn`), which has to learn the mask semantics. A run cannot resume across changing this; use `-refresh`.
-- **Circle-only targets:** `negative.allow_circle_targets` also trains the negative-only prompt on circles that have no mask (the disc is the target), capped at `negative.circle_target_fraction` of the mask-bearing examples.
+- **Removed:** `prompt.prob_full_mask`, `prob_negative_only`, `prob_circle_mask`, `prob_corrupted_mask`, `negative.allow_circle_targets` and `negative.circle_target_fraction`. A run started before this change should be restarted with `-refresh`: its mask network was trained on the old +-1 encoding.
 
 ## Train / eval / infer
 
@@ -166,8 +198,22 @@ sam2-em-train
 sam2-em-train -refresh
 
 # Time ~50 train batches + 20 val forwards (plus warmup), then exit. Does not load or write last.pt.
+# It prints the step time, the data-loader wait (data-bound or GPU-bound), the peak CUDA memory of the timed steps
+# and the seconds per sample of a validation subset pass and of a full pass, with the projected run.
+# Keep the outputs in benchmarks/ (git-ignored): sam2-em-train -benchmark 2>&1 | tee benchmarks/v3_bs4.txt
 sam2-em-train -benchmark
 sam2-em-train -benchmark --benchmark-steps 80 --benchmark-val-steps 30
+# Training steps only (no validation timing): sam2-em-train -benchmark --benchmark-no-val
+# Compare two configurations A, B, A, B with the GPU clocks, temperature, power and throttle reasons logged
+# (nvidia-smi every 5 s) and the other GPU processes noted; prints a table when done:
+#   bash scripts/compare_throughput.sh          # results in benchmarks/throughput/
+#   python scripts/summarize_throughput.py benchmarks/throughput
+# Try a setting without editing the config: prompt variants, batch size, activation checkpointing, cuDNN autotuner.
+sam2-em-train -benchmark prompt.variants_per_sample=2
+# The defaults are batch 2 x 8 accumulation with activation checkpointing off (see em_finetune.yaml for the
+# measurements). On a smaller card: checkpointing on, or only a share of the blocks, at batch 4.
+sam2-em-train -benchmark model.activation_checkpointing=true training.batch_size=4 training.gradient_accumulation_steps=4
+sam2-em-train -benchmark model.activation_checkpointing=true model.activation_checkpointing_fraction=0.5 training.batch_size=4 training.gradient_accumulation_steps=4
 
 # TensorBoard starts with the container (cursor-dev-entry.sh) on :6006.
 # Compose maps host 8060 -> 6006. Events under /storage4/Sam2Trainer/runs/<run>/tb/.

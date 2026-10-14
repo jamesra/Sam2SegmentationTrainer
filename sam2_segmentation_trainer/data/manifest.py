@@ -26,9 +26,6 @@ class CropExample:
     split_key: str
     width: int | None = None
     height: int | None = None
-    target_circle: tuple[float, float, float] | None = None
-    """``(center_x, center_y, radius)`` in tile pixels for an example whose target is a circle annotation
-    with no mask file (see ``tiles.circle_target_examples``); None for the usual polygon-mask example."""
     area_frac: float | None = None
     """Fraction of the tile the target mask covers (sidecar `area` over width times height), when known."""
 

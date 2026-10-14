@@ -45,7 +45,6 @@ from sam2_segmentation_trainer.data.prompts import PromptConfig
 from sam2_segmentation_trainer.data.tiles import (
     TileContext,
     build_tile_context,
-    circle_target_examples,
 )
 from sam2_segmentation_trainer.losses import containment_warmup_scale
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
@@ -61,11 +60,15 @@ from sam2_segmentation_trainer.data.manifest import (
     volume_counts,
 )
 from sam2_segmentation_trainer.data.fulltile import cap_full_tiles, is_full_tile
+from sam2_segmentation_trainer.goal_metrics import EARLY_STOPPING_MIN_DELTA, SelectionKey, improves
 from sam2_segmentation_trainer.interactive import iterative_predict_masks
 from sam2_segmentation_trainer.validation import (
     DEFAULT_VAL_PROMPTS,
     ValidationSuite,
+    collect_family_records,
     collect_records,
+    epoch_selection,
+    full_pass_due,
     log_results,
 )
 from sam2_segmentation_trainer.data.splits import (
@@ -177,9 +180,13 @@ def _amp_setup(device: torch.device, enabled: bool):
     return dtype, scaler
 
 
-def enable_cudnn_benchmark(device: torch.device) -> bool:
-    """Let cuDNN pick convolution algorithms for a fixed tile size (always 1024×1024)."""
-    if device.type != "cuda":
+def enable_cudnn_benchmark(device: torch.device, enabled: bool = True) -> bool:
+    """Let cuDNN pick convolution algorithms for a fixed tile size (always 1024×1024).
+
+    ``training.cudnn_benchmark: false`` turns the autotuner off: it can pick an algorithm with a very large
+    workspace for one batch shape (seen as a 21 GB peak at 3 prompt variants, 12 GB at 1, 2 and 4).
+    """
+    if device.type != "cuda" or not enabled:
         return False
     torch.backends.cudnn.benchmark = True
     return True
@@ -240,7 +247,10 @@ def _is_oom(exc: BaseException) -> bool:
     accelerator_err = getattr(torch, "AcceleratorError", None)
     if accelerator_err is not None and isinstance(exc, accelerator_err):
         return "out of memory" in str(exc).lower()
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    text = str(exc).lower()
+    # Under memory pressure some drivers report a failed mapping (seen as "CUDA driver error: device not ready")
+    # instead of "out of memory".
+    return isinstance(exc, RuntimeError) and ("out of memory" in text or "failed to create gpu mapping" in text)
 
 
 def _summarize_times(times: list[float]) -> str:
@@ -252,6 +262,53 @@ def _summarize_times(times: list[float]) -> str:
         f"{mean:.3f} s/it (median {median:.3f}, "
         f"min {min(times):.3f}, max {max(times):.3f}, n={len(times)})"
     )
+
+
+def _time_validation_suite(
+    model, val_suite: ValidationSuite, device, image_size: int, threshold: float, warmup: int, steps: int
+) -> dict[str, tuple[float, float]]:
+    """Seconds per validation sample of a subset pass and of a full pass of the real suite.
+
+    Each pass scores the first ``warmup + steps`` samples with every family it runs; the batches holding the first
+    ``warmup`` samples are not timed. A time is the interval between two batches reaching the scoring loop divided
+    by the batch size, so it covers data loading, the one encoder pass, all the decodes and the metrics (which run
+    in threads while the GPU works on the next batch). Returns ``{"subset": (seconds, metrics_wait), "full": ...}``
+    per sample, where ``metrics_wait`` is the part the main thread spent waiting for the metrics.
+    """
+    result: dict[str, tuple[float, float]] = {}
+    batch_size = val_suite.batch_size
+    for name, full in (("subset", False), ("full", True)):
+        dataset = val_suite.full_dataset if full else val_suite.subset_dataset
+        take = min(len(dataset), max(2, warmup + steps))
+        if take == 0:
+            continue
+        stamps: list[float] = []
+        timings: dict[str, float] = {}
+        base = val_suite.loader(full=full, limit=take)
+
+        def stamped(batches=base, marks=stamps):
+            for batch in batches:
+                marks.append(time.perf_counter())
+                yield batch
+
+        collect_family_records(
+            model,
+            stamped(),
+            device,
+            image_size,
+            threshold,
+            core_band_px=val_suite.core_band_px,
+            metric_threads=val_suite.metric_threads,
+            timings=timings,
+        )
+        stamps.append(time.perf_counter())
+        batches = len(stamps) - 1
+        skip = min(math.ceil(warmup / batch_size), max(0, batches - 1))
+        intervals = [b - a for a, b in zip(stamps[skip:-1], stamps[skip + 1 :])]
+        seconds = statistics.fmean(intervals) / batch_size if intervals else 0.0
+        wait = timings.get("metrics_wait_s", 0.0) / max(1, take)
+        result[name] = (seconds, wait)
+    return result
 
 
 def run_throughput_benchmark(
@@ -281,6 +338,8 @@ def run_throughput_benchmark(
     warmup_train: int = 10,
     warmup_val: int = 3,
     progress: TrainingProgress | None = None,
+    val_suite: ValidationSuite | None = None,
+    time_validation: bool = True,
 ) -> dict[str, float]:
     # Wall-clock includes DataLoader wait; that is the tqdm s/it the full run will see.
     model.train()
@@ -309,10 +368,9 @@ def run_throughput_benchmark(
 
     def train_one(batch, step_i: int) -> float:
         images = batch["image"].to(device, non_blocking=True)
-        masks = batch["mask"].to(device, non_blocking=True)
         points = batch["point"].to(device, non_blocking=True)
         labels = batch["point_label"].to(device, non_blocking=True)
-        prompt_fg = batch["prompt_fg"].to(device, non_blocking=True)
+        inputs = _loss_inputs(batch, device)
         with torch.amp.autocast(
             device_type=device.type,
             dtype=amp_dtype,
@@ -326,10 +384,11 @@ def run_throughput_benchmark(
                 batch["boxes"],
                 batch["dense_mask"],
                 image_size=image_size,
+                variant_index=inputs["variant_index"],
             )
             loss, stats = combined_loss(
                 pred,
-                masks,
+                inputs["masks"],
                 iou_preds,
                 focal_weight=float(cfg.loss.focal_weight),
                 dice_weight=float(cfg.loss.dice_weight),
@@ -338,9 +397,13 @@ def run_throughput_benchmark(
                 labels=labels,
                 containment_weight=float(cfg.loss.get("containment_weight", 0.0)),
                 containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
-                prompt_foreground=prompt_fg,
+                prompt_foreground=inputs["prompt_fg"],
                 mask_contain_weight=_mask_contain_weight(cfg, 1.0),
                 iou_use_l1=_iou_use_l1(cfg),
+                edge_weight=inputs["edge_weight"],
+                variant_index=inputs["variant_index"],
+                num_samples=images.shape[0],
+                sample_weight=inputs["sample_weight"],
             )
             loss = loss / accum
         scaler.scale(loss).backward()
@@ -364,11 +427,18 @@ def run_throughput_benchmark(
             _sync_device(device)
 
         train_times: list[float] = []
+        wait_times: list[float] = []
+        variant_counts: list[int] = []
         log_every = int(cfg.training.log_every_n_steps)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         for j in range(train_steps):
             i = warmup_train + j
             t0 = time.perf_counter()
-            step_loss = train_one(next(train_iter), i)
+            batch = next(train_iter)  # time spent here is the GPU waiting for the DataLoader
+            wait_times.append(time.perf_counter() - t0)
+            variant_counts.append(int(batch["point"].shape[0]))
+            step_loss = train_one(batch, i)
             _sync_device(device)
             train_times.append(time.perf_counter() - t0)
             if progress is not None:
@@ -392,7 +462,9 @@ def run_throughput_benchmark(
 
     val_times: list[float] = []
     need_val = warmup_val + val_steps
-    n_val_take = min(len(val_ds), need_val)
+    # With a validation suite the real pass is timed below (its dataset carries one prompt variant per family, which
+    # this single-prompt timing loop cannot decode); without one, time a plain point-prompt forward.
+    n_val_take = 0 if (val_suite is not None or not time_validation) else min(len(val_ds), need_val)
     if n_val_take > 0:
         if n_val_take < need_val:
             warmup_val = min(warmup_val, max(0, n_val_take // 5))
@@ -439,6 +511,11 @@ def run_throughput_benchmark(
 
     train_s = statistics.fmean(train_times) if train_times else 0.0
     val_s = statistics.fmean(val_times) if val_times else 0.0
+    suite_times: dict[str, tuple[float, float]] = {}
+    if time_validation and val_suite is not None and len(val_suite) > 0:
+        suite_times = _time_validation_suite(
+            model, val_suite, device, image_size, float(cfg.data.mask_threshold), warmup_val, val_steps
+        )
     projected = project_full_run(
         train_s=train_s,
         val_s=val_s,
@@ -447,6 +524,18 @@ def run_throughput_benchmark(
         num_epochs=num_epochs,
         val_every_n_epochs=val_every_n_epochs,
     )
+    if suite_times:
+        # Every epoch validates the subset; every `full_every` epochs and after the last, the full split instead.
+        full_every = max(1, int(OmegaConf.select(cfg, "val.full_every_n_epochs", default=3)))
+        subset_pass_s = suite_times["subset"][0] * val_suite.subset_size
+        full_pass_s = suite_times["full"][0] * len(val_suite)
+        n_full = sum(1 for e in range(num_epochs) if full_pass_due(e, num_epochs, full_every))
+        projected["val_pass_s"] = subset_pass_s
+        projected["val_full_pass_s"] = full_pass_s
+        projected["full_run_s"] = (
+            projected["train_epoch_s"] * num_epochs + subset_pass_s * (num_epochs - n_full) + full_pass_s * n_full
+        )
+        projected["n_full_passes"] = float(n_full)
     gpu = (
         torch.cuda.get_device_name(0)
         if device.type == "cuda" and torch.cuda.is_available()
@@ -456,16 +545,61 @@ def run_throughput_benchmark(
     print(f"  GPU: {gpu}")
     print(
         f"  timed {len(train_times)} train batches after {warmup_train} warmup; "
-        f"{len(val_times)} val after {warmup_val} warmup"
+        + (
+            f"{warmup_val + val_steps} validation samples per pass ({warmup_val} warmup)"
+            if suite_times
+            else "validation not timed"
+            if not time_validation
+            else f"{len(val_times)} val after {warmup_val} warmup"
+        )
     )
     print(
-        f"  train={n_train} val={n_val} batch_size={batch_size} "
+        f"  train={n_train} val={n_val} batch_size={batch_size} image_size={image_size} "
         f"batches/epoch={batches_per_epoch} epochs={num_epochs}"
     )
     print(f"  train {_summarize_times(train_times)}")
-    print(f"  val   {_summarize_times(val_times)}")
+    if wait_times:
+        wait_s = statistics.fmean(wait_times)
+        share = wait_s / statistics.fmean(train_times) if train_times else 0.0
+        print(
+            f"  data wait {_summarize_times(wait_times)}; {share:.0%} of the step "
+            f"({num_workers} workers, prefetch {int(cfg.training.prefetch_factor)}; "
+            f"{statistics.fmean(variant_counts) / batch_size:.1f} prompt variants per sample)"
+        )
+        print(
+            "    -> data-bound: more workers or cheaper prompts help"
+            if share > 0.2
+            else "    -> GPU-bound: the DataLoader keeps up"
+        )
+    if device.type == "cuda" and torch.cuda.is_available():
+        print(
+            f"  peak CUDA memory in the timed train steps: "
+            f"{torch.cuda.max_memory_allocated() / 1024**3:.2f}G allocated, "
+            f"{torch.cuda.max_memory_reserved() / 1024**3:.2f}G reserved, "
+            f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}G total"
+        )
+    if val_times:
+        print(f"  val   {_summarize_times(val_times)}  (one family, point prompt, no goal metrics)")
+    if suite_times:
+        for name in ("subset", "full"):
+            if name in suite_times:
+                seconds, wait = suite_times[name]
+                families = val_suite.subset_modes if name == "subset" else val_suite.modes
+                size = val_suite.subset_size if name == "subset" else len(val_suite)
+                print(
+                    f"  val {name:6s} {seconds:.3f} s/sample ({len(families)} families, one encoder pass, batch "
+                    f"{val_suite.batch_size}, {val_suite.metric_threads} metric threads; waited {wait:.3f} s/sample "
+                    f"for the metrics) x {size} samples"
+                )
     print(f"  estimated train epoch: {format_duration(projected['train_epoch_s'])}")
-    print(f"  estimated val pass:    {format_duration(projected['val_pass_s'])}")
+    if suite_times:
+        print(f"  estimated val pass, subset (every epoch):       {format_duration(projected['val_pass_s'])}")
+        print(
+            f"  estimated val pass, full ({int(projected['n_full_passes'])} of {num_epochs} epochs):  "
+            f"{format_duration(projected['val_full_pass_s'])}"
+        )
+    elif time_validation:
+        print(f"  estimated val pass:    {format_duration(projected['val_pass_s'])}")
     estimate = (
         f"  estimated {num_epochs}-epoch run: "
         f"{format_duration(projected['full_run_s'])} (no early stopping)"
@@ -493,32 +627,10 @@ def _circle_scale(cfg: DictConfig) -> float:
 def _circle_guard(cfg: DictConfig, prompt_cfg: PromptConfig) -> dict:
     """Keyword arguments for :func:`build_tile_context`: the circle scale, and a failure when circles are absent."""
     return {
-        "require_circles": prompt_cfg.prob_circle_mask > 0.0
+        "require_circles": prompt_cfg.prob_circle_seed > 0.0
         and bool(OmegaConf.select(cfg, "data.require_circle_file", default=True)),
         "circle_scale": _circle_scale(cfg),
     }
-
-
-def _with_circle_targets(
-    examples: list,
-    prompt_cfg: PromptConfig,
-    seed: int,
-    guard: dict | None = None,
-) -> tuple[list, TileContext]:
-    """Tile context for ``examples`` plus, when allowed, circle-only training examples appended to them.
-
-    The context is built from the mask-bearing examples alone, so the added circle targets are not their own
-    neighbors. Used at startup and again whenever the inventory is rebuilt.
-    """
-    context = build_tile_context(examples, **(guard or {}))
-    if prompt_cfg.allow_circle_targets:
-        extra = circle_target_examples(
-            examples, context, max_fraction=prompt_cfg.circle_target_fraction, seed=seed
-        )
-        if extra:
-            print(f"added {len(extra)} circle-only negative-prompt targets")
-            return list(examples) + extra, context
-    return list(examples), context
 
 
 def prompt_mix_fractions(counts: Counter[str]) -> dict[str, float]:
@@ -530,7 +642,8 @@ def prompt_mix_fractions(counts: Counter[str]) -> dict[str, float]:
 
 
 def _log_prompt_mix(writer: SummaryWriter, epoch: int, counts: Counter[str]) -> None:
-    """Print and log the realized prompt mix, so a missing circle file or a dropped type shows at once."""
+    """Print and log the realized prompt mix (share and count per family), so a missing circle file or a dropped
+    type shows at once. Variant 0 of every sample is fixed, so this differs from the ``prob_*`` shares."""
     fractions = prompt_mix_fractions(counts)
     if not fractions:
         return
@@ -538,6 +651,7 @@ def _log_prompt_mix(writer: SummaryWriter, epoch: int, counts: Counter[str]) -> 
     print(f"epoch {epoch} prompt mix ({sum(counts.values())} samples): {summary}")
     for ptype, share in fractions.items():
         writer.add_scalar(f"train/prompt_mix/{ptype}", share, epoch)
+        writer.add_scalar(f"train/prompt_count/{ptype}", counts[ptype], epoch)
 
 
 def _iterative_rounds(cfg: DictConfig, seed: int, epoch: int, step: int) -> int:
@@ -577,6 +691,81 @@ def _cap_full_tiles(train_ex: list, cfg: DictConfig) -> list:
 def _iou_use_l1(cfg: DictConfig) -> bool:
     """SAM 2 trains the IoU head with L1 (``iou_use_l1_loss``); ``loss.iou_use_l1: false`` restores MSE."""
     return bool(OmegaConf.select(cfg, "loss.iou_use_l1", default=True))
+
+
+def _edge_loss_settings(cfg: DictConfig) -> tuple[float, float]:
+    """``(loss.edge_tau_px, loss.edge_weight_min)``: tau of the edge-tolerant loss weight (0 disables it) and its floor."""
+    tau = float(OmegaConf.select(cfg, "loss.edge_tau_px", default=8.0))
+    return tau, float(OmegaConf.select(cfg, "loss.edge_weight_min", default=0.05))
+
+
+def _tau_depth_frac(cfg: DictConfig) -> float:
+    """``prompt.edge_tau_depth_frac``: the thin-process cap of tau, shared by the prompt encoding and the loss weight."""
+    return float(OmegaConf.select(cfg, "prompt.edge_tau_depth_frac", default=0.25))
+
+
+def _leak_settings(cfg: DictConfig) -> tuple[float, float]:
+    """``(loss.leak_weight, val.core_band_px)``: the weight on neighbor cores (1 disables) and how deep inside a
+    neighbor a pixel must be to count as its core."""
+    return (
+        float(OmegaConf.select(cfg, "loss.leak_weight", default=3.0)),
+        float(OmegaConf.select(cfg, "val.core_band_px", default=10.0)),
+    )
+
+
+def _tolerance_tau(cfg: DictConfig) -> float:
+    """Tau of the band the tolerant IoU ignores. It follows the loss weight, or 8 px when edge weighting is off."""
+    tau = _edge_loss_settings(cfg)[0]
+    return tau if tau > 0.0 else 8.0
+
+
+def load_approved_set(cfg: DictConfig) -> frozenset:
+    """``(location_id, image_key)`` pairs from ``data.approved_path`` (``approved.json``), or an empty set.
+
+    The file is the gallery's list of approved masks, entries ``{"location_id": ..., "image_key": ...}`` (a
+    ``[location_id, image_key]`` pair works too). A missing path warns and skips the Approved row.
+    """
+    raw = OmegaConf.select(cfg, "data.approved_path", default=None)
+    if not raw:
+        return frozenset()
+    path = Path(str(raw))
+    if not path.is_file():
+        print(f"WARNING: data.approved_path {path} not found; Approved masks will not be reported or weighted")
+        return frozenset()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    keys: set[tuple[int, str]] = set()
+    for item in payload if isinstance(payload, list) else []:
+        try:
+            if isinstance(item, dict):
+                keys.add((int(item["location_id"]), str(item.get("image_key") or "")))
+            else:
+                location_id, image_key = item
+                keys.add((int(location_id), str(image_key or "")))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return frozenset(keys)
+
+
+def approved_counts(examples, approved: frozenset) -> dict[str, int]:
+    """How many of ``examples`` are approved, per volume."""
+    counts: dict[str, int] = {}
+    for ex in examples:
+        if (int(ex.location_id), ex.image_key) in approved:
+            counts[ex.volume] = counts.get(ex.volume, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _loss_inputs(batch: dict, device) -> dict:
+    """Device tensors shared by every loss call: per-variant targets and weights, and the variant index."""
+    index = batch["variant_index"].to(device, non_blocking=True)
+    edge = batch.get("edge_weight")
+    return {
+        "variant_index": index,
+        "masks": batch["mask"].to(device, non_blocking=True)[index],
+        "edge_weight": None if edge is None else edge.to(device, non_blocking=True)[index],
+        "prompt_fg": batch["prompt_fg"].to(device, non_blocking=True),
+        "sample_weight": batch["sample_weight"].to(device, non_blocking=True),
+    }
 
 
 def _mask_contain_weight(cfg: DictConfig, scale: float) -> float:
@@ -778,6 +967,7 @@ def _snapshot(
     epochs_without_improve: int,
     freeze_mode: str,
     unfreeze_mask_cnn: bool = False,
+    best_selection: list | None = None,
 ) -> dict:
     return TrainSnapshot(
         model=model,
@@ -793,6 +983,7 @@ def _snapshot(
         freeze_mode=freeze_mode,
         rng=capture_rng(),
         unfreeze_mask_cnn=unfreeze_mask_cnn,
+        best_selection=best_selection,
     ).as_checkpoint()
 
 
@@ -920,9 +1111,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     prompt_cfg = PromptConfig.from_cfg(cfg)
     tile_context: TileContext | None = None
     if mixed_prompts:
-        examples, tile_context = _with_circle_targets(
-            examples, prompt_cfg, int(cfg.training.seed), _circle_guard(cfg, prompt_cfg)
-        )
+        tile_context = build_tile_context(examples, **_circle_guard(cfg, prompt_cfg))
         n_with_negatives = sum(
             1
             for ex in examples
@@ -1014,6 +1203,14 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         ),
     )
 
+    approved = load_approved_set(cfg)
+    core_recall_target = float(OmegaConf.select(cfg, "val.core_recall_target", default=0.975))
+    if approved:
+        print(
+            f"approved masks: {len(approved)} in approved.json; "
+            f"train per volume {approved_counts(train_ex, approved)}; "
+            f"val per volume {approved_counts(val_ex, approved)}"
+        )
     batch_size = int(cfg.training.batch_size)
     num_workers = int(cfg.training.num_workers)
     prefetch_factor = int(cfg.training.prefetch_factor)
@@ -1031,6 +1228,13 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         seed=seed,
         epoch=epoch_counter,
         full_tile_threshold=_full_tile_settings(cfg)[0],
+        edge_tau_px=_edge_loss_settings(cfg)[0],
+        edge_weight_min=_edge_loss_settings(cfg)[1],
+        edge_tau_depth_frac=_tau_depth_frac(cfg),
+        leak_weight=_leak_settings(cfg)[0],
+        leak_core_px=_leak_settings(cfg)[1],
+        approved=approved,
+        approved_weight=float(OmegaConf.select(cfg, "data.approved_weight", default=1.0)),
     )
     val_modes = [str(m) for m in OmegaConf.select(cfg, "eval.val_prompts", default=list(DEFAULT_VAL_PROMPTS))]
     val_primary = str(OmegaConf.select(cfg, "eval.primary_val_prompt", default=val_modes[0]))
@@ -1046,8 +1250,22 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         seed=seed,
         circle_scale=_circle_scale(cfg),
         full_tile_threshold=_full_tile_settings(cfg)[0],
+        edge_tau_px=_tolerance_tau(cfg),
+        edge_weight_min=_edge_loss_settings(cfg)[1],
+        edge_tau_depth_frac=_tau_depth_frac(cfg),
+        core_band_px=_leak_settings(cfg)[1],
+        core_recall_target=core_recall_target,
+        approved=approved,
+        epoch_subset=float(OmegaConf.select(cfg, "val.epoch_subset", default=0.25)),
+        batch_size=int(OmegaConf.select(cfg, "val.batch_size", default=4)),
+        metric_threads=int(OmegaConf.select(cfg, "val.metric_threads", default=4)),
     )
     val_ds = val_suite.dataset
+    print(
+        f"validation: every epoch the fixed subset of {val_suite.subset_size} of {len(val_ds)} samples "
+        f"({', '.join(val_suite.subset_modes)}); the full split ({', '.join(val_suite.modes)}) every "
+        f"{int(OmegaConf.select(cfg, 'val.full_every_n_epochs', default=3))} epochs and after the last"
+    )
     print(f"validation prompts: {val_modes} (primary {val_primary})")
 
     n_train = len(train_ds)
@@ -1058,8 +1276,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     warmup_steps = steps_per_epoch * int(cfg.lr_schedule.warmup_epochs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if enable_cudnn_benchmark(device):
+    if enable_cudnn_benchmark(device, bool(cfg.training.get("cudnn_benchmark", True))):
         print("cuDNN benchmark on (fixed image size)")
+    else:
+        print("cuDNN benchmark off")
     model = build_em_sam2(cfg.model.config, str(checkpoint), device, train=True)
     unfreeze_mask_cnn = mixed_prompts and bool(
         OmegaConf.select(cfg, "model.unfreeze_mask_cnn", default=True)
@@ -1068,8 +1288,11 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         model, freeze_mode=freeze_mode, unfreeze_mask_cnn=unfreeze_mask_cnn
     )
     if bool(cfg.model.get("activation_checkpointing", True)):
-        n_ckpt = enable_activation_checkpointing(model)
-        print(f"Activation checkpointing on {n_ckpt} Hiera blocks")
+        fraction = float(cfg.model.get("activation_checkpointing_fraction", 1.0))
+        n_ckpt = enable_activation_checkpointing(model, fraction)
+        print(f"Activation checkpointing on {n_ckpt} Hiera blocks (fraction {fraction:g})")
+    else:
+        print("Activation checkpointing off")
     _log_cuda_mem("after model")
 
     optimizer = AdamW(
@@ -1087,6 +1310,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     amp_dtype, scaler = _amp_setup(device, bool(cfg.training.mixed_precision))
     if bool(cfg.training.get("benchmark", False)):
         run_throughput_benchmark(
+            val_suite=val_suite,
             model=model,
             train_ds=train_ds,
             val_ds=val_ds,
@@ -1110,6 +1334,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             train_steps=max(1, int(cfg.training.get("benchmark_steps", 50))),
             val_steps=max(1, int(cfg.training.get("benchmark_val_steps", 20))),
             progress=progress,
+            time_validation=bool(cfg.training.get("benchmark_val", True)),
         )
         print(f"Run directory: {run_dir} (benchmark only; no last.pt written)")
         return run_dir
@@ -1122,13 +1347,15 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         worker_name=run_name,
     )
     best_val_iou = -1.0
+    best_selection = None  # SelectionKey values of the best epoch so far
     epochs_without_improve = 0
     global_step = 0
     opt_step = 0
     start_epoch = 0
     start_step = 0
     patience = int(cfg.training.early_stopping_patience)
-    min_delta = float(cfg.training.get("early_stopping_min_delta", 0.0))
+    min_delta = float(cfg.training.get("early_stopping_min_delta", EARLY_STOPPING_MIN_DELTA))
+    full_every = max(1, int(OmegaConf.select(cfg, "val.full_every_n_epochs", default=3)))
     save_every = max(1, int(cfg.training.get("save_every_n_steps", 200)))
     resume_enabled = bool(cfg.training.get("resume", True))
 
@@ -1163,6 +1390,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         global_step = int(payload["global_step"])
         opt_step = int(payload["opt_step"])
         best_val_iou = float(payload["best_val_iou"])
+        saved_selection = payload.get("best_selection")
+        best_selection = None if saved_selection is None else SelectionKey.from_list(saved_selection)
         epochs_without_improve = int(payload["epochs_without_improve"])
         restore_rng(payload["rng"])
         print(
@@ -1190,6 +1419,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 epochs_without_improve=epochs_without_improve,
                 freeze_mode=freeze_mode,
                 unfreeze_mask_cnn=unfreeze_mask_cnn,
+                best_selection=None if best_selection is None else best_selection.to_list(),
             ),
         )
 
@@ -1216,9 +1446,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             examples = index_volumes(volumes=volumes, root=data_dir, skip_missing=True)
             examples, rejected_tiles = take_model_sized(examples, image_size)
             if mixed_prompts:
-                examples, tile_context = _with_circle_targets(
-                    examples, prompt_cfg, seed, _circle_guard(cfg, prompt_cfg)
-                )
+                tile_context = build_tile_context(examples, **_circle_guard(cfg, prompt_cfg))
                 train_ds.tiles = tile_context
             grown = include_new_keys(
                 split,
@@ -1340,10 +1568,9 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         for rel_i, batch in enumerate(pbar):
             step = step0 + rel_i
             images = batch["image"].to(device, non_blocking=True)
-            masks = batch["mask"].to(device, non_blocking=True)
             points = batch["point"].to(device, non_blocking=True)
             labels = batch["point_label"].to(device, non_blocking=True)
-            prompt_fg = batch["prompt_fg"].to(device, non_blocking=True)
+            inputs = _loss_inputs(batch, device)
             contain_scale = containment_warmup_scale(
                 epoch,
                 step,
@@ -1364,11 +1591,12 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                         labels,
                         batch["boxes"],
                         batch["dense_mask"],
-                        masks,
+                        batch["mask"].to(device, non_blocking=True),
                         image_size=image_size,
                         rounds=correction_rounds,
                         prev_mask_prob=float(OmegaConf.select(cfg, "iterative.prev_mask_prob", default=0.5)),
                         rng=np.random.default_rng([seed, epoch, step, 9]),
+                        variant_index=inputs["variant_index"],
                     )
                 else:
                     pred, iou_preds = predict_masks_mixed(
@@ -1379,10 +1607,11 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                         batch["boxes"],
                         batch["dense_mask"],
                         image_size=image_size,
+                        variant_index=inputs["variant_index"],
                     )
                 loss, stats = combined_loss(
                     pred,
-                    masks,
+                    inputs["masks"],
                     iou_preds,
                     focal_weight=float(cfg.loss.focal_weight),
                     dice_weight=float(cfg.loss.dice_weight),
@@ -1391,9 +1620,13 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     labels=labels,
                     containment_weight=float(cfg.loss.get("containment_weight", 0.0)),
                     containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
-                    prompt_foreground=prompt_fg,
+                    prompt_foreground=inputs["prompt_fg"],
                     mask_contain_weight=_mask_contain_weight(cfg, contain_scale),
                     iou_use_l1=_iou_use_l1(cfg),
+                    edge_weight=inputs["edge_weight"],
+                    variant_index=inputs["variant_index"],
+                    num_samples=images.shape[0],
+                    sample_weight=inputs["sample_weight"],
                 )
                 loss = loss / accum
             scaler.scale(loss).backward()
@@ -1456,18 +1689,40 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 if due_for_val_images(global_step, last_val_image_step, val_images_every)
                 else 0
             )
+            full_due = full_pass_due(epoch, num_epochs, full_every)
             try:
-                val_results, overlays = val_suite.run(
+                suite_result = val_suite.run(
                     model,
                     device,
                     image_size,
                     float(cfg.data.mask_threshold),
+                    full=full_due,
                     overlays_per_volume=capture_overlays,
                 )
             finally:
                 progress.stage("validate", "end")
+            # The subset numbers (also taken out of a full pass) select the checkpoint and stop the run.
+            val_results, overlays = suite_result.subset, suite_result.overlays
             val_iou = val_results[val_suite.primary].iou
-            val_summary = log_results(writer, epoch, val_results, val_suite.primary)
+            val_key = epoch_selection(val_results, val_suite.primary, core_recall_target)
+            val_summary = log_results(
+                writer,
+                epoch,
+                val_results,
+                val_suite.primary,
+                core_recall_target,
+                root="val_subset",
+                label=f"subset ({val_suite.subset_size} of {len(val_ds)})",
+            )
+            writer.add_scalar("val_pass_seconds/subset" if not full_due else "val_pass_seconds/full",
+                              suite_result.seconds, epoch)
+            if suite_result.full is not None:
+                progress.transcript(
+                    log_results(
+                        writer, epoch, suite_result.full, val_suite.primary, core_recall_target,
+                        root="val_full", label=f"full ({len(val_ds)}, {suite_result.seconds / 60:.0f} min)",
+                    )
+                )
             if overlays:
                 slots: dict[str, int] = {}
                 for volume, panel in overlays:
@@ -1486,14 +1741,30 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     f"({', '.join(sorted(slots))})"
                 )
             progress.transcript(val_summary)
-            if val_iou > best_val_iou + min_delta:
+            if improves(val_key, best_selection, min_delta):
                 best_val_iou = val_iou
+                best_selection = val_key
                 epochs_without_improve = 0
                 atomic_torch_save(model.state_dict(), run_dir / "best_model.pt")
-                progress.transcript(f"  saved best_model.pt (IoU {best_val_iou:.4f})")
+                goal = val_results[val_suite.primary].goal
+                progress.transcript(
+                    f"  saved best_model.pt (core recall {goal.core_recall:.4f}, merge rate {goal.merge_rate:.3f}, "
+                    f"spill {goal.spill:.3f}; {'target reached' if val_key.gated else 'below the target'})"
+                )
             else:
                 epochs_without_improve += 1
                 if patience > 0 and epochs_without_improve >= patience:
+                    if suite_result.full is None:
+                        # The last validation of a run is always the full split.
+                        final = val_suite.run(
+                            model, device, image_size, float(cfg.data.mask_threshold), full=True
+                        )
+                        progress.transcript(
+                            log_results(
+                                writer, epoch, final.full, val_suite.primary, core_recall_target,
+                                root="val_full", label=f"full ({len(val_ds)}, {final.seconds / 60:.0f} min)",
+                            )
+                        )
                     save_now(epoch + 1, 0)
                     progress.transcript(f"early stopping at epoch {epoch}")
                     break
@@ -1517,7 +1788,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         print(f"Run directory: {run_dir}")
     else:
         progress.transcript(
-            f"Training complete. Best val IoU: {best_val_iou:.4f}. Run directory: {run_dir}"
+            f"Training complete. Best epoch by the core-recall rule: "
+            f"{'none' if best_selection is None else best_selection.values}. Run directory: {run_dir}"
         )
     return run_dir
 
@@ -1560,6 +1832,12 @@ def parse_train_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Timed val forwards after warmup (default 20)",
     )
     parser.add_argument(
+        "-benchmark-no-val",
+        "--benchmark-no-val",
+        action="store_true",
+        help="With --benchmark: time only the training steps (no validation timing, no projection of it)",
+    )
+    parser.add_argument(
         "overrides",
         nargs="*",
         help="Hydra-style overrides, e.g. training.num_epochs=8 training.batch_size=2",
@@ -1576,6 +1854,8 @@ def main(argv: list[str] | None = None) -> None:
         overrides.append("training.benchmark=true")
         overrides.append(f"training.benchmark_steps={args.benchmark_steps}")
         overrides.append(f"training.benchmark_val_steps={args.benchmark_val_steps}")
+        if args.benchmark_no_val:
+            overrides.append("training.benchmark_val=false")
     train_from_cfg(load_train_cfg(overrides))
 
 

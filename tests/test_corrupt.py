@@ -11,7 +11,7 @@ from sam2_segmentation_trainer.data.corrupt import (
     polygon_mask,
     stroke_mask,
 )
-from sam2_segmentation_trainer.data.prompts import PromptConfig, PromptType, build_prompt
+from sam2_segmentation_trainer.data.prompts import PromptConfig
 
 
 def _blob() -> np.ndarray:
@@ -54,46 +54,13 @@ class CorruptionTests(unittest.TestCase):
         self.assertEqual(set(CORRUPTIONS), {"morph", "strokes", "polygon"})
 
 
-class CorruptedPromptTests(unittest.TestCase):
-    def test_prompt_carries_a_dense_mask_but_no_containment_region(self) -> None:
-        mask = _blob()
-        prompt = build_prompt(
-            PromptType.CORRUPTED_MASK,
-            target_mask=mask,
-            circle_mask=None,
-            regions=[],
-            cfg=PromptConfig(),
-            rng=np.random.default_rng(2),
-        )
-        self.assertEqual(prompt.prompt_type, PromptType.CORRUPTED_MASK)
-        self.assertIsNotNone(prompt.dense_logits)
-        self.assertEqual(prompt.dense_logits.shape, (256, 256))
-        self.assertIsNone(prompt.foreground_region)
-        self.assertEqual(prompt.point_coords.shape[0], 1)
-        self.assertEqual(int(prompt.point_labels[0]), 1)
-
-    def test_full_mask_still_reports_its_containment_region(self) -> None:
-        prompt = build_prompt(
-            PromptType.FULL_MASK,
-            target_mask=_blob(),
-            circle_mask=None,
-            regions=[],
-            cfg=PromptConfig(),
-            rng=np.random.default_rng(2),
-        )
-        self.assertIsNotNone(prompt.foreground_region)
-
-    def test_probabilities_include_the_new_type_and_validate(self) -> None:
-        cfg = PromptConfig(
-            prob_points_only=0.15, prob_box_only=0.05, prob_box_points=0.10,
-            prob_circle_mask=0.45, prob_full_mask=0.0, prob_negative_only=0.0, prob_corrupted_mask=0.25,
-        )
-        cfg.validate()
-        self.assertEqual(cfg.probabilities()[PromptType.CORRUPTED_MASK], 0.25)
-        with self.assertRaises(ValueError):
-            PromptConfig(corrupt_stroke_keep_min=0.9, corrupt_stroke_keep_max=0.4).validate()
+class RefinementConfigTests(unittest.TestCase):
+    def test_cascade_settings_are_validated(self) -> None:
+        PromptConfig().validate()
         with self.assertRaises(ValueError):
             PromptConfig(corrupt_max_shift_px=0).validate()
+        with self.assertRaises(ValueError):
+            PromptConfig(corrupt_polygon_tolerance=0.0).validate()
 
 
 if __name__ == "__main__":

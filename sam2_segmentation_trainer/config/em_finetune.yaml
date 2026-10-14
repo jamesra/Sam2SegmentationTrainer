@@ -9,13 +9,22 @@ training:
   # Large checkpoints (last.pt / best_model) — default /storage4/Sam2Trainer via env.
   checkpoint_dir: null
   num_epochs: 15
-  batch_size: 4
+  # Batch 2 with 8 accumulation steps (effective 16), activation checkpointing off: measured on an RTX 4500 Ada
+  # (22.5 GB), 3 prompt variants, cuDNN autotuner off, 0.286 s per sample at a 14.8 GB peak, against 0.324 s per
+  # sample for batch 4 with checkpointing (7.0 GB). Batch 4 without checkpointing does not fit (driver mapping
+  # failure in the first forward pass).
+  batch_size: 2
   num_workers: 4
   prefetch_factor: 2
   persistent_workers: true
   seed: 42
   mixed_precision: true
-  gradient_accumulation_steps: 4
+  # cuDNN autotuner for the fixed 1024 tile. Off: benchmarked on an RTX 4500 Ada (22.5 GB), batch 4, 1024 px, it
+  # gave no speed-up (3 variants: 1.297 s/step off vs 1.32 s on; 1 to 4 variants: off was 2-3% faster every time)
+  # and it picked convolution algorithms with a huge workspace for some batch shapes (peak 21.0 GB at 3 prompt
+  # variants with it on, against 7.0 GB off; 11.9 GB at 1, 2 and 4 variants on, 6.7-7.5 GB off).
+  cudnn_benchmark: false
+  gradient_accumulation_steps: 8
   gradient_clip: 1.0
   log_every_n_steps: 50
   # torch.profiler traces for the TensorBoard PYTORCH_PROFILER tab.
@@ -43,9 +52,14 @@ training:
   save_every_n_epochs: 3
   save_every_n_steps: 200
   resume: true
-  early_stopping_patience: 5
-  # 0: any val IoU increase resets patience. Pass training.early_stopping_min_delta=0.0005 to require a larger gain.
-  early_stopping_min_delta: 0
+  # Epochs without a better checkpoint before training stops. "Better" follows the checkpoint rule (see
+  # val.core_recall_target): among epochs at or above the core-recall target, the lowest merge rate, spill breaking
+  # ties; if none reaches the target, the highest core recall. 0 disables early stopping.
+  early_stopping_patience: 2
+  # Noise floor of that rule, measured on the per-epoch subset: at the core-recall target the merge rate has to fall
+  # by at least this (or, if it moved by less, the spill has to fall by this) to count as better; below the target
+  # the core recall has to rise by at least 0.0005. Crossing the target always counts.
+  early_stopping_min_delta: 0.002
   # MQTT warn when a step is much slower / higher-loss than the recent median.
   warn_anomaly_warmup: 30
   warn_anomaly_window: 100
@@ -68,9 +82,11 @@ lr_schedule:
 differential_lr:
   encoder_lr_factor: 0.1
 
-# Prompt mix for training samples. Probabilities must sum to 1.0 (checked when the config loads).
-# A sample whose tile has no circle for its target, or no other annotation, loses those two types and
-# their share moves to the rest. Validation always uses a single centroid point so IoU stays comparable.
+# Prompt mix for training samples (docs/mask_refinement_plan.md). Probabilities must sum to 1.0 (checked when the
+# config loads). Every family is trained against the true polygon; the full ground-truth mask is never a prompt.
+# Dense mask prompts are scaled by an edge confidence curve c(d) = 1 - exp(-d / tau_eff), so the traced edge
+# is trusted loosely and the interior fully. The server must use the same function and constants
+# (annotation_crops/prompt_encoding.py). Validation always uses fixed prompts so scores stay comparable.
 prompt:
   # false: every training sample is the original single centroid point.
   enabled: true
@@ -78,22 +94,47 @@ prompt:
   # The exporter writes true radii (diameter_scale 1.0); the trainer shrinks them to this on load, and rescales a
   # file from an older exporter that baked a scale in, so changing it needs no re-export.
   circle_diameter_scale: 0.95
-  # The six or seven probabilities must sum to 1.0.
-  prob_points_only: 0.15
+  # Prompt variants decoded per encoded sample. Variant 1 is always the production prompt (a circle seed; with an
+  # adjacent-section shape, an adjacent seed with probability prob_adjacent_seed / (prob_adjacent_seed +
+  # prob_circle_seed)). The others are drawn from the prob_* mix below without replacement. So the prob_* values
+  # only steer variants 2 onwards: the realised mix has a larger circle share than prob_circle_seed (see
+  # train/prompt_mix/* and train/prompt_count/* in TensorBoard). The image encoder runs once per sample.
+  variants_per_sample: 3
+  # tau of the prompt confidence curve in pixels. Traces are about 9 px (20 nm) from the membrane on average, so
+  # 8 px puts 95% confidence about 24 px inside the traced line.
+  edge_tau_px: 8.0
+  # Thin-process cap: tau_eff = min(edge_tau_px, edge_tau_depth_frac * D), D the mask's maximum depth, computed per
+  # mask (the target, each seed, each neighbor), in the prompt and in the loss weight. A process 20 px wide has
+  # D about 10 and gets tau_eff 2.5, so it is not all edge. 0 turns the cap off.
+  edge_tau_depth_frac: 0.25
+  # Logit of a trusted seed pixel (M_seed) and of a mask to correct (M_corr, lower: it is only a suggestion).
+  seed_logit: 10.0
+  correction_logit: 3.0
+  prob_points_only: 0.10
   prob_box_only: 0.05
-  prob_box_points: 0.10
-  prob_circle_mask: 0.45  # the production prompt
-  # A mask prompt degraded the way hand painting is (too thin or fat, patchy, a coarse outline), so the model
-  # has to find the membrane instead of echoing its input. Not used by the mask containment loss.
-  prob_corrupted_mask: 0.25
-  # The ground-truth mask as the prompt is a copy task, and a negative-only prompt does not say which cell is
-  # meant. Both are off; set a probability above 0 only on purpose.
-  prob_full_mask: 0.0
-  prob_negative_only: 0.0
-  corrupt_max_shift_px: 12         # grow or shrink by 1..this many pixels
-  corrupt_stroke_keep_min: 0.40    # partial painting keeps this fraction of the mask at least ...
-  corrupt_stroke_keep_max: 0.90    # ... and at most
-  corrupt_polygon_tolerance: 0.04  # coarse outline: simplification tolerance as a fraction of sqrt(area)
+  prob_box_points: 0.05
+  # Seeds (trusted, inside the cell; the containment loss applies to their core):
+  prob_circle_seed: 0.40    # the production prompt: inscribed circle x circle_diameter_scale plus its center point
+  # A linked polygon from the adjacent section scaled to fit inside the cell (the Viking workflow). Needs the
+  # exporter's shapes.jsonl; until then its share moves to the circle seed.
+  prob_adjacent_seed: 0.15
+  prob_subset_seed: 0.10    # a part of the true mask: eroded 10-40 px, then optionally cut straight or along the cell
+  # Masks to correct (suggestions that may be wrong; no containment loss):
+  prob_correction: 0.10     # grown, scaled, warped, simplified or merged with a neighbor
+  # A good human trace: outline wobble of 5-12 px on average plus 1-3 local bulges or dents of 15-30 px. The model
+  # must leave it at least as good (val "do no harm").
+  prob_near_correct: 0.05
+  adjacent_fit_inside: 0.98          # share of the scaled seed that must lie inside the target grown by adjacent_fit_grow_px
+  adjacent_fit_grow_px: 10           # the annotator fits the seed to the visible membrane, up to this far outside the trace
+  adjacent_scale_range: [0.7, 1.0]   # factor applied to the fitted scale
+  erode_px: [10, 40]                 # shrink range of a subset seed (applied before any cut)
+  dilate_px: [5, 50]                 # grow range of a mask to correct
+  scale_range: [0.8, 1.25]           # wheel-style scale of a mask to correct
+  correction_wobble_px: [10, 20]     # mean outline displacement of a mask to correct's wobble (local excursions up to 50 px)
+  near_correct_wobble_px: [5, 12]    # MEAN outline displacement of a near-correct mask
+  near_correct_excursion_px: [15, 30]  # amplitude of each of its 1-3 local bulges or dents (30-150 px of outline each)
+  corrupt_max_shift_px: 30         # grow or shrink by 1..this many pixels after a simplified outline
+  corrupt_polygon_tolerance: 0.04  # simplified outline: tolerance as a fraction of sqrt(area)
   # Each box edge is pushed out by uniform(0, box_jitter_frac * edge length). A box is only a hint that the
   # object is most likely inside; nothing penalizes predictions that leave it.
   box_jitter_frac: 0.15
@@ -103,17 +144,13 @@ prompt:
   line_frac_min: 0.40
   line_frac_max: 0.90
 
-# Other annotations in the same tile are negative context: a -1 area of the dense mask prompt and, by chance,
-# background points.
+# Other annotations in the same tile are negative context: a negative area of the dense mask prompt (scaled by
+# each neighbor's own edge confidence) and, by chance, background points.
 negative:
   bg_point_prob_circle: 0.25
   bg_point_prob_polygon: 0.15
   # Decoded neighbor masks kept per DataLoader worker (each worker has its own cache).
   cache_size: 64
-  # Also train the negative-only prompt on circle annotations that have no mask (the disc is the target).
-  allow_circle_targets: false
-  # Cap on those samples as a fraction of the mask-bearing examples.
-  circle_target_fraction: 0.05
   # Leave out a neighbor's circle negative when it reaches into the target mask (it would say background
   # about pixels the loss calls foreground). Choosing by the true mask leaks a little of its extent into the
   # prompt, so measure first: sam2-em-validate --circle-overlap 2000.
@@ -125,8 +162,9 @@ loss:
   iou_weight: 1.0
   # true: the IoU head is trained with L1 as in SAM 2 (iou_use_l1_loss). false: squared error.
   iou_use_l1: true
-  # Hinge penalty for predicting background where a dense mask prompt said foreground (the mask is a seed
-  # the engine grows beyond). 0 disables. Ramps up linearly over containment_warmup_epochs.
+  # Hinge penalty for predicting background where a seed said foreground (the seed is a core the engine grows
+  # beyond), weighted by the seed's edge confidence. Never applied to masks to correct. 0 disables. Ramps up
+  # linearly over containment_warmup_epochs.
   mask_contain_weight: 0.5
   containment_warmup_epochs: 2
   # Penalizes predicting background at prompted point locations (BCE toward 1
@@ -134,6 +172,17 @@ loss:
   # 0 disables the term.
   containment_weight: 0.0
   containment_radius: 8.0
+  # Edge-tolerant loss: labels stay hard 0/1 but each pixel is weighted w(d) = max(edge_weight_min,
+  # 1 - exp(-d / tau_eff)) by its distance d to the ground-truth edge (both sides), in the focal, dice and
+  # IoU-head terms, so hand-tremor disagreement at the traced line is nearly free. tau_eff is capped per mask by
+  # prompt.edge_tau_depth_frac. 0 disables it. The diagnostic tolerant IoU ignores pixels with w < 0.5 whatever
+  # this is (8 px when 0).
+  edge_tau_px: 8.0
+  edge_weight_min: 0.05
+  # Leak penalty: the focal and dice weight of pixels at least val.core_band_px inside another annotation and
+  # outside the target is multiplied by this. A merge breaks connectivity, so it costs more than an equal area of
+  # edge error. Applies to every sample, neighbor-merge samples included. 1 turns it off.
+  leak_weight: 3.0
 
 data:
   root: null
@@ -149,6 +198,12 @@ data:
   # Validation scores them apart (val/iou_fulltile) and leaves them out of val/iou.
   full_tile_threshold: 0.99
   full_tile_keep_fraction: 0.25
+  # approved.json from the gallery: a list of {"location_id", "image_key"} entries (or [location_id, image_key]
+  # pairs). Those masks are reported as their own row in validation, and counted per volume at start-up. null or a
+  # missing file: warn and skip the row. Keep the file next to the export so runs are reproducible.
+  approved_path: null
+  # Training weight of Approved masks (2.0 to try).
+  approved_weight: 1.0
   # zslab: validation is slab_count contiguous runs of sections spaced evenly through each volume, together about
   # (1 - train_split) of its examples, with guard_sections sections on each side of every slab used by neither
   # side. Adjacent sections and overlapping crop windows then never cross the split.
@@ -167,10 +222,16 @@ model:
   checkpoint: null
   config: configs/sam2.1/sam2.1_hiera_l.yaml
   freeze_mode: none
-  # Train the prompt encoder's mask_downscaling network (about 50K parameters) so it learns the -1/0/+1
-  # mask prompt. Only applies with prompt.enabled. Changing it needs -refresh, not resume.
+  # Train the prompt encoder's mask_downscaling network (about 4.7K parameters) so it learns the continuous
+  # seed / correction / negative mask prompt. Only applies with prompt.enabled. Changing it needs -refresh, not resume.
   unfreeze_mask_cnn: true
-  activation_checkpointing: true
+  # Off: at batch 2 it is 12% faster per sample than checkpointing at batch 4 (0.286 vs 0.324 s) and peaks at 14.8 GB
+  # of 22.5. Checkpointing half of the blocks at batch 4 measured 0.296 s per sample at 15.6 GB; a quarter thrashed
+  # the allocator at 20.5 GB (0.75 s per sample). On a smaller card turn it back on (and use batch 4).
+  activation_checkpointing: false
+  # Share of the 48 Hiera blocks that are checkpointed (spread evenly through the trunk) when activation
+  # checkpointing is on. 1.0 = all.
+  activation_checkpointing_fraction: 1.0
 
 # Corrective-click training, as in SAM 2: a share of the batches predict, sample a click from where the
 # prediction is wrong, and re-run with the previous low-resolution logits plus the click. Only the last pass
@@ -182,15 +243,45 @@ iterative:
   prev_mask_prob: 0.5   # per sample, chance the previous logits are fed back (muSAM: always feeding it over-relies)
 
 eval:
-  # Validation scores the validation split once per prompt, with fixed prompts:
-  #   circle_mask  the inscribed circle as the dense prompt (what production starts from)
-  #   point        one foreground point at the deepest interior pixel
-  #   centroid     one point at the mask centroid (the original prompt; can land outside C-shaped cells)
-  val_prompts: [circle_mask, point, centroid]
-  # The prompt whose IoU picks best_model.pt and drives early stopping (val/iou).
+  # Validation scores the validation split once per prompt, with fixed prompts. Every family reports core recall,
+  # leak, merge rate, spill and fragmentation (see val:), with tolerant IoU and boundary F1 at 10 and 20 px as
+  # diagnostics:
+  #   circle_mask   the inscribed circle as a seed (what production starts from)
+  #   correction    a grown, scaled, warped or simplified true mask; also scored on its input mask, with the change
+  #   near_correct  a good human trace (5-12 px wobble plus local excursions up to 30 px): "do no harm", the share
+  #                 of samples whose core recall drops at most 0.5 points and whose spill rises at most 0.5%
+  #   point         one foreground point at the deepest interior pixel
+  #   centroid      one point at the mask centroid (the original prompt; raw IoU, for continuity with earlier runs)
+  # All families of a sample share one image load and one encoder pass (see val:).
+  # Validation runs in fp32 like infer.py and interactive.py; its precision should follow the server's inference precision.
+  val_prompts: [circle_mask, correction, near_correct, point, centroid]
+  # The prompt whose goal metrics pick best_model.pt and drive early stopping (see val:).
   primary_val_prompt: circle_mask
   grid_every: 10
   max_grids: 40
+
+# Project-goal validation (docs/mask_refinement_plan.md, section 6): identify cells and their connectivity.
+val:
+  # Each validation loads a sample once, encodes it once and decodes every eval.val_prompts family from that
+  # embedding, in batches of batch_size images (batch_size x families prompts per batch). The metrics run in
+  # metric_threads threads while the GPU works on the next batch. Each family's prompt is seeded from the run seed,
+  # the sample (volume, image key, location id) and the family, so results do not depend on batch composition,
+  # family order or which samples are in the pass.
+  batch_size: 4
+  metric_threads: 4
+  # Every epoch validates a fixed subset: this share of each volume, drawn once from the run seed and stratified by
+  # volume, always holding every Approved sample, without the legacy centroid family. The best checkpoint and early
+  # stopping use it. 1.0 validates the whole split every epoch.
+  epoch_subset: 0.25
+  # The full split, centroid included, runs every this many epochs and after the last (and before an early stop).
+  # Its results are logged apart (val_full/*; the subset is val_subset/*), and its subset share is what selects.
+  full_every_n_epochs: 3
+  # Pixels within this many px of a traced edge are ignored by core recall, leak and spill, and a neighbor's core
+  # is the part of it at least this far inside. Traces are about 9 px from the membrane on average.
+  core_band_px: 10
+  # Checkpoint gate. Among epochs whose pooled core recall on the primary prompt is at least this, best_model.pt
+  # is the one with the lowest merge rate (spill breaks ties); if none reaches it, the highest core recall.
+  core_recall_target: 0.975
 
 hydra:
   job:

@@ -3,24 +3,43 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 from annotation_crops.negatives import KIND_CIRCLE, KIND_POLYGON, NegativeRegion
 from sam2_segmentation_trainer.data.prompts import (
+    FULL_TILE_PROMPTS,
     LOW_RES,
-    MASK_PROMPT_LOGIT,
     PromptConfig,
     PromptType,
     benford_count,
     build_prompt,
     choose_prompt_type,
     jittered_box,
-    nearest_resize,
     sample_points_in_mask,
-    to_low_res_logits,
 )
 
 CFG = PromptConfig()
 POINT_ARGS = dict(min_edge_px=15, line_frac_min=0.4, line_frac_max=0.9)
+ZERO = {
+    "prob_points_only": 0.0,
+    "prob_box_only": 0.0,
+    "prob_box_points": 0.0,
+    "prob_circle_seed": 0.0,
+    "prob_adjacent_seed": 0.0,
+    "prob_subset_seed": 0.0,
+    "prob_correction": 0.0,
+    "prob_near_correct": 0.0,
+}
+_FIELD = {
+    PromptType.POINTS: "prob_points_only",
+    PromptType.BOX: "prob_box_only",
+    PromptType.BOX_POINTS: "prob_box_points",
+    PromptType.CIRCLE_SEED: "prob_circle_seed",
+    PromptType.ADJACENT_SEED: "prob_adjacent_seed",
+    PromptType.SUBSET_SEED: "prob_subset_seed",
+    PromptType.CORRECTION: "prob_correction",
+    PromptType.NEAR_CORRECT: "prob_near_correct",
+}
 
 
 def _square(size: int, lo: int, hi: int) -> np.ndarray:
@@ -29,24 +48,10 @@ def _square(size: int, lo: int, hi: int) -> np.ndarray:
     return mask
 
 
-def _only(prompt_type: PromptType) -> PromptConfig:
-    values = {
-        "prob_points_only": 0.0,
-        "prob_box_only": 0.0,
-        "prob_box_points": 0.0,
-        "prob_circle_mask": 0.0,
-        "prob_full_mask": 0.0,
-        "prob_negative_only": 0.0,
-    }
-    name = {
-        PromptType.POINTS: "prob_points_only",
-        PromptType.BOX: "prob_box_only",
-        PromptType.BOX_POINTS: "prob_box_points",
-        PromptType.CIRCLE_MASK: "prob_circle_mask",
-        PromptType.FULL_MASK: "prob_full_mask",
-        PromptType.NEGATIVE_ONLY: "prob_negative_only",
-    }[prompt_type]
-    values[name] = 1.0
+def _only(prompt_type: PromptType, **extra) -> PromptConfig:
+    values = dict(ZERO)
+    values[_FIELD[prompt_type]] = 1.0
+    values.update(extra)
     return PromptConfig(**values)
 
 
@@ -54,28 +59,39 @@ class PromptConfigTests(unittest.TestCase):
     def test_defaults_sum_to_one(self) -> None:
         CFG.validate()
         self.assertAlmostEqual(sum(CFG.probabilities().values()), 1.0)
+        self.assertEqual(CFG.variants_per_sample, 3)
 
     def test_rejects_bad_sum_negative_and_inverted_range(self) -> None:
         with self.assertRaises(ValueError):
             PromptConfig(prob_points_only=0.5).validate()
         with self.assertRaises(ValueError):
-            PromptConfig(prob_points_only=-0.1, prob_circle_mask=0.65).validate()
+            PromptConfig(prob_points_only=-0.1, prob_circle_seed=0.65).validate()
         with self.assertRaises(ValueError):
             PromptConfig(line_frac_min=0.9, line_frac_max=0.4).validate()
         with self.assertRaises(ValueError):
             PromptConfig(box_points_max=0).validate()
+        with self.assertRaises(ValueError):
+            PromptConfig(variants_per_sample=0).validate()
+        with self.assertRaises(ValueError):
+            PromptConfig(erode_px=(30.0, 3.0)).validate()
 
     def test_from_cfg_merges_sections_and_keeps_defaults(self) -> None:
         cfg = {
-            "prompt": {"prob_points_only": 0.15, "prob_circle_mask": 0.40, "box_points_max": 2},
-            "negative": {"cache_size": 8, "allow_circle_targets": True},
+            "prompt": {
+                "prob_points_only": 0.15,
+                "prob_circle_seed": 0.35,
+                "box_points_max": 2,
+                "erode_px": [2, 20],
+            },
+            "negative": {"cache_size": 8, "drop_overlapping_circles": True},
         }
         config = PromptConfig.from_cfg(cfg)
         self.assertEqual(config.prob_points_only, 0.15)
         self.assertEqual(config.box_points_max, 2)
+        self.assertEqual(config.erode_px, (2.0, 20.0))
         self.assertEqual(config.cache_size, 8)
-        self.assertIs(config.allow_circle_targets, True)
-        self.assertEqual(config.prob_full_mask, 0.30)
+        self.assertIs(config.drop_overlapping_circles, True)
+        self.assertEqual(config.prob_adjacent_seed, 0.15)
         self.assertEqual(PromptConfig.from_cfg({}), CFG)
 
     def test_from_cfg_validates(self) -> None:
@@ -140,48 +156,35 @@ class BoxTests(unittest.TestCase):
         self.assertIsNone(jittered_box(np.zeros((8, 8), bool), np.random.default_rng(0), 0.1))
 
 
-class DenseMaskTests(unittest.TestCase):
-    def test_nearest_resize_keeps_exact_values(self) -> None:
-        signed = np.zeros((1024, 1024), dtype=np.int8)
-        signed[:512] = 1
-        signed[600:700, 100:200] = -1
-        small = nearest_resize(signed, LOW_RES)
-        self.assertEqual(small.shape, (LOW_RES, LOW_RES))
-        self.assertEqual(set(np.unique(small)), {-1, 0, 1})
-        self.assertEqual(int(small[0, 0]), 1)
-        self.assertEqual(int(small[160, 40]), -1)
-
-    def test_logit_scale(self) -> None:
-        signed = np.zeros((512, 512), dtype=np.int8)
-        signed[:256] = 1
-        signed[300:400] = -1
-        logits = to_low_res_logits(signed)
-        self.assertEqual(logits.dtype, np.float32)
-        self.assertEqual(set(np.unique(logits)), {-MASK_PROMPT_LOGIT, 0.0, MASK_PROMPT_LOGIT})
-
-
 class ChoosePromptTypeTests(unittest.TestCase):
-    def test_unavailable_types_are_dropped(self) -> None:
+    def test_adjacent_share_moves_to_the_circle_seed_until_shapes_exist(self) -> None:
         rng = np.random.default_rng(0)
-        drawn = {
-            choose_prompt_type(CFG, rng, can_circle_mask=False, has_negatives=False) for _ in range(500)
-        }
-        self.assertNotIn(PromptType.CIRCLE_MASK, drawn)
-        self.assertNotIn(PromptType.NEGATIVE_ONLY, drawn)
-        self.assertIn(PromptType.FULL_MASK, drawn)
+        drawn = [choose_prompt_type(CFG, rng) for _ in range(6000)]
+        self.assertNotIn(PromptType.ADJACENT_SEED, drawn)
+        share = drawn.count(PromptType.CIRCLE_SEED) / len(drawn)
+        self.assertAlmostEqual(share, 0.55, delta=0.04)
 
     def test_everything_available_draws_every_type(self) -> None:
         rng = np.random.default_rng(1)
-        drawn = {
-            choose_prompt_type(CFG, rng, can_circle_mask=True, has_negatives=True) for _ in range(4000)
-        }
+        drawn = {choose_prompt_type(CFG, rng, can_adjacent_seed=True) for _ in range(4000)}
         self.assertEqual(drawn, {kind for kind, share in CFG.probabilities().items() if share > 0})
 
-    def test_nothing_left_falls_back_to_full_mask(self) -> None:
-        only_circle = _only(PromptType.CIRCLE_MASK)
+    def test_exclude_draws_without_replacement(self) -> None:
+        rng = np.random.default_rng(2)
+        drawn = {
+            choose_prompt_type(CFG, rng, exclude={PromptType.CIRCLE_SEED, PromptType.POINTS})
+            for _ in range(1000)
+        }
+        self.assertFalse(drawn & {PromptType.CIRCLE_SEED, PromptType.POINTS})
+
+    def test_allowed_limits_the_draw_and_falls_back(self) -> None:
+        rng = np.random.default_rng(3)
+        drawn = {choose_prompt_type(CFG, rng, allowed=FULL_TILE_PROMPTS) for _ in range(400)}
+        self.assertEqual(drawn, set(FULL_TILE_PROMPTS))
+        only_box = _only(PromptType.BOX)
+        self.assertIs(choose_prompt_type(only_box, rng, allowed=FULL_TILE_PROMPTS), PromptType.POINTS)
         self.assertIs(
-            choose_prompt_type(only_circle, np.random.default_rng(0), can_circle_mask=False, has_negatives=True),
-            PromptType.FULL_MASK,
+            choose_prompt_type(only_box, rng, allowed={PromptType.CIRCLE_SEED}), PromptType.CIRCLE_SEED
         )
 
 
@@ -199,13 +202,13 @@ class BuildPromptTests(unittest.TestCase):
             NegativeRegion(11, KIND_CIRCLE, circle_neighbor),
         ]
 
-    def _build(self, prompt_type: PromptType, regions=None, circle=True, seed: int = 0):
+    def _build(self, prompt_type: PromptType, regions=None, circle=True, seed: int = 0, **extra):
         return build_prompt(
             prompt_type,
             target_mask=self.target,
             circle_mask=self.circle if circle else None,
             regions=self.regions if regions is None else regions,
-            cfg=_only(prompt_type),
+            cfg=_only(prompt_type, **extra),
             rng=np.random.default_rng(seed),
         )
 
@@ -215,14 +218,15 @@ class BuildPromptTests(unittest.TestCase):
         self.assertTrue((prompt.point_labels == 1).all())
         self.assertIsNone(prompt.box)
         self.assertIsNone(prompt.dense_logits)  # no negatives: learned no-mask embedding, not zeros
-        self.assertIsNone(prompt.foreground_region)
+        self.assertIsNone(prompt.foreground_weight)
+        self.assertIsNone(prompt.input_mask)
 
     def test_points_prompt_carries_negatives_as_dense_mask(self) -> None:
         prompt = self._build(PromptType.POINTS)
-        self.assertIsNotNone(prompt.dense_logits)
         self.assertEqual(prompt.dense_logits.shape, (LOW_RES, LOW_RES))
-        self.assertEqual(set(np.unique(prompt.dense_logits)), {-MASK_PROMPT_LOGIT, 0.0})
-        self.assertIsNone(prompt.foreground_region)
+        self.assertLess(float(prompt.dense_logits.min()), -5.0)
+        self.assertLessEqual(float(prompt.dense_logits.max()), 0.0)
+        self.assertIsNone(prompt.foreground_weight)
 
     def test_box_prompt_has_box_and_no_foreground_points(self) -> None:
         prompt = self._build(PromptType.BOX, regions=[])
@@ -238,62 +242,153 @@ class BuildPromptTests(unittest.TestCase):
             counts.add(prompt.point_coords.shape[0])
         self.assertTrue(counts <= {1, 2, 3} and len(counts) > 1)
 
-    def test_circle_mask_prompt(self) -> None:
-        prompt = self._build(PromptType.CIRCLE_MASK)
-        self.assertEqual(prompt.point_coords.shape[0] - int((prompt.point_labels == 0).sum()), 1)
+    def test_circle_seed_prompt(self) -> None:
+        prompt = self._build(PromptType.CIRCLE_SEED, regions=[])
+        self.assertEqual(prompt.point_coords.shape[0], 1)
         x, y = prompt.point_coords[0]
         self.assertAlmostEqual(float(x), 31.5, places=3)
         self.assertAlmostEqual(float(y), 31.5, places=3)
         self.assertEqual(int(prompt.point_labels[0]), 1)
         self.assertIsNone(prompt.box)
-        self.assertEqual(set(np.unique(prompt.dense_logits)), {-MASK_PROMPT_LOGIT, 0.0, MASK_PROMPT_LOGIT})
-        self.assertEqual(int(prompt.foreground_region.sum()), 16 * 16)
+        # The seed core is fully trusted; its traced edge is not.
+        self.assertGreater(float(prompt.dense_logits.max()), 5.0)
+        self.assertLessEqual(float(prompt.dense_logits.max()), 10.0)
+        self.assertTrue(np.array_equal(prompt.input_mask, self.circle))
+        weight = prompt.foreground_weight
+        self.assertGreater(float(weight[31, 31]), 0.95)
+        self.assertLess(float(weight[24, 31]), 0.3)
+        self.assertEqual(float(weight[0, 0]), 0.0)
 
-    def test_circle_mask_overlapping_negative_becomes_unknown(self) -> None:
+    def test_circle_seed_overlapping_negative_loses_its_trust(self) -> None:
         overlap = np.zeros((64, 64), dtype=bool)
         overlap[24:32, 24:40] = True
         regions = [NegativeRegion(12, KIND_POLYGON, overlap)]
-        prompt = self._build(PromptType.CIRCLE_MASK, regions=regions)
-        self.assertEqual(int(prompt.foreground_region.sum()), 8 * 16)
-        self.assertFalse(prompt.foreground_region[24:32, 24:40].any())
+        prompt = self._build(PromptType.CIRCLE_SEED, regions=regions)
+        self.assertFalse(prompt.foreground_weight[24:32, 24:40].any())
+        self.assertTrue(prompt.foreground_weight[34:38, 28:36].all())
 
-    def test_circle_mask_requires_a_circle(self) -> None:
+    def test_circle_seed_requires_a_circle(self) -> None:
         with self.assertRaises(ValueError):
-            self._build(PromptType.CIRCLE_MASK, circle=False)
+            self._build(PromptType.CIRCLE_SEED, circle=False)
 
-    def test_full_mask_prompt(self) -> None:
-        prompt = self._build(PromptType.FULL_MASK, regions=[])
-        self.assertEqual(prompt.point_coords.shape[0], 1)
-        self.assertEqual(int(prompt.foreground_region.sum()), 32 * 32)
-        self.assertEqual(set(np.unique(prompt.dense_logits)), {0.0, MASK_PROMPT_LOGIT})
+    def test_subset_seed_stays_inside_the_truth_and_is_trusted(self) -> None:
+        for seed in range(12):
+            prompt = self._build(PromptType.SUBSET_SEED, regions=[], seed=seed)
+            seed_mask = prompt.input_mask
+            self.assertTrue(seed_mask.any())
+            self.assertFalse((seed_mask & ~self.target).any())
+            self.assertIsNotNone(prompt.foreground_weight)
+            x, y = prompt.point_coords[0]
+            self.assertTrue(seed_mask[int(round(y)), int(round(x))])
 
-    def test_negative_only_prompt_has_only_background_points(self) -> None:
-        prompt = self._build(PromptType.NEGATIVE_ONLY)
-        self.assertGreaterEqual(prompt.point_coords.shape[0], 1)
-        self.assertTrue((prompt.point_labels == 0).all())
-        self.assertIsNone(prompt.box)
-        self.assertIsNone(prompt.foreground_region)
-        self.assertIsNotNone(prompt.dense_logits)
-        for x, y in prompt.point_coords:
-            inside_neighbor = 2 <= x < 12 and 2 <= y < 12
-            inside_circle = 50 <= x < 60 and 50 <= y < 60
-            self.assertTrue(inside_neighbor or inside_circle)
+    def test_correction_differs_from_truth_and_is_not_trusted(self) -> None:
+        for seed in range(12):
+            prompt = self._build(PromptType.CORRECTION, regions=[], seed=seed)
+            self.assertFalse(np.array_equal(prompt.input_mask, self.target))
+            self.assertIsNone(prompt.foreground_weight)  # the containment loss never sees a mask to correct
+            self.assertLessEqual(float(prompt.dense_logits.max()), 3.0 + 1e-4)
+            self.assertGreater(float(prompt.dense_logits.max()), 0.0)
 
-    def test_negative_only_needs_a_negative(self) -> None:
-        with self.assertRaises(ValueError):
-            self._build(PromptType.NEGATIVE_ONLY, regions=[])
+    def test_near_correct_stays_within_three_pixels_of_the_truth(self) -> None:
+        inside = distance_transform_edt(self.target)
+        outside = distance_transform_edt(~self.target)
+        for seed in range(12):
+            prompt = self._build(PromptType.NEAR_CORRECT, regions=[], seed=seed)
+            self.assertIsNone(prompt.foreground_weight)
+            moved = prompt.input_mask ^ self.target
+            # No excursion goes more than 30 px (plus a pixel of rounding) from the truth's outline.
+            self.assertTrue(np.all(np.where(self.target, inside, outside)[moved] <= 31.0))
+
+    def test_correction_click_comes_from_the_mask_to_correct_not_the_truth(self) -> None:
+        for kind in (PromptType.CORRECTION, PromptType.NEAR_CORRECT):
+            for seed in range(25):
+                prompt = self._build(kind, regions=[], seed=seed)
+                x, y = prompt.point_coords[0]
+                shown = prompt.input_mask
+                self.assertTrue(shown[int(round(y)), int(round(x))], (kind, seed))
+                # It is the deepest interior pixel of what the user sees.
+                depth = distance_transform_edt(shown)  # the array border is not an edge
+                self.assertAlmostEqual(float(depth[int(round(y)), int(round(x))]), float(depth.max()), places=4)
+
+    def test_correction_click_can_lie_outside_the_truth(self) -> None:
+        # A mask to correct that swallowed a big neighbor has its deepest point in the neighbor, not the truth.
+        target = _square(120, 10, 30)
+        region = NegativeRegion(10, KIND_POLYGON, _square(120, 40, 110))
+        cfg = _only(PromptType.CORRECTION)
+        outside = 0
+        for seed in range(80):
+            prompt = build_prompt(
+                PromptType.CORRECTION, target_mask=target, circle_mask=None, regions=[region], cfg=cfg,
+                rng=np.random.default_rng(seed),
+            )
+            x, y = prompt.point_coords[0]
+            self.assertTrue(prompt.input_mask[int(round(y)), int(round(x))])
+            outside += int(not target[int(round(y)), int(round(x))])
+        self.assertGreater(outside, 0)
+
+    def test_background_points_never_land_in_the_merged_neighbor(self) -> None:
+        target = _square(200, 20, 60)
+        neighbor = _square(200, 150, 190)
+        other = _square(200, 90, 120)
+        regions = [NegativeRegion(10, KIND_POLYGON, neighbor), NegativeRegion(11, KIND_POLYGON, other)]
+        cfg = _only(PromptType.CORRECTION, bg_point_prob_polygon=1.0, bg_point_prob_circle=1.0)
+        merged_seen = 0
+        for seed in range(80):
+            prompt = build_prompt(
+                PromptType.CORRECTION, target_mask=target, circle_mask=None, regions=regions, cfg=cfg,
+                rng=np.random.default_rng(seed),
+            )
+            if not (prompt.input_mask & neighbor).any():
+                continue
+            merged_seen += 1
+            background = prompt.point_coords[prompt.point_labels == 0]
+            self.assertGreater(len(background), 0)  # the other neighbor still gets its points
+            self.assertFalse(any(neighbor[int(round(y)), int(round(x))] for x, y in background), seed)
+        self.assertGreater(merged_seen, 3)
+
+    def test_neighbor_merge_leaves_the_merged_neighbor_out_of_the_negative_context(self) -> None:
+        target = _square(200, 20, 60)
+        neighbor = _square(200, 150, 190)  # too far away for a grow or scale to reach it
+        region = NegativeRegion(10, KIND_POLYGON, neighbor)
+        cfg = _only(PromptType.CORRECTION)
+        merged_seen = 0
+        for seed in range(80):
+            prompt = build_prompt(
+                PromptType.CORRECTION,
+                target_mask=target,
+                circle_mask=None,
+                regions=[region],
+                cfg=cfg,
+                rng=np.random.default_rng(seed),
+            )
+            if (prompt.input_mask & neighbor).any():
+                merged_seen += 1
+                # The neighbor is part of the error, so it is not also labelled background.
+                self.assertGreaterEqual(float(prompt.dense_logits.min()), 0.0)
+            else:
+                self.assertLess(float(prompt.dense_logits.min()), -5.0)
+        self.assertGreater(merged_seen, 3)
+
+    def test_adjacent_seed_fits_inside_or_falls_back_to_the_circle(self) -> None:
+        shape = np.zeros((30, 30), dtype=bool)
+        shape[5:25, 8:22] = True
+        prompt = build_prompt(
+            PromptType.ADJACENT_SEED,
+            target_mask=self.target,
+            circle_mask=self.circle,
+            regions=[],
+            cfg=_only(PromptType.ADJACENT_SEED),
+            rng=np.random.default_rng(0),
+            adjacent_shape=shape,
+        )
+        self.assertIs(prompt.prompt_type, PromptType.ADJACENT_SEED)
+        grown = distance_transform_edt(~self.target) <= 10.0
+        self.assertGreaterEqual(float((prompt.input_mask & grown).sum()) / prompt.input_mask.sum(), 0.97)
+        missing = self._build(PromptType.ADJACENT_SEED, regions=[])
+        self.assertIs(missing.prompt_type, PromptType.CIRCLE_SEED)
 
     def test_background_points_ride_along_by_probability(self) -> None:
-        always = PromptConfig(
-            prob_points_only=1.0,
-            prob_box_only=0.0,
-            prob_box_points=0.0,
-            prob_circle_mask=0.0,
-            prob_full_mask=0.0,
-            prob_negative_only=0.0,
-            bg_point_prob_circle=1.0,
-            bg_point_prob_polygon=1.0,
-        )
+        always = _only(PromptType.POINTS, bg_point_prob_circle=1.0, bg_point_prob_polygon=1.0)
         prompt = build_prompt(
             PromptType.POINTS,
             target_mask=self.target,

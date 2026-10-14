@@ -7,20 +7,16 @@ annotation) and are shared with DataLoader workers by fork/pickle.
 
 from __future__ import annotations
 
-import random
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
 from annotation_crops.negatives import CircleAnnotation, load_circle_annotations, load_circle_scale
 
-from sam2_segmentation_trainer.data.manifest import CropExample, load_ignore_ids
+from sam2_segmentation_trainer.data.manifest import CropExample
 
 TileKey = tuple[str, str]
 """``(volume, image_key)``."""
-
-_MIN_CIRCLE_TARGET_RADIUS_PX = 4.0
-"""Circle-only targets smaller than this are noise, not cells."""
 
 
 @dataclass(slots=True)
@@ -47,6 +43,14 @@ class TileContext:
         for circle in self.circles.get(key, ()):
             if circle.location_id == location_id:
                 return circle
+        return None
+
+    def adjacent_shape(self, key: TileKey, location_id: int):
+        """Boolean raster of the linked polygon from a neighbouring section, or None.
+
+        The exporter does not write ``shapes.jsonl`` yet (plan phase B), so this is always None and adjacent-section
+        seeds are not drawn. A loader that has the shapes overrides or replaces this.
+        """
         return None
 
 
@@ -116,56 +120,3 @@ def build_tile_context(
                 circles[(volume, image_key)] = entries
         check_circle_files(crops_dirs, loaded, require=require_circles, circle_scale=circle_scale)
     return TileContext(neighbors=neighbors, circles=circles)
-
-
-def circle_target_examples(
-    examples: Sequence[CropExample],
-    context: TileContext,
-    *,
-    max_fraction: float,
-    seed: int,
-) -> list[CropExample]:
-    """Training examples for circle annotations that have no mask of their own.
-
-    The target is the circle's disc, so these only make sense for the negative-only prompt, where the model
-    must find the object from the other annotations and the image alone. A circle qualifies when its location
-    is still a circle (``source == "annotated"``), has no mask in the tile, is not on the volume's ignore list,
-    has a usable radius and a center inside the tile. At most ``max_fraction`` of ``len(examples)`` are
-    returned, chosen with ``seed``, so these samples cannot swamp the real polygon targets.
-    """
-    templates: dict[TileKey, CropExample] = {}
-    for example in examples:
-        templates.setdefault((example.volume, example.image_key), example)
-    ignored: dict[str, set[int]] = {}
-    candidates: list[CropExample] = []
-    for key, circles in context.circles.items():
-        template = templates.get(key)
-        if template is None or template.width is None or template.height is None:
-            continue
-        crops = crops_dir_of(template)
-        if template.volume not in ignored:
-            ignored[template.volume] = load_ignore_ids(crops)
-        masked = set(context.neighbor_ids(key))
-        for circle in circles:
-            if (
-                circle.has_polygon_mask
-                or circle.source != "annotated"
-                or circle.location_id in masked
-                or circle.location_id in ignored[template.volume]
-                or circle.radius < _MIN_CIRCLE_TARGET_RADIUS_PX
-                or not circle.center_in((template.height, template.width))
-            ):
-                continue
-            candidates.append(
-                replace(
-                    template,
-                    location_id=circle.location_id,
-                    mask_path=template.mask_path.parent / f"{template.image_key}_{circle.location_id}.png",
-                    split_key=f"{template.volume}:{circle.location_id}",
-                    target_circle=(circle.center_x, circle.center_y, circle.radius),
-                )
-            )
-    limit = int(max(0.0, max_fraction) * len(examples))
-    if len(candidates) > limit:
-        candidates = random.Random(seed).sample(candidates, limit)
-    return sorted(candidates, key=lambda ex: (ex.volume, ex.image_key, ex.location_id))

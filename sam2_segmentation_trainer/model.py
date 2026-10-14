@@ -8,7 +8,12 @@ import torch
 import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 
-from sam2_segmentation_trainer.losses import mask_containment_loss_per_sample
+from sam2_segmentation_trainer.losses import (
+    mask_containment_loss_per_sample,
+    tolerant_iou_target,
+    weighted_dice_loss,
+    weighted_focal_loss_per_sample,
+)
 
 def build_em_sam2(
     config_file: str,
@@ -34,7 +39,7 @@ def configure_trainable_params(
     """Set ``requires_grad`` for the chosen ``freeze_mode`` and return (trainable, total) parameter counts.
 
     The prompt encoder stays frozen except, when ``unfreeze_mask_cnn`` is set, its ``mask_downscaling``
-    network (about 50K parameters), which turns a dense mask prompt into an embedding and has to learn the
+    network (about 4.7K parameters), which turns a dense mask prompt into an embedding and has to learn the
     -1/0/+1 mask semantics of mixed-prompt training. Those parameters join the non-encoder optimizer group.
     Changing this setting changes the optimizer's parameter list, so a run cannot resume across it.
     """
@@ -68,11 +73,26 @@ def configure_trainable_params(
     return trainable, total
 
 
-def enable_activation_checkpointing(model) -> int:
-    """Recompute Hiera blocks in backward to fit 1024 / batch 4 on 32GB."""
+def checkpointed_block_indices(n_blocks: int, fraction: float) -> list[int]:
+    """Which of ``n_blocks`` blocks to checkpoint for a ``fraction`` in [0, 1], spread evenly through the trunk.
+
+    ``1.0`` is every block, ``0.5`` every other one, ``0`` none. Evenly spread keeps the saved activations from
+    piling up in one stage.
+    """
+    count = int(round(max(0.0, min(1.0, float(fraction))) * n_blocks))
+    if count <= 0:
+        return []
+    return sorted({int(i * n_blocks / count) for i in range(count)})
+
+
+def enable_activation_checkpointing(model, fraction: float = 1.0) -> int:
+    """Recompute a ``fraction`` of the Hiera blocks in backward to fit 1024 / batch 4 on 32GB (all by default)."""
     trunk = model.image_encoder.trunk
     n_enabled = 0
-    for block in trunk.blocks:
+    chosen = set(checkpointed_block_indices(len(trunk.blocks), fraction))
+    for index, block in enumerate(trunk.blocks):
+        if index not in chosen:
+            continue
         if getattr(block, "_em_activation_ckpt", False):
             continue
         orig_forward = block.forward
@@ -248,6 +268,7 @@ def predict_masks_mixed(
     *,
     image_size: int,
     orig_hw: tuple[int, int] | None = None,
+    variant_index: torch.Tensor | None = None,
 ):
     """Prediction for a batch whose samples may have boxes and dense masks or not.
 
@@ -255,6 +276,10 @@ def predict_masks_mixed(
     samples are grouped by (has box, has dense mask) and each group is decoded separately, then scattered
     back to batch order. ``boxes[i]`` is ``[4]`` xyxy and ``dense_masks[i]`` is ``[256, 256]`` or None.
     Returns ``(pred_logits [B, H, W], iou_preds [B, 1])`` like :func:`predict_masks`.
+
+    With ``variant_index`` (``[N]`` long, the image each prompt variant belongs to) the prompt arguments
+    describe ``N`` variants of the ``B`` images; the encoder still runs once per image and every variant reuses
+    its image's embeddings. The result then has ``N`` rows.
     """
     image_embed, high_res = encode_images(model, images)
     return decode_grouped(
@@ -267,6 +292,7 @@ def predict_masks_mixed(
         dense_masks,
         image_size=image_size,
         orig_hw=orig_hw,
+        embed_index=variant_index,
     )
 
 
@@ -282,14 +308,16 @@ def decode_grouped(
     image_size: int,
     orig_hw: tuple[int, int] | None = None,
     return_low_res: bool = False,
+    embed_index: torch.Tensor | None = None,
 ):
     """Decode an already encoded batch whose samples may have boxes and dense masks or not.
 
     Samples are grouped by (has box, has dense mask) and each group is decoded separately, then scattered back
     to batch order. With ``return_low_res`` the result has a third value, the low-resolution logits
-    ``[B, h, w]``.
+    ``[B, h, w]``. With ``embed_index`` (``[N]`` long) the ``N`` prompts are variants of the encoded images:
+    prompt ``i`` is decoded against image ``embed_index[i]``, so one encoder pass serves all of them.
     """
-    batch = image_embed.shape[0]
+    batch = image_embed.shape[0] if embed_index is None else int(embed_index.shape[0])
     groups: dict[tuple[bool, bool], list[int]] = {}
     for i in range(batch):
         groups.setdefault((boxes[i] is not None, dense_masks[i] is not None), []).append(i)
@@ -306,10 +334,11 @@ def decode_grouped(
             if has_dense
             else None
         )
+        image_sel = sel if embed_index is None else embed_index[sel]
         decoded = decode_prompts(
             model,
-            image_embed[sel],
-            [feat[sel] for feat in high_res],
+            image_embed[image_sel],
+            [feat[image_sel] for feat in high_res],
             point_coords[sel],
             point_labels[sel],
             image_size=image_size,
@@ -336,23 +365,18 @@ def decode_grouped(
     return (pred_logits, iou_preds, low_res) if return_low_res else (pred_logits, iou_preds)
 
 
-def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Per-sample dice loss (shape ``[B]``)."""
-    pred_s = torch.sigmoid(pred).flatten(1)
-    target_f = target.float().flatten(1)
-    inter = (pred_s * target_f).sum(1)
-    return 1 - (2 * inter + eps) / (pred_s.sum(1) + target_f.sum(1) + eps)
+def dice_loss(
+    pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6
+) -> torch.Tensor:
+    """Per-sample dice loss (shape ``[B]``), optionally edge-weighted."""
+    return weighted_dice_loss(pred, target, weight, eps)
 
 
 def focal_loss_per_sample(
-    pred: torch.Tensor, target: torch.Tensor, gamma: float = 2.0
+    pred: torch.Tensor, target: torch.Tensor, gamma: float = 2.0, weight: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """Per-sample mean focal loss over spatial dims (shape ``[B]``)."""
-    bce = F.binary_cross_entropy_with_logits(
-        pred, target.float(), reduction="none"
-    )
-    pt = torch.exp(-bce)
-    return ((1 - pt) ** gamma * bce).flatten(1).mean(1)
+    """Per-sample focal loss (shape ``[B]``): the mean over pixels, or the weight-normalized sum with ``weight``."""
+    return weighted_focal_loss_per_sample(pred, target, weight, gamma)
 
 
 def focal_loss(
@@ -362,15 +386,19 @@ def focal_loss(
 
 
 def iou_prediction_loss_per_sample(
-    pred: torch.Tensor, target: torch.Tensor, iou_preds: torch.Tensor, *, use_l1: bool = False
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    iou_preds: torch.Tensor,
+    *,
+    use_l1: bool = False,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-sample IoU-head loss (shape ``[B]``): squared error, or absolute error with ``use_l1`` (SAM 2)."""
+    """Per-sample IoU-head loss (shape ``[B]``): squared error, or absolute error with ``use_l1`` (SAM 2).
+
+    With an edge ``weight`` the target IoU ignores pixels whose weight is below 0.5, matching tolerant validation.
+    """
     with torch.no_grad():
-        pred_bin = torch.sigmoid(pred) > 0.5
-        target_b = target.bool()
-        inter = (pred_bin & target_b).flatten(1).sum(1).float()
-        union = (pred_bin | target_b).flatten(1).sum(1).float()
-        gt_iou = inter / (union + 1e-6)
+        gt_iou = tolerant_iou_target(pred, target, weight)
     iou_head = iou_preds[:, 0] if iou_preds.ndim > 1 else iou_preds
     error = iou_head.float() - gt_iou
     return error.abs() if use_l1 else error.pow(2)
@@ -434,16 +462,34 @@ def combined_loss(
     prompt_foreground: torch.Tensor | None = None,
     mask_contain_weight: float = 0.0,
     iou_use_l1: bool = False,
+    edge_weight: torch.Tensor | None = None,
+    variant_index: torch.Tensor | None = None,
+    num_samples: int | None = None,
+    sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return the batch loss and detached GPU stats. Callers sync when they log.
 
-    ``prompt_foreground`` (``[B, H, W]``, non-zero where a dense mask prompt said foreground) with a positive
+    ``prompt_foreground`` (``[B, H, W]``, the trust of a seed at each pixel, 0 elsewhere) with a positive
     ``mask_contain_weight`` adds the one-sided mask containment penalty; the caller scales the weight by its
     warmup. ``stats`` then also has ``loss_mask_contain``.
+
+    ``edge_weight`` (``[B, H, W]``, see :func:`sam2_segmentation_trainer.losses.edge_loss_weight`) down-weights
+    pixels near the ground-truth edge in the focal, dice and IoU-head terms; the labels stay hard.
+
+    With ``variant_index`` (``[N]`` long) the rows are prompt variants and the index names each one's sample.
+    The batch loss averages the variants of a sample first, then the samples, so a sample with more variants
+    does not weigh more. ``num_samples`` is the number of samples (the batch size) and every one of them has at
+    least one variant; passing it avoids a GPU sync to find out. ``stats["sample_losses"]`` keeps one value per
+    variant.
+
+    ``sample_weight`` (``[B]``, or ``[N]`` without ``variant_index``) scales each sample's loss, for
+    ``data.approved_weight``; ``stats["sample_losses"]`` stays unweighted.
     """
-    loss_focal_ps = focal_loss_per_sample(pred, target)
-    loss_dice_ps = dice_loss(pred, target)
-    loss_iou_ps = iou_prediction_loss_per_sample(pred, target, iou_preds, use_l1=iou_use_l1)
+    loss_focal_ps = focal_loss_per_sample(pred, target, weight=edge_weight)
+    loss_dice_ps = dice_loss(pred, target, edge_weight)
+    loss_iou_ps = iou_prediction_loss_per_sample(
+        pred, target, iou_preds, use_l1=iou_use_l1, weight=edge_weight
+    )
     sample_losses = (
         float(focal_weight) * loss_focal_ps
         + float(dice_weight) * loss_dice_ps
@@ -466,7 +512,17 @@ def combined_loss(
         loss_mask_ps = mask_containment_loss_per_sample(pred, prompt_foreground)
         sample_losses = sample_losses + float(mask_contain_weight) * loss_mask_ps
         stats["loss_mask_contain"] = loss_mask_ps.mean().detach()
-    loss = sample_losses.mean()
+    weighted_losses = sample_losses
+    if sample_weight is not None:
+        row_weight = sample_weight if variant_index is None else sample_weight[variant_index]
+        weighted_losses = sample_losses * row_weight.to(device=sample_losses.device, dtype=sample_losses.dtype)
+    if variant_index is None:
+        loss = weighted_losses.mean()
+    else:
+        count = int(num_samples) if num_samples is not None else int(variant_index.max().item()) + 1
+        totals = weighted_losses.new_zeros(count).index_add(0, variant_index, weighted_losses)
+        sizes = torch.bincount(variant_index, minlength=count).to(sample_losses.dtype)
+        loss = (totals / sizes.clamp(min=1.0)).mean()
     stats["loss"] = loss.detach()
     stats["sample_losses"] = sample_losses.detach()
     return loss, stats

@@ -76,7 +76,7 @@ class PromptRestrictionTests(unittest.TestCase):
         cfg = PromptConfig()
         rng = np.random.default_rng(0)
         drawn = {
-            choose_prompt_type(cfg, rng, can_circle_mask=True, has_negatives=True, allowed=FULL_TILE_PROMPTS)
+            choose_prompt_type(cfg, rng, allowed=FULL_TILE_PROMPTS)
             for _ in range(200)
         }
         self.assertTrue(drawn <= FULL_TILE_PROMPTS)
@@ -84,11 +84,11 @@ class PromptRestrictionTests(unittest.TestCase):
 
     def test_falls_back_to_points_when_nothing_allowed_has_weight(self) -> None:
         cfg = PromptConfig(
-            prob_points_only=0.0, prob_box_only=0.5, prob_box_points=0.0,
-            prob_circle_mask=0.0, prob_full_mask=0.5, prob_negative_only=0.0,
+            prob_points_only=0.0, prob_box_only=0.5, prob_box_points=0.0, prob_circle_seed=0.0,
+            prob_adjacent_seed=0.0, prob_subset_seed=0.5, prob_correction=0.0, prob_near_correct=0.0,
         )
         rng = np.random.default_rng(0)
-        kind = choose_prompt_type(cfg, rng, can_circle_mask=False, has_negatives=False, allowed=FULL_TILE_PROMPTS)
+        kind = choose_prompt_type(cfg, rng, allowed=FULL_TILE_PROMPTS)
         self.assertIs(kind, PromptType.POINTS)
 
     def test_dataset_gives_full_tiles_only_points_or_circles(self) -> None:
@@ -98,17 +98,20 @@ class PromptRestrictionTests(unittest.TestCase):
             examples = [replace(e, area_frac=1.0) for e in index_volumes(volumes=["RC1"], root=root)]
             context = build_tile_context(examples, load_circles=False)
             cfg = PromptConfig(
-                prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0,
-                prob_circle_mask=0.0, prob_full_mask=1.0, prob_negative_only=0.0,
+                prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0, prob_circle_seed=0.0,
+                prob_adjacent_seed=0.0, prob_subset_seed=1.0, prob_correction=0.0, prob_near_correct=0.0,
             )
             dataset = EMSegDataset(
                 examples, split="train", image_size=32, tiles=context, prompt_cfg=cfg,
                 seed=1, full_tile_threshold=0.99,
             )
             item = dataset[0]
-            self.assertEqual(item["prompt_type"], PromptType.POINTS.value)
+            # Variant 1 is the circle seed; a fully masked tile has nothing else to draw but points.
+            self.assertEqual(
+                [v["prompt_type"] for v in item["variants"]],
+                [PromptType.CIRCLE_SEED.value, PromptType.POINTS.value],
+            )
             self.assertTrue(item["sample_meta"].full_tile)
-            self.assertTrue(item["meta"]["full_tile"] if "meta" in item else True)
 
     def test_normal_tiles_keep_the_configured_mix(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -117,15 +120,18 @@ class PromptRestrictionTests(unittest.TestCase):
             examples = index_volumes(volumes=["RC1"], root=root)
             context = build_tile_context(examples, load_circles=False)
             cfg = PromptConfig(
-                prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0,
-                prob_circle_mask=0.0, prob_full_mask=1.0, prob_negative_only=0.0,
+                prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0, prob_circle_seed=0.0,
+                prob_adjacent_seed=0.0, prob_subset_seed=1.0, prob_correction=0.0, prob_near_correct=0.0,
             )
             dataset = EMSegDataset(
                 examples, split="train", image_size=32, tiles=context, prompt_cfg=cfg,
                 seed=1, full_tile_threshold=0.99,
             )
             item = dataset[0]
-            self.assertEqual(item["prompt_type"], PromptType.FULL_MASK.value)
+            self.assertEqual(
+                [v["prompt_type"] for v in item["variants"]],
+                [PromptType.CIRCLE_SEED.value, PromptType.SUBSET_SEED.value, PromptType.POINTS.value],
+            )
             self.assertFalse(item["sample_meta"].full_tile)
 
 

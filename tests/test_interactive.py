@@ -131,6 +131,19 @@ class IterativePredictTests(unittest.TestCase):
         self.assertEqual([c["n_points"] for c in calls], [1, 2, 3, 4])
         self.assertEqual([c["has_mask"] for c in calls], [False, True, True, True])
 
+    def test_variants_reuse_the_image_embeddings_and_expand_the_targets(self) -> None:
+        model = _Sam()
+        images, _points, _labels, gt = _batch()
+        index = torch.tensor([0, 0, 1])
+        points = torch.full((3, 1, 2), 4.0)
+        labels = torch.ones(3, 1, dtype=torch.int32)
+        pred, _iou = iterative_predict_masks(
+            model, images, points, labels, [None] * 3, [None] * 3, gt,
+            image_size=8, rounds=2, prev_mask_prob=1.0, rng=np.random.default_rng(0), variant_index=index,
+        )
+        self.assertEqual(tuple(pred.shape), (3, 8, 8))
+        self.assertEqual([c["n_points"] for c in model.sam_prompt_encoder.calls], [1, 2, 3])
+
     def test_zero_rounds_matches_the_plain_mixed_prediction(self) -> None:
         model = _Sam()
         images, points, labels, gt = _batch()

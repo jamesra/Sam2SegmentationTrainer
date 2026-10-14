@@ -5,8 +5,12 @@ import unittest
 import numpy as np
 import torch
 
+from scipy.ndimage import binary_dilation
+from skimage.segmentation import find_boundaries
+
 from sam2_segmentation_trainer.metrics import (
     boundary_f1,
+    boundary_f1_multi,
     iou_dice_pr,
     mean_iou_by_volume,
     summarize_records,
@@ -34,6 +38,35 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(stats["iou"], 1.0, places=5)
         self.assertAlmostEqual(stats["dice"], 1.0, places=5)
         self.assertGreater(boundary_f1(mask, mask), 0.99)
+
+    def test_boundary_f1_matches_a_square_dilation_at_every_tolerance(self) -> None:
+        def reference(pred, gt, tolerance):
+            pred_b = find_boundaries(pred, mode="outer")
+            gt_b = find_boundaries(gt, mode="outer")
+            struct = np.ones((2 * tolerance + 1, 2 * tolerance + 1))
+            prec = (pred_b & binary_dilation(gt_b, structure=struct)).sum() / (pred_b.sum() + 1e-6)
+            rec = (gt_b & binary_dilation(pred_b, structure=struct)).sum() / (gt_b.sum() + 1e-6)
+            return float(2 * prec * rec / (prec + rec + 1e-6))
+
+        gt = np.zeros((120, 140), dtype=bool)
+        gt[30:90, 40:100] = True
+        pred = np.zeros_like(gt)
+        pred[34:96, 36:104] = True
+        pred[10:20, 120:130] = True
+        tolerances = (2, 4, 10, 20)
+        multi = boundary_f1_multi(pred, gt, tolerances)
+        for tolerance, value in zip(tolerances, multi):
+            self.assertAlmostEqual(value, reference(pred, gt, tolerance), places=5)
+            self.assertAlmostEqual(boundary_f1(pred, gt, tolerance), value, places=6)
+        self.assertEqual(sorted(multi), multi)  # a looser tolerance never scores lower
+
+    def test_boundary_f1_with_a_mask_touching_the_array_border_and_empty_masks(self) -> None:
+        gt = np.zeros((60, 60), dtype=bool)
+        gt[:30, :30] = True
+        self.assertGreater(boundary_f1(gt, gt, 10), 0.99)
+        empty = np.zeros_like(gt)
+        self.assertEqual(boundary_f1(empty, gt, 10), 0.0)
+        self.assertEqual(boundary_f1(empty, empty, 10), 0.0)
 
     def test_summarize_groups(self) -> None:
         recs = [

@@ -103,6 +103,7 @@ def iterative_predict_masks(
     prev_mask_prob: float,
     rng: np.random.Generator,
     orig_hw: tuple[int, int] | None = None,
+    variant_index: torch.Tensor | None = None,
 ):
     """Prediction after ``rounds`` corrective clicks. Only the last pass carries gradients.
 
@@ -111,11 +112,16 @@ def iterative_predict_masks(
     ``prev_mask_prob`` share of samples; the others keep their initial prompt, as muSAM does so the model does
     not learn to depend on a previous mask). The final pass has the loss's gradient. ``rounds`` 0 is an
     ordinary mixed prediction. Returns ``(pred_logits, iou_preds)`` like ``predict_masks_mixed``.
+
+    With ``variant_index`` the prompts are several variants per image (see ``predict_masks_mixed``); ``gt_masks``
+    stays per image and is expanded to the variants here.
     """
     image_embed, high_res = encode_images(model, images)
     points, labels = point_coords, point_labels
     current = list(dense_masks)
-    batch = images.shape[0]
+    batch = len(current)
+    if variant_index is not None:
+        gt_masks = gt_masks[variant_index]
     if rounds > 0:
         with torch.no_grad():
             frozen_embed = image_embed.detach()
@@ -124,6 +130,7 @@ def iterative_predict_masks(
                 _pred, _iou, low = decode_grouped(
                     model, frozen_embed, frozen_high, points, labels, boxes, current,
                     image_size=image_size, orig_hw=orig_hw, return_low_res=True,
+                    embed_index=variant_index,
                 )
                 coords, click_labels = error_clicks(low, gt_masks, rng)
                 points, labels = _append_click(points, labels, coords, click_labels)
@@ -131,7 +138,7 @@ def iterative_predict_masks(
                 current = _prev_mask_prompts(low, dense_masks, use_prev)
     return decode_grouped(
         model, image_embed, high_res, points, labels, boxes, current,
-        image_size=image_size, orig_hw=orig_hw,
+        image_size=image_size, orig_hw=orig_hw, embed_index=variant_index,
     )
 
 

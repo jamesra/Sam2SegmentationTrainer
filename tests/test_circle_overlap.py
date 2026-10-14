@@ -88,18 +88,15 @@ class DatasetOptionTests(unittest.TestCase):
             first = examples[0]
             _write_circles(crops, first.image_key, 99999, 16.0, 16.0, 4.0)
             context = build_tile_context(examples)
-            zero = dict(prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0,
-                        prob_circle_mask=0.0, prob_negative_only=0.0)
-
             def dense_for(drop: bool):
-                cfg = PromptConfig(prob_full_mask=1.0, drop_overlapping_circles=drop, **zero)
+                cfg = PromptConfig(variants_per_sample=1, drop_overlapping_circles=drop)
                 ds = EMSegDataset([first], split="val", image_size=32, tiles=context, prompt_cfg=cfg, seed=1)
-                return ds[0]
+                return ds[0]["variants"][0]["dense_mask"]
 
             kept = dense_for(False)
             dropped = dense_for(True)
-            # The circle sits inside the target, so with it kept the dense prompt differs from the plain mask.
-            self.assertFalse(np.array_equal(kept["dense_mask"].numpy(), dropped["dense_mask"].numpy()))
+            # The circle sits inside the target, so with it kept the dense prompt carries its negative.
+            self.assertFalse(np.array_equal(kept.numpy(), dropped.numpy()))
 
 
 if __name__ == "__main__":

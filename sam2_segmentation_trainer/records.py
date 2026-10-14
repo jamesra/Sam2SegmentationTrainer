@@ -79,6 +79,8 @@ class TrainSnapshot:
     freeze_mode: str
     rng: dict
     unfreeze_mask_cnn: bool = False
+    best_selection: list | None = None
+    """The best epoch's ``SelectionKey`` values (see ``goal_metrics``); None before the first validation."""
 
     def as_checkpoint(self) -> dict[str, Any]:
         """Dict ``torch.save`` already understands."""
@@ -92,6 +94,7 @@ class TrainSnapshot:
             "global_step": self.global_step,
             "opt_step": self.opt_step,
             "best_val_iou": self.best_val_iou,
+            "best_selection": self.best_selection,
             "epochs_without_improve": self.epochs_without_improve,
             "freeze_mode": self.freeze_mode,
             "unfreeze_mask_cnn": self.unfreeze_mask_cnn,
