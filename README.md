@@ -250,7 +250,16 @@ sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/
 sam2-em-export-serve \
   --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt \
   --out /path/to/best_TEM_model.pt
+# The file is {"model": state_dict, "prompt_encoding": {...}}: build_sam2 reads only "model"; the other key records
+# EDGE_TAU_PX, EDGE_TAU_DEPTH_FRAC, SEED_LOGIT, CORRECTION_LOGIT, LOGIT_CLIP, LOW_RES, circle_diameter_scale and a
+# prompt_encoding version string (--circle-diameter-scale records the run's prompt.circle_diameter_scale).
 ```
+
+**Do not serve a v4 model until the server builds `mask_input` with `annotation_crops/prompt_encoding.py` and the
+constants in the exported file.** The mask network was trained on edge-confidence canvases (a seed at +10 times the
+edge confidence, a mask to correct at +3, other annotations at -10, area-averaged to 256 x 256), not on the mask
+encoding of earlier models. A server that still builds `mask_input` the old way gives the model a differently scaled
+input than it saw in training. Check the `prompt_encoding` version and constants against the server's before switching.
 
 Unit tests (no GPU, no NAS):
 

@@ -47,6 +47,19 @@ def load_finetuned_model(
     return model
 
 
+def serve_metadata(circle_diameter_scale: float | None = None) -> dict[str, Any]:
+    """The prompt-encoding constants written next to the weights (``"prompt_encoding"`` in the exported file).
+
+    The mask network of a v4 model was trained on ``mask_input`` built by ``annotation_crops/prompt_encoding.py``
+    with these constants; a server must build it the same way (see the README).
+    """
+    from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
+    from annotation_crops.prompt_encoding import encoding_metadata
+
+    scale = DEFAULT_CIRCLE_DIAMETER_SCALE if circle_diameter_scale is None else circle_diameter_scale
+    return encoding_metadata(scale)
+
+
 def export_serve_checkpoint(
     *,
     finetuned: Path,
@@ -54,13 +67,18 @@ def export_serve_checkpoint(
     out: Path,
     model_cfg: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
     device: str = "cpu",
+    circle_diameter_scale: float | None = None,
 ) -> Path:
-    """Load base SAM2, overlay fine-tuned weights, write a build_sam2 checkpoint."""
+    """Load base SAM2, overlay fine-tuned weights, write a build_sam2 checkpoint.
+
+    The file is ``{"model": state_dict, "prompt_encoding": {...}}``: ``build_sam2`` reads only ``"model"``, and the
+    metadata records the constants the model was trained with (:func:`serve_metadata`).
+    """
     import torch
 
     model = load_finetuned_model(finetuned, base_ckpt, model_cfg, device)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict()}, out)
+    torch.save({"model": model.state_dict(), "prompt_encoding": serve_metadata(circle_diameter_scale)}, out)
     return out
 
 
@@ -81,6 +99,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Destination, e.g. best_TEM_model.pt",
     )
     parser.add_argument("--base-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--circle-diameter-scale",
+        type=float,
+        default=None,
+        help="prompt.circle_diameter_scale of the training run, recorded in the file (default: the library default)",
+    )
     parser.add_argument("--model-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
     parser.add_argument(
         "--device",
@@ -97,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         out=args.out,
         model_cfg=args.model_config,
         device=args.device,
+        circle_diameter_scale=args.circle_diameter_scale,
     )
     print(out)
     return 0

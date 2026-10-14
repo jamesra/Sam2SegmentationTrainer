@@ -49,6 +49,24 @@ CORRECTION_LOGIT = 3.0
 LOGIT_CLIP = 10.0
 """Overlapping positive and negative contributions are summed and clipped to +/- this."""
 
+PROMPT_ENCODING_VERSION = "edge-confidence-v4"
+"""Name of this encoding. Bump it when the way ``mask_input`` is built changes in a way that needs a retrain; an
+exported model carries it so a server can refuse a model whose encoding it does not implement."""
+
+
+def encoding_metadata(circle_diameter_scale: float) -> dict[str, float | int | str]:
+    """The constants a server must use to build ``mask_input`` for a model trained with this encoding."""
+    return {
+        "prompt_encoding": PROMPT_ENCODING_VERSION,
+        "EDGE_TAU_PX": EDGE_TAU_PX,
+        "EDGE_TAU_DEPTH_FRAC": EDGE_TAU_DEPTH_FRAC,
+        "SEED_LOGIT": SEED_LOGIT,
+        "CORRECTION_LOGIT": CORRECTION_LOGIT,
+        "LOGIT_CLIP": LOGIT_CLIP,
+        "LOW_RES": LOW_RES,
+        "circle_diameter_scale": float(circle_diameter_scale),
+    }
+
 
 def window(mask: np.ndarray, margin: int) -> tuple[slice, slice] | None:
     """Bounding box of ``mask`` grown by ``margin`` pixels and clipped to the array, or None for an empty mask.
