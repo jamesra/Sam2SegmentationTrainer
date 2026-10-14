@@ -1,6 +1,6 @@
 # Mask Refinement, Edge Tolerance and Multi-Prompt Training Plan
 
-Oct 13, 2026 · Phase A and its follow-ups (section 9) implemented in the trainer (Phases B–F open: exporter `shapes.jsonl` and adjacent-section seeds, model-made correction masks, server and Viking, section-to-section propagation, cell typing) · Revised Oct 14 for the project goals: cells and connectivity, not perfect membranes · Extends *Overall training plan* (Goals, Parts 3–5) and *claude/Training plan assessment* (1.1, 1.4, 1.5), both in the Sam2 claude.ai project. This plan is self-contained for implementation.
+Oct 13, 2026 · Phase A, its follow-ups and Phase C item 2 (section 9) implemented in the trainer (Phases B–F open: exporter `shapes.jsonl` and adjacent-section seeds, model-made correction masks, server and Viking, section-to-section propagation, cell typing) · Revised Oct 14 for the project goals: cells and connectivity, not perfect membranes · Extends *Overall training plan* (Goals, Parts 3–5) and *claude/Training plan assessment* (1.1, 1.4, 1.5), both in the Sam2 claude.ai project. This plan is self-contained for implementation.
 
 ## What changed in this revision (Oct 14)
 
@@ -115,7 +115,7 @@ Put the shapes in a per-volume `shapes.jsonl`, so the trainer does not reassembl
 - **Wheel-style scale:** U(0.8, 1.25) about the centroid.
 - **Outline wobble:** an elastic warp with mean displacement U(10, 20) px and local excursions up to 50 px, giving over- and under-shoot in different places.
 - **CascadePSP-style:** simplify the outline, then randomly dilate or erode by up to 30 px.
-- **Neighbor merge:** union with part of an annotated neighbor's mask, teaching the model to remove a merge. Background points are sampled *after* the merge and never inside the merged region.
+- **Neighbor merge:** union with part of an annotated neighbor's mask, teaching the model to remove a merge. The neighbor is chosen among those within 20 px of the target (any neighbor when none is that close). Background points are sampled *after* the merge and never inside the merged region, and the positive click is taken from the mask minus the merged neighbor (the deepest point of the union is often inside the neighbor).
 
 ### 3.4 Near-correct mask ("do no harm")
 
@@ -172,7 +172,7 @@ Use a fixed seed and the z-slab validation split.
 **Definitions.** b = 10 px is the core band (`val.core_band_px`).
 - **Core recall:** the share of ground-truth pixels at least b inside the traced edge that are predicted foreground. Reported pooled over all pixels (the "interior volume" figure), and per sample as the 10th percentile and the share of samples at or above 97.5%.
 - **Leak:** the share of predicted pixels that fall in annotated neighbors' cores (at least b inside a neighbor).
-- **Merge rate:** the share of samples whose prediction covers at least 5% of any one neighbor's core.
+- **Merge rate:** the share of samples whose prediction covers at least 5% of any one neighbor's visible core and at least `val.merge_min_px` (500) px of it. The floor keeps a stray blob into a neighbor clipped by the tile edge from counting as a merge, since the merge rate selects the checkpoint.
 - **Spill:** predicted area more than b outside the ground truth, as a share of the ground-truth area. It catches leaks into cells nobody annotated, which leak cannot see.
 - **Fragmentation:** the share of samples whose prediction has more connected components (of at least 200 px) than the ground truth.
 - **VI (split and merge parts):** on tiles where every annotated object is predicted, as in connectomics benchmarks (Meilă 2007; Arganda-Carreras et al. 2015). Optional in Phase A; required in Phase E.
@@ -189,16 +189,27 @@ Use a fixed seed and the z-slab validation split.
 | Centroid point (legacy) | Raw IoU, kept for continuity with earlier runs |
 | Approved masks | All of the above, for Approved masks in the validation sections |
 
+**Breakdowns (full passes only).** Core recall (pooled and p10), merge rate and spill are also logged per category (`val_full_cat/<metric>/<family>/<category>`) and per volume (`val_full_vol/...`). Core recall is stratified by the ground truth's maximum depth, under 20 px, 20–60 px and 60 px and over (`val_full_depth/...`, with the per-sample mean next to the pooled figure): thin processes weigh little in the pooled number, and a profile under about 20 px wide has no core at all. Selection does not use them.
+
 **Approved masks as the reference set.**
-- `approved.json` (a list of location id and image key pairs, from `annotation-gallery/catalog.py`) lives in the gallery's local mirror, not in the export on `Y:`. The trainer reads it from `data.approved_path` and skips the Approved rows with a warning when it is missing. Copying it next to the export would make runs reproducible.
-- Approved masks stay on their own side of the z-slab split. Count how many fall in the validation sections before relying on the Approved row; if there are too few, report a confidence interval.
+- The gallery writes `approved.json` (location id and image key entries; an empty image key approves every window of that location) into each volume's crops folder. With `data.approved_path` null the trainer reads `{data_root}/{volume}/approved.json` for every configured volume, in the flat or `AnnotationCrops` layout; it may also be a file, a directory or a list of those. Location ids are only unique within a volume, so matching always includes the volume. The counts per volume are logged at start-up, and a total of 0 warns loudly.
+- Approved masks stay on their own side of the z-slab split. Count how many fall in the validation sections before relying on the Approved row; if there are too few, report a confidence interval. Every Approved sample is always in the per-epoch subset.
 - Optionally, weight Approved masks 2× in training (`data.approved_weight`).
 
-**Checkpoint selection.** Among checkpoints whose pooled core recall on circle seeds is at least 97.5%, keep the one with the lowest merge rate, with spill breaking ties. If none reaches 97.5%, keep the highest core recall. This replaces IoU-based selection (assessment 1.1).
+**Per-epoch cost: a fixed subset, a full pass every third epoch.**
+- A full pass (all families, about 60 minutes on the RTX 4500 Ada) is too slow to run each epoch. Every epoch validates a fixed subset instead: `val.epoch_subset` (0.25) of each volume, drawn once from the run seed by a hash of volume, image key and location id, always including the Approved samples, without the legacy centroid family. It takes about 15 minutes.
+- The full split, centroid included, runs every `val.full_every_n_epochs` (3) epochs, after the last epoch and before an early stop. TensorBoard tags are `val_subset/...` and `val_full/...`; the old `val/iou` follows the subset.
+- Each sample is loaded once and encoded once, and every family decodes from that encoding. The ground-truth terms are computed in the DataLoader workers and the metrics run in a thread pool on the cropped bounding box, so the pass is GPU-bound. Validation runs in fp32, like `infer.py` and the server, so there is no `val.mixed_precision`.
+- Corrective-click evaluation (`sam2-em-eval --noc`) samples its clicks from goal errors and reports two stopping rules: IoU at the target (NoC@90) and core recall at the target with no merge.
+- `sam2-em-eval --goal` runs one full pass for any model (zero-shot, an earlier checkpoint) and prints every family's goal metrics, for baselines.
+
+**Checkpoint selection.** Among checkpoints whose pooled core recall on circle seeds (on the subset) is at least 97.5%, keep the one with the lowest merge rate, with spill breaking ties. If none reaches 97.5%, keep the highest core recall. This replaces IoU-based selection (assessment 1.1).
+
+**Early stopping and the noise floor.** A new best must beat the best so far by `training.early_stopping_min_delta` (0.002) in merge rate or spill, or 0.0005 in core recall, so noise on a 25% subset does not reset the patience (2 epochs); crossing the core-recall gate always counts. Metrics are rounded to 4 decimals before they are compared.
 
 ## 7. Production requirements (server and Viking)
 
-- **Shared encoding:** the server builds `mask_input` with the shared function and constants from section 2.
+- **Shared encoding:** the server builds `mask_input` with the shared function and constants from section 2. **A v4 model must not be served until it does.** `sam2-em-export-serve` writes the constants (`EDGE_TAU_PX`, `EDGE_TAU_DEPTH_FRAC`, `SEED_LOGIT`, `CORRECTION_LOGIT`, `LOGIT_CLIP`, `LOW_RES`, `circle_diameter_scale`) and a `prompt_encoding` version string into the exported file next to the weights, so the server can check them.
 - **Adjacent-section polygon:** when an annotator brings a polygon from the adjacent section and scales it to fit inside the cell, Viking sends it as a **seed**.
 - **New command, "Resegment this polygon":** sends an existing polygon as a **mask to correct** (M_corr), optionally with correction clicks.
 - **Clamp:** no hard clamp on masks to correct. If the +6 clamp is adopted at all, it applies only to a seed's trusted core.
@@ -230,10 +241,21 @@ Use a fixed seed and the z-slab validation split.
 | `loss.edge_tau_px` | 8.0 | τ of the loss weight (same cap); 0 disables edge weighting |
 | `loss.edge_weight_min` | 0.05 | w_min |
 | `loss.leak_weight` | 3.0 | λ_leak on neighbor cores; 1 disables |
-| `val.core_band_px` | 10 | Band ignored by core recall, leak and spill |
+| `iterative.batch_fraction`, `rounds_min`, `rounds_max`, `prev_mask_prob` | 0.2, 2, 6, 0.5 | Corrective-click training: the share of batches, rounds per batch, and the share of samples that feed back their previous logits. Clicks target goal errors (a miss in the core, a spill beyond the band) |
+| `val.core_band_px` | 10 | Band ignored by core recall, leak and spill, and by corrective-click sampling |
 | `val.core_recall_target` | 0.975 | Checkpoint gate |
-| `data.approved_path` | none | Path to `approved.json`; missing means no Approved row |
+| `val.merge_min_px` | 500 | A merge covers at least this many px of one neighbor's visible core, as well as 5% of it |
+| `val.epoch_subset` | 0.25 | Share of each volume validated every epoch (fixed, includes Approved) |
+| `val.full_every_n_epochs` | 3 | Full validation pass interval (and after the last epoch) |
+| `val.batch_size`, `val.metric_threads` | 4, 4 | Validation batch and metric threads |
+| `training.early_stopping_patience`, `early_stopping_min_delta` | 2, 0.002 | Epochs without a better checkpoint before stopping; the noise floor of "better" (core recall uses 0.0005) |
+| `data.approved_path` | null | null: each volume's `approved.json`. Or a file, a directory or a list. Empty image key = every window of the location |
 | `data.approved_weight` | 1.0 | Training weight for Approved masks (2.0 to try) |
+| `training.batch_size`, `gradient_accumulation_steps` | 2, 8 | Throughput default, see below |
+| `model.activation_checkpointing` | false | Faster than checkpointing at batch 4 (see below) |
+| `training.cudnn_benchmark` | false | No speed benefit; one run had a 21 GB workspace spike |
+
+**Throughput defaults.** An A/B/A/B comparison of 200 training steps each, with the GPU clocks logged: batch 2 × 8 accumulation without activation checkpointing took 0.2765 and 0.2755 s/sample at 14.8 GB peak; batch 4 × 4 with checkpointing took 0.314 and 0.339 s/sample at 7.0 GB. The first is 15.5% faster, so it is the default. Clocks were steady (only the software power cap fired, in both), and no other process used the GPU. Checkpointing off at batch 4 does not fit in 22.5 GB, and a quarter of the blocks thrashed at 20.5 GB. An earlier whole-benchmark run showed 0.321 s/sample for the first configuration; a single v4 epoch will show which holds.
 
 Removed: `prompt.prob_full_mask`, `prompt.prob_negative_only`, `negative.allow_circle_targets`, `negative.circle_target_fraction`.
 
@@ -257,6 +279,7 @@ Removed: `prompt.prob_full_mask`, `prompt.prob_negative_only`, `negative.allow_c
 8. Bounding-box distance transforms (3–7× faster on full tiles); GPU edge weights if loading is still the bottleneck.
 9. No `.item()` syncs in the loss path; stale comments (the "50K" mask CNN size) fixed.
 10. Tests: shrunk and cut seeds stay inside the truth; masks to correct differ from it; near-correct masks have mean displacement 5–12 px and peak excursion no more than 30 px; leak weights appear only in neighbor cores.
+11. Second review (Oct 14): merge corrections click outside the merged neighbor; Approved discovery per volume with whole-location entries; a merge floor of 500 px (`val.merge_min_px`); corrective clicks aimed at goal errors, and NoC reported by IoU and by core recall with no merge; encoding constants written into the exported model; per-category, per-volume and per-depth goal metrics on full passes; losses in fp32; merges drawn from neighbors within 20 px; `sam2-em-eval --goal` for baselines.
 
 **Acceptance for Phase A**, on the z-slab validation split, against the current model:
 - pooled core recall on circle seeds does not drop, and merge rate does not rise;
@@ -270,8 +293,8 @@ Removed: `prompt.prob_full_mask`, `prompt.prob_negative_only`, `negative.allow_c
 4. Copy `approved.json` next to the export.
 
 **Phase C: correction training.**
-1. Correction masks from the model's own predictions, used for about half of the correction samples (as in μSAM).
-2. Correction clicks sampled from the error region of masks to correct (as in SAM, SAM 2 and RITM).
+1. Correction masks from the model's own predictions, used for about half of the correction samples (as in μSAM). Open.
+2. Correction clicks sampled from the error region (as in SAM, SAM 2 and RITM). **Done** (`iterative.*`): 20% of batches run 2–6 rounds of predict, click, feed back the previous logits, with only the last pass carrying gradients. Clicks target goal errors (a positive click in the part of the core the prediction misses, a negative one beyond the core band), and fall back to the raw error regions when there are none.
 
 **Phase D: production.**
 1. The server uses the shared encoding.
