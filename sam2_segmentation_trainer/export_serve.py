@@ -47,16 +47,16 @@ def load_finetuned_model(
     return model
 
 
-def run_encoding_settings(run_dir: Path | None) -> dict[str, float] | None:
+def run_encoding_settings(run_dir: Path | None) -> dict[str, Any] | None:
     """The encoding values a run trained with, from its saved ``config.yaml``; None when there is none to read.
 
     Keys: ``edge_tau_px``, ``edge_tau_depth_frac``, ``seed_logit``, ``correction_logit``,
-    ``circle_diameter_scale`` (the ``prompt.*`` values; a key the config lacks keeps the library default).
+    ``circle_diameter_scale`` (floats) and ``circle_annotation_trust`` (a ``CircleAnnotationTrust``): the
+    ``prompt.*`` values; a key the config lacks keeps the library default.
     """
     from omegaconf import OmegaConf
 
-    from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
-    from annotation_crops import prompt_encoding as enc
+    from sam2_segmentation_trainer.encoding_record import settings_from_cfg
 
     path = None if run_dir is None else Path(run_dir) / "config.yaml"
     if path is None or not path.is_file():
@@ -66,16 +66,7 @@ def run_encoding_settings(run_dir: Path | None) -> dict[str, float] | None:
     except Exception as exc:  # unreadable yaml: treat as missing, the caller warns
         print(f"WARNING: could not read {path}: {exc}")
         return None
-    defaults = {
-        "edge_tau_px": enc.EDGE_TAU_PX,
-        "edge_tau_depth_frac": enc.EDGE_TAU_DEPTH_FRAC,
-        "seed_logit": enc.SEED_LOGIT,
-        "correction_logit": enc.CORRECTION_LOGIT,
-        "circle_diameter_scale": DEFAULT_CIRCLE_DIAMETER_SCALE,
-    }
-    return {
-        key: float(OmegaConf.select(cfg, f"prompt.{key}", default=default)) for key, default in defaults.items()
-    }
+    return settings_from_cfg(cfg)
 
 
 def serve_metadata(circle_diameter_scale: float | None = None, run_dir: Path | None = None) -> dict[str, Any]:
@@ -87,7 +78,7 @@ def serve_metadata(circle_diameter_scale: float | None = None, run_dir: Path | N
     the same way (see the README), and a run whose values differ from the library constants is warned about.
     """
     from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
-    from annotation_crops.prompt_encoding import encoding_differences, encoding_metadata
+    from annotation_crops.prompt_encoding import CircleAnnotationTrust, encoding_differences, encoding_metadata
 
     settings = run_encoding_settings(run_dir)
     if settings is None:
@@ -107,6 +98,7 @@ def serve_metadata(circle_diameter_scale: float | None = None, run_dir: Path | N
         correction_logit=meta["CORRECTION_LOGIT"],
         circle_diameter_scale=scale,
         default_circle_diameter_scale=DEFAULT_CIRCLE_DIAMETER_SCALE,
+        circle_annotation_trust=CircleAnnotationTrust.from_mapping(meta["circle_annotation_trust"]),
     ):
         print(f"WARNING: {message}; the server implements the library constants")
     return meta
@@ -126,9 +118,13 @@ def export_serve_checkpoint(
 
     The file is ``{"model": state_dict, "prompt_encoding": {...}}``: ``build_sam2`` reads only ``"model"``, and the
     metadata records the constants the model was trained with, read from ``run_dir/config.yaml`` (the checkpoint's
-    own folder when ``run_dir`` is omitted; see :func:`serve_metadata`).
+    own folder when ``run_dir`` is omitted; see :func:`serve_metadata`). The same dict is also written as
+    ``<out stem>.prompt_encoding.json`` next to ``out``. The exporter never scales circles: the record carries the
+    diameter scale and the circle-annotation trust fractions for the server to apply.
     """
     import torch
+
+    from sam2_segmentation_trainer.encoding_record import sidecar_path, write_record
 
     model = load_finetuned_model(finetuned, base_ckpt, model_cfg, device)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +132,7 @@ def export_serve_checkpoint(
     metadata = serve_metadata(circle_diameter_scale, run_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict(), "prompt_encoding": metadata}, out)
+    write_record(sidecar_path(out), metadata)
     return out
 
 

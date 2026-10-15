@@ -20,7 +20,7 @@ from annotation_crops.negatives import (
     drop_circles_over_target,
     rasterize_circle,
 )
-from annotation_crops.prompt_encoding import EDGE_TAU_DEPTH_FRAC
+from annotation_crops.prompt_encoding import EDGE_TAU_DEPTH_FRAC, CircleAnnotationTrust
 
 from sam2_segmentation_trainer.data.approved import as_approved, is_approved
 from sam2_segmentation_trainer.data.augment import (
@@ -162,6 +162,40 @@ def imagenet_normalize(rgb_uint8: np.ndarray) -> torch.Tensor:
     mean = torch.tensor(IMAGENET_MEAN, dtype=tensor.dtype).view(3, 1, 1)
     std = torch.tensor(IMAGENET_STD, dtype=tensor.dtype).view(3, 1, 1)
     return (tensor - mean) / std
+
+
+def augment_scene(
+    transform,
+    rgb: np.ndarray,
+    target: np.ndarray,
+    regions: Sequence[NegativeRegion],
+    extras: Sequence[np.ndarray] = (),
+):
+    """Run the image, target, negative regions and extra boolean masks through one geometric transform.
+
+    A region that is an annotated circle also carries a float32 trust map; it rides along as its own layer, so the
+    claimed mask and the map stay registered to the image (flips, rotations and elastic warps). Returns
+    ``(image, target, regions, extras)`` with boolean masks, and drops regions that left the image.
+    """
+    weighted = [r for r in regions if r.weight is not None]
+    layers = (
+        [target.astype(np.uint8)]
+        + [r.mask.astype(np.uint8) for r in regions]
+        + [r.weight.astype(np.float32, copy=False) for r in weighted]
+        + [e.astype(np.uint8) for e in extras]
+    )
+    augmented = transform(image=rgb, masks=layers)
+    out = augmented["masks"]
+    count = len(regions)
+    region_masks = [np.asarray(m) > 0 for m in out[1 : 1 + count]]
+    weights = iter(np.asarray(w, dtype=np.float32) for w in out[1 + count : 1 + count + len(weighted)])
+    regions_aug: list[NegativeRegion] = []
+    for region, mask in zip(regions, region_masks):
+        weight = None if region.weight is None else next(weights)  # advance for every weighted region, kept or not
+        if mask.any():
+            regions_aug.append(NegativeRegion(region.location_id, region.kind, mask, weight))
+    extras_aug = [np.asarray(m) > 0 for m in out[1 + count + len(weighted) :]]
+    return augmented["image"], np.asarray(out[0]) > 0, regions_aug, extras_aug
 
 
 def _variant_from_prompt(prompt) -> dict[str, Any]:
@@ -327,14 +361,8 @@ class EMSegDataset(Dataset):
 
         shape = (int(rgb.shape[0]), int(rgb.shape[1]))
         regions = self._other_annotations(example, shape) if self._needs_neighbors() else []
-        augmented = self.transform(image=rgb, masks=[mask] + [r.mask.astype(np.uint8) for r in regions])
-        image_aug = augmented["image"]
-        mask_bin = (np.asarray(augmented["masks"][0]) > 0).astype(np.uint8)
-        regions_aug = [
-            NegativeRegion(region.location_id, region.kind, np.asarray(m) > 0)
-            for region, m in zip(regions, augmented["masks"][1:])
-            if np.asarray(m).any()
-        ]
+        image_aug, target_aug, regions_aug, _extras = augment_scene(self.transform, rgb, mask > 0, regions)
+        mask_bin = target_aug.astype(np.uint8)
 
         centroid = interior_point_xy(mask_bin) if point_mode == "point" else mask_centroid_xy(mask_bin)
         if centroid is None:
@@ -392,27 +420,18 @@ class EMSegDataset(Dataset):
         if needs_circle:
             own = tiles.circle_for(key, example.location_id)
             if own is not None and own.center_in(shape):
-                disc = rasterize_circle(shape, own.center_x, own.center_y, own.radius)
+                disc = rasterize_circle(shape, own.center_x, own.center_y, own.seed_radius(self.circle_scale))
                 circle_mask = disc if disc.any() else None
         regions = self._other_annotations(example, shape)
         if prompt_cfg.drop_overlapping_circles:
             regions = drop_circles_over_target(regions, target)
 
-        layers = [target.astype(np.uint8)] + [r.mask.astype(np.uint8) for r in regions]
-        if circle_mask is not None:
-            layers.append(circle_mask.astype(np.uint8))
-        augmented = self.transform(image=rgb, masks=layers)
-        image_aug = augmented["image"]
-        masks_aug = [np.asarray(m) > 0 for m in augmented["masks"]]
-        target_aug = masks_aug[0]
+        image_aug, target_aug, regions_aug, extras = augment_scene(
+            self.transform, rgb, target, regions, [] if circle_mask is None else [circle_mask]
+        )
         if not target_aug.any():
             raise KeyError(f"{example.split_key} target is empty after augmentation")
-        regions_aug = [
-            NegativeRegion(region.location_id, region.kind, m)
-            for region, m in zip(regions, masks_aug[1 : 1 + len(regions)])
-            if m.any()
-        ]
-        circle_aug = masks_aug[-1] if circle_mask is not None else None
+        circle_aug = extras[0] if circle_mask is not None else None
         if needs_circle and (circle_aug is None or not circle_aug.any()):
             fitted = inscribed_circle_xyr(target_aug, self.circle_scale)
             if fitted is None:
@@ -494,8 +513,13 @@ class EMSegDataset(Dataset):
             example.mask_path.parent,
             shape,
             self._mask_cache,
+            self._circle_trust(),
         )
         return regions
+
+    def _circle_trust(self) -> CircleAnnotationTrust:
+        """The circle-annotation trust the prompts use (``prompt.circle_annotation_trust``)."""
+        return (self.prompt_cfg if self.prompt_cfg is not None else PromptConfig()).circle_annotation_trust
 
     def _weights(
         self, target: np.ndarray, regions: Sequence[NegativeRegion], meta: SampleMeta
@@ -503,10 +527,11 @@ class EMSegDataset(Dataset):
         """The loss-side items of a sample: edge weight, training weight and (validation) neighbor cores.
 
         ``edge_weight`` is the tolerant weight of the ground truth (float16) times ``leak_weight`` on neighbor
-        cores; None when both are off. ``neighbor_core`` is None unless ``core_band_px > 0``.
+        cores; None when both are off. ``neighbor_core`` is None unless ``core_band_px > 0``. A polygon's core is
+        ``leak_core_px`` (loss) or ``core_band_px`` (metric) deep; an annotated circle's is ``rho <= full_frac``.
         """
         weight = edge_weight_map(target, self.edge_tau_px, self.edge_weight_min, self.edge_tau_depth_frac)
-        masks = [r.mask for r in regions]
+        masks = list(regions)
         if self.leak_weight != 1.0 and masks:
             weight = apply_leak_weight(
                 weight, leak_mask(masks, target, self.leak_core_px), self.leak_weight, target.shape
@@ -588,18 +613,10 @@ class EMSegDataset(Dataset):
         own = tiles.circle_for(key, example.location_id)
         circle_mask: np.ndarray | None = None
         if own is not None and own.center_in(shape):
-            disc = rasterize_circle(shape, own.center_x, own.center_y, own.radius)
+            disc = rasterize_circle(shape, own.center_x, own.center_y, own.seed_radius(self.circle_scale))
             circle_mask = disc if disc.any() else None
 
-        regions = collect_negative_regions(
-            example.image_key,
-            example.location_id,
-            tiles.neighbor_ids(key),
-            tiles.circles_in(key),
-            example.mask_path.parent,
-            shape,
-            self._mask_cache,
-        )
+        regions = self._other_annotations(example, shape)
         if prompt_cfg.drop_overlapping_circles:
             regions = drop_circles_over_target(regions, target)
         adjacent_shape = None if full_tile else tiles.adjacent_shape(key, example.location_id)
@@ -609,24 +626,15 @@ class EMSegDataset(Dataset):
 
         # The target, every negative and the circle go through the same geometric transform as the image, so
         # prompts stay registered to it (elastic warps and flips included).
-        layers = [target.astype(np.uint8)] + [r.mask.astype(np.uint8) for r in regions]
         # An adjacent seed that cannot be fitted falls back to the circle seed, so it needs the circle too.
         needs_circle = PromptType.CIRCLE_SEED in types or PromptType.ADJACENT_SEED in types
         use_circle = needs_circle and circle_mask is not None
-        if use_circle:
-            layers.append(circle_mask.astype(np.uint8))
-        augmented = self.transform(image=rgb, masks=layers)
-        image_aug = augmented["image"]
-        masks_aug = [np.asarray(m) > 0 for m in augmented["masks"]]
-        target_aug = masks_aug[0]
+        image_aug, target_aug, regions_aug, extras = augment_scene(
+            self.transform, rgb, target, regions, [circle_mask] if use_circle else []
+        )
         if not target_aug.any():
             raise KeyError(f"{example.split_key} target is empty after augmentation")
-        regions_aug = [
-            NegativeRegion(region.location_id, region.kind, mask)
-            for region, mask in zip(regions, masks_aug[1 : 1 + len(regions)])
-            if mask.any()
-        ]
-        circle_aug = masks_aug[-1] if use_circle else None
+        circle_aug = extras[0] if use_circle else None
         if needs_circle and (circle_aug is None or not circle_aug.any()):
             # No annotation circle in this tile (or it left the image): fit the largest circle inside the target.
             fitted = inscribed_circle_xyr(target_aug, self.circle_scale)

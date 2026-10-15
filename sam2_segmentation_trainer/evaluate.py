@@ -16,8 +16,10 @@ from tqdm import tqdm
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
 from sam2_segmentation_trainer.data.dataset import VAL_PROMPTS, EMSegDataset, collate_em
 from sam2_segmentation_trainer.data.manifest import index_volumes
+from sam2_segmentation_trainer.data.prompts import PromptConfig
 from sam2_segmentation_trainer.data.splits import load_split
 from sam2_segmentation_trainer.data.tiles import build_tile_context
+from sam2_segmentation_trainer.encoding_record import ResolvedEncoding, read_record, resolve_encoding
 from sam2_segmentation_trainer.export_serve import load_finetuned_model
 from sam2_segmentation_trainer.interactive import simulate_clicks, summarize_noc
 from sam2_segmentation_trainer.metrics import boundary_f1, iou_dice_pr, summarize_records
@@ -49,7 +51,11 @@ class EvalRequest:
     noc: bool = False
     noc_max_clicks: int = 20
     noc_target_iou: float = 0.9
-    circle_scale: float = DEFAULT_CIRCLE_DIAMETER_SCALE
+    circle_scale: float | None = None
+    """Override of the diameter scale of seed circles; None uses the model's record, else the default."""
+    circle_full_frac: float | None = None
+    circle_zero_frac: float | None = None
+    """Overrides of ``prompt.circle_annotation_trust``; None uses the model's record, else the default."""
     core_band_px: float = 10.0
     """``val.core_band_px``: the band the goal metrics and the NoC click sampling ignore around the traced edge."""
     core_recall_target: float = 0.975
@@ -58,6 +64,19 @@ class EvalRequest:
     """Score the full validation split with the training validation suite (every family's goal metrics)."""
     overrides: tuple[str, ...] = ()
     """Config overrides (``section.key=value``) for the ``goal`` run, like the trainer's command line."""
+
+
+def resolve_request_encoding(request: EvalRequest) -> ResolvedEncoding:
+    """The prompt encoding to score ``request`` with: the model's own record when it has one, else the defaults,
+    with the command-line overrides applied and logged."""
+    record, source = read_record(request.finetuned)
+    return resolve_encoding(
+        record,
+        source=source,
+        circle_scale=request.circle_scale,
+        full_frac=request.circle_full_frac,
+        zero_frac=request.circle_zero_frac,
+    )
 
 
 def _load_model(request: EvalRequest, device: torch.device):
@@ -70,11 +89,11 @@ def _load_model(request: EvalRequest, device: torch.device):
     return model
 
 
-def _evaluate_noc(request: EvalRequest, val_ex, tiles, model, device) -> dict:
+def _evaluate_noc(request: EvalRequest, val_ex, tiles, model, device, prompt_cfg=None) -> dict:
     """Clicks to reach `noc_target_iou` from one interior point plus simulated corrections, per volume."""
     dataset = EMSegDataset(
         val_ex, split="val", image_size=request.image_size, tiles=tiles, val_prompt="point",
-        core_band_px=request.core_band_px,
+        core_band_px=request.core_band_px, prompt_cfg=prompt_cfg,
     )
     loader = DataLoader(
         dataset, batch_size=1, shuffle=False, num_workers=request.num_workers, collate_fn=collate_em
@@ -114,11 +133,12 @@ def evaluate_goal(request: EvalRequest) -> dict:
 
     from sam2_segmentation_trainer import train
     from sam2_segmentation_trainer.data.manifest import take_model_sized
-    from sam2_segmentation_trainer.data.prompts import PromptConfig
     from sam2_segmentation_trainer.data.splits import save_split
     from sam2_segmentation_trainer.validation import format_summary
 
-    cfg = train.load_train_cfg(list(request.overrides))
+    resolved = resolve_request_encoding(request)
+    # The model's record and the command line come first, so an explicit --set still wins.
+    cfg = train.load_train_cfg(resolved.cfg_overrides() + list(request.overrides))
     prompt_cfg = PromptConfig.from_cfg(cfg)
     examples = index_volumes(volumes=request.volumes, root=request.data_dir, skip_missing=True)
     examples, _wrong_size = take_model_sized(examples, request.image_size)
@@ -165,7 +185,9 @@ def evaluate(request: EvalRequest) -> dict:
     examples = index_volumes(volumes=request.volumes, root=request.data_dir, skip_missing=True)
     split = load_split(request.split_path)
     _train_ex, val_ex = split.partition(examples)
-    tiles = build_tile_context(examples, circle_scale=request.circle_scale)
+    resolved = resolve_request_encoding(request)
+    prompt_cfg = PromptConfig(**resolved.prompt_kwargs())
+    tiles = build_tile_context(examples, circle_scale=resolved.circle_diameter_scale)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _load_model(request, device)
 
@@ -177,7 +199,8 @@ def evaluate(request: EvalRequest) -> dict:
             val_ex, split="val", image_size=request.image_size,
             tiles=tiles,
             val_prompt=prompt,
-            circle_scale=request.circle_scale,
+            circle_scale=resolved.circle_diameter_scale,
+            prompt_cfg=prompt_cfg,
         )
         loader = DataLoader(
             dataset,
@@ -206,7 +229,7 @@ def evaluate(request: EvalRequest) -> dict:
         summaries[prompt] = summarize_records(records)
 
     if request.noc:
-        summaries["noc"] = _evaluate_noc(request, val_ex, tiles, model, device)
+        summaries["noc"] = _evaluate_noc(request, val_ex, tiles, model, device, prompt_cfg)
 
     request.out_dir.mkdir(parents=True, exist_ok=True)
     (request.out_dir / "metrics.json").write_text(json.dumps(summaries, indent=2) + "\n", encoding="utf-8")
@@ -269,8 +292,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--circle-scale",
         type=float,
-        default=DEFAULT_CIRCLE_DIAMETER_SCALE,
-        help="Diameter scale of prompt circles; the exporter writes true radii and this shrinks them (match prompt.circle_diameter_scale)",
+        default=None,
+        help="Override the diameter scale of the seed circles (default: the model's prompt-encoding record, else "
+        f"{DEFAULT_CIRCLE_DIAMETER_SCALE}). The exporter writes true radii; this applies to seed circles only",
+    )
+    parser.add_argument(
+        "--circle-full-frac",
+        type=float,
+        default=None,
+        help="Override prompt.circle_annotation_trust.full_frac (default: the model's record, else the library default)",
+    )
+    parser.add_argument(
+        "--circle-zero-frac",
+        type=float,
+        default=None,
+        help="Override prompt.circle_annotation_trust.zero_frac (default: the model's record, else the library default)",
     )
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -308,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             noc_max_clicks=args.noc_max_clicks,
             noc_target_iou=args.noc_iou,
             circle_scale=args.circle_scale,
+            circle_full_frac=args.circle_full_frac,
+            circle_zero_frac=args.circle_zero_frac,
             core_band_px=args.core_band_px,
             core_recall_target=args.core_recall_target,
             goal=args.goal,

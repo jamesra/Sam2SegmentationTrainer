@@ -7,11 +7,17 @@ annotation) and are shared with DataLoader workers by fork/pickle.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from annotation_crops.negatives import CircleAnnotation, load_circle_annotations, load_circle_scale
+from annotation_crops.negatives import (
+    SOURCE_ANNOTATED,
+    CircleAnnotation,
+    load_circle_annotations,
+    load_circle_scale,
+)
 
 from sam2_segmentation_trainer.data.manifest import CropExample
 
@@ -65,12 +71,13 @@ def check_circle_files(
     *,
     require: bool,
     circle_scale: float | None,
+    by_source: dict[str, Counter] | None = None,
 ) -> list[str]:
-    """Report volumes whose circle file is missing or empty, and how each file's radii are rescaled.
+    """Report volumes whose circle file is missing or empty, and how each file's radii are used.
 
-    ``loaded`` maps each volume to its number of circle entries. With ``require`` a missing or empty file
-    raises, because circle-mask prompts would silently disappear and the prompt mix would shift to the rest.
-    Returns the warnings it printed.
+    ``loaded`` maps each volume to its number of circle entries; ``by_source`` optionally to its entries per
+    ``source``. With ``require`` a missing or empty file raises, because circle-mask prompts would silently
+    disappear and the prompt mix would shift to the rest. Returns the warnings it printed.
     """
     missing = sorted(volume for volume in crops_dirs if loaded.get(volume, 0) == 0)
     if missing and require:
@@ -83,8 +90,15 @@ def check_circle_files(
         if volume in missing:
             continue
         scale = load_circle_scale(crops)
-        note = "" if circle_scale is None else f", radii x{circle_scale / (scale or 1.0):.4g} to diameter scale {circle_scale}"
-        print(f"circles {volume}: {loaded[volume]} entries, file diameter_scale {scale}{note}")
+        counts = (by_source or {}).get(volume, Counter())
+        annotated = counts.get(SOURCE_ANNOTATED, 0)
+        inscribed = loaded[volume] - annotated
+        seed_note = "as written" if circle_scale is None else f"x{circle_scale / (scale or 1.0):.4g} (diameter scale {circle_scale})"
+        print(
+            f"circles {volume}: {loaded[volume]} entries, file diameter_scale {scale}; "
+            f"{annotated} annotated at true radius (trust fractions apply, no diameter scale), "
+            f"{inscribed} inscribed radii {seed_note}"
+        )
     for message in messages:
         print(f"WARNING: {message}")
     return messages
@@ -101,8 +115,8 @@ def build_tile_context(
 
     ``examples`` should be the whole usable inventory, not just the training split: a validation location is
     still an annotation that a training tile must treat as background. ``circle_scale`` is the diameter scale
-    of the circles the caller draws; radii are rescaled from the file's own ``diameter_scale`` to it (None
-    keeps them as written). ``require_circles`` turns a missing file into an error (:func:`check_circle_files`).
+    of the seed circles the caller draws: inscribed radii are rescaled from the file's own ``diameter_scale`` to
+    it (None keeps them as written). Annotated circles always load at their true radius. ``require_circles`` turns a missing file into an error (:func:`check_circle_files`).
     """
     by_tile: dict[TileKey, list[int]] = {}
     crops_dirs: dict[str, Path] = {}
@@ -113,10 +127,14 @@ def build_tile_context(
     circles: dict[TileKey, tuple[CircleAnnotation, ...]] = {}
     if load_circles:
         loaded: dict[str, int] = {}
+        by_source: dict[str, Counter] = {}
         for volume, crops in crops_dirs.items():
             entries_by_key = load_circle_annotations(crops, circle_scale)
             loaded[volume] = sum(len(entries) for entries in entries_by_key.values())
+            by_source[volume] = Counter(c.source for entries in entries_by_key.values() for c in entries)
             for image_key, entries in entries_by_key.items():
                 circles[(volume, image_key)] = entries
-        check_circle_files(crops_dirs, loaded, require=require_circles, circle_scale=circle_scale)
+        check_circle_files(
+            crops_dirs, loaded, require=require_circles, circle_scale=circle_scale, by_source=by_source
+        )
     return TileContext(neighbors=neighbors, circles=circles)

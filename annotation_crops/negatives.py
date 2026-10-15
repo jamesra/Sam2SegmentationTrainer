@@ -20,6 +20,8 @@ from typing import Collection, Iterable, Sequence
 import numpy as np
 from PIL import Image
 
+from annotation_crops.prompt_encoding import DEFAULT_CIRCLE_TRUST, CircleAnnotationTrust, circle_negative_canvas
+
 CIRCLE_FILE_NAME = "circle_annotations.json"
 #: Fraction of a circle's true diameter that a prompt circle covers (training default, ``prompt.circle_diameter_scale``).
 DEFAULT_CIRCLE_DIAMETER_SCALE = 0.95
@@ -28,6 +30,9 @@ DEFAULT_CIRCLE_DIAMETER_SCALE = 0.95
 KIND_POLYGON = "polygon"
 KIND_CIRCLE = "circle"
 
+SOURCE_ANNOTATED = "annotated"
+SOURCE_INSCRIBED = "inscribed"
+
 _MASK_THRESHOLD = 127
 
 
@@ -35,9 +40,11 @@ _MASK_THRESHOLD = 127
 class CircleAnnotation:
     """One circle in a tile, in that tile's pixel space (x right, y down, origin at the top-left corner).
 
-    ``radius`` is already multiplied by the exporter's diameter scale. The center may lie outside the tile
-    when only part of the circle falls in it. ``source`` is ``"annotated"`` for a location that is still a
-    circle and ``"inscribed"`` for the largest circle inside a polygon location.
+    ``source`` is ``"annotated"`` for a location that is still a circle and ``"inscribed"`` for the largest
+    circle inside a polygon location. An annotated circle's ``radius`` is its TRUE radius (its radii are unreliable,
+    so it is only ever a negative, scaled by :class:`CircleAnnotationTrust`); an inscribed circle's ``radius`` is
+    already multiplied by the caller's diameter scale. The center may lie outside the tile when only part of the
+    circle falls in it.
     """
 
     location_id: int
@@ -46,23 +53,41 @@ class CircleAnnotation:
     radius: float
     structure_label: str = ""
     has_polygon_mask: bool = False
-    source: str = "annotated"
+    source: str = SOURCE_ANNOTATED
 
     def center_in(self, shape: tuple[int, int]) -> bool:
         """Whether the center lies inside an image of ``shape`` (height, width)."""
         height, width = shape
         return 0.0 <= self.center_x < float(width) and 0.0 <= self.center_y < float(height)
 
+    def seed_radius(self, scale: float) -> float:
+        """The radius of this circle drawn as a prompt seed: ``scale`` times the true radius.
+
+        An annotated circle is stored at its true radius, so the diameter scale applies here; an inscribed one has
+        it applied already.
+        """
+        return self.radius * float(scale) if self.source == SOURCE_ANNOTATED else self.radius
+
 
 @dataclass(eq=False)
 class NegativeRegion:
     """One other annotation in the tile: its location id, whether it came from a polygon mask or a circle,
     and a boolean raster of shape ``(height, width)``. Callers must not modify ``mask``.
+
+    ``weight`` is set only for an annotated circle: its float32 trust map ``w`` (see
+    :func:`annotation_crops.prompt_encoding.circle_trust`), with ``mask`` the region it claims. Its core is
+    ``weight >= 1``. Both go through the same geometric augmentation as the image.
     """
 
     location_id: int
     kind: str
     mask: np.ndarray
+    weight: np.ndarray | None = None
+
+    @property
+    def core(self) -> np.ndarray | None:
+        """The fully trusted pixels of an annotated circle, or None for any other region."""
+        return None if self.weight is None else self.weight >= 1.0
 
 
 def circle_file_path(crops: Path) -> Path:
@@ -83,9 +108,10 @@ def load_circle_annotations(
 ) -> dict[str, tuple[CircleAnnotation, ...]]:
     """Read ``circle_annotations.json`` into ``{imageKey: circles}``.
 
-    The exporter writes true radii and records ``diameter_scale`` 1.0; files from older exporters have the
-    scale baked into ``radius``. ``scale`` is the diameter scale the caller wants: every radius is multiplied
-    by ``scale / diameter_scale`` so both kinds of file give the same circles. None keeps the radii as written.
+    The exporter never scales: it writes true radii and records ``diameter_scale`` 1.0; files from older exporters
+    have the scale baked into ``radius``. Annotated circles are loaded at their TRUE radius (divided by the file's
+    ``diameter_scale`` for an old file). Inscribed circles are the caller's seed circles: ``scale`` is the diameter
+    scale it wants and each of their radii is multiplied by ``scale / diameter_scale``; None keeps them as written.
 
     A missing or unreadable file, or a version this code does not know, yields an empty mapping: circles are
     optional context, so training and the gallery run without them. Malformed entries are skipped.
@@ -99,28 +125,29 @@ def load_circle_annotations(
     cells = payload.get("grid_cells")
     if not isinstance(cells, dict):
         return {}
-    factor = 1.0
-    if scale is not None:
-        try:
-            file_scale = float(payload.get("diameter_scale", 1.0))
-        except (TypeError, ValueError):
-            file_scale = 1.0
-        if file_scale > 0.0:
-            factor = float(scale) / file_scale
+    try:
+        file_scale = float(payload.get("diameter_scale", 1.0))
+    except (TypeError, ValueError):
+        file_scale = 1.0
+    if file_scale <= 0.0:
+        file_scale = 1.0
+    true_factor = 1.0 / file_scale
+    seed_factor = 1.0 if scale is None else float(scale) / file_scale
     index: dict[str, tuple[CircleAnnotation, ...]] = {}
     for image_key, entries in cells.items():
         circles: list[CircleAnnotation] = []
         for entry in entries or []:
             try:
+                source = str(entry.get("source") or SOURCE_ANNOTATED)
                 circles.append(
                     CircleAnnotation(
                         location_id=int(entry["location_id"]),
                         center_x=float(entry["center_x"]),
                         center_y=float(entry["center_y"]),
-                        radius=float(entry["radius"]) * factor,
+                        radius=float(entry["radius"]) * (true_factor if source == SOURCE_ANNOTATED else seed_factor),
                         structure_label=str(entry.get("structure_label") or ""),
                         has_polygon_mask=bool(entry.get("has_polygon_mask", False)),
-                        source=str(entry.get("source") or "annotated"),
+                        source=source,
                     )
                 )
             except (KeyError, TypeError, ValueError):
@@ -205,6 +232,7 @@ def collect_negative_regions(
     mask_dir: Path,
     shape: tuple[int, int],
     cache: MaskCache | None = None,
+    trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST,
 ) -> list[NegativeRegion]:
     """Every other annotation in the tile as its own boolean raster.
 
@@ -212,6 +240,9 @@ def collect_negative_regions(
     may be included; it is skipped). A neighbor whose file has vanished is skipped. A circle is rasterized
     only when its location is neither the target nor a neighbor whose mask was loaded, so a polygon is not
     drawn twice and the inscribed circle of a polygon is not added on top of the polygon itself.
+
+    An annotated circle (true radius, unreliable) becomes the region it claims under ``trust`` (``rho <=
+    zero_frac``) with its trust map in ``weight``; an inscribed circle is rasterized at its stored radius.
     """
     loader = cache.get if cache is not None else _load_mask
     regions: list[NegativeRegion] = []
@@ -229,6 +260,12 @@ def collect_negative_regions(
         regions.append(NegativeRegion(location_id, KIND_POLYGON, mask))
     for circle in circles:
         if circle.location_id in covered:
+            continue
+        if circle.source == SOURCE_ANNOTATED:
+            claim = circle_negative_canvas(shape, circle.center_x, circle.center_y, circle.radius, trust, 1.0)
+            if claim.mask.any():
+                covered.add(circle.location_id)
+                regions.append(NegativeRegion(circle.location_id, KIND_CIRCLE, claim.mask, -claim.canvas))
             continue
         mask = rasterize_circle(shape, circle.center_x, circle.center_y, circle.radius)
         if mask.any():
@@ -253,6 +290,7 @@ def composite_negative_mask(
     mask_dir: Path,
     shape: tuple[int, int],
     cache: MaskCache | None = None,
+    trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST,
 ) -> np.ndarray:
     """int8 array of ``shape``: -1 at every other annotation in the tile, 0 elsewhere.
 
@@ -261,7 +299,7 @@ def composite_negative_mask(
     draw the result.
     """
     regions = collect_negative_regions(
-        image_key, target_location_id, neighbor_location_ids, circles, mask_dir, shape, cache
+        image_key, target_location_id, neighbor_location_ids, circles, mask_dir, shape, cache, trust
     )
     return stamp_negative_regions(regions, shape)
 

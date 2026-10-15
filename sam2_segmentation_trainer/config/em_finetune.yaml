@@ -94,10 +94,19 @@ differential_lr:
 prompt:
   # false: every training sample is the original single centroid point.
   enabled: true
-  # Diameter of a prompt circle as a fraction of the annotated circle (and of a polygon's inscribed circle).
-  # The exporter writes true radii (diameter_scale 1.0); the trainer shrinks them to this on load, and rescales a
-  # file from an older exporter that baked a scale in, so changing it needs no re-export.
+  # Diameter of a SEED circle (a polygon's inscribed circle, the production prompt) as a fraction of its true
+  # diameter. It does not apply to circle annotations, which only ever serve as negatives (see below).
+  # The exporter never scales: it writes true radii (diameter_scale 1.0); the trainer applies this on load, and
+  # rescales a file from an older exporter that baked a scale in, so changing it needs no re-export.
   circle_diameter_scale: 0.95
+  # Trust in a circle ANNOTATION (circle_annotations.json source "annotated"), as fractions of its TRUE radius:
+  # its radii are unreliable (about 2x in the radius-bug cases), so it is used only as a negative. The negative
+  # is fed at full strength (-seed_logit) inside full_frac, tapers to 0 with a half cosine, and the circle claims
+  # nothing beyond zero_frac. The core used for leak and the metrics, and for its background points, is
+  # rho <= full_frac. Needs 0 <= full_frac < zero_frac. Recorded with the model (prompt_encoding.json).
+  circle_annotation_trust:
+    full_frac: 0.5    # full -SEED_LOGIT inside this fraction of the TRUE radius
+    zero_frac: 0.95   # taper reaches 0 here; the circle claims nothing beyond
   # Prompt variants decoded per encoded sample. Variant 1 is always the production prompt (a circle seed; with an
   # adjacent-section shape, an adjacent seed with probability prob_adjacent_seed / (prob_adjacent_seed +
   # prob_circle_seed)). The others are drawn from the prob_* mix below without replacement. So the prob_* values

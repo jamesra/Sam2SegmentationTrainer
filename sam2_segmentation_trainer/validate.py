@@ -14,7 +14,9 @@ from sam2_segmentation_trainer.data.manifest import (
     summarize_index,
 )
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE, load_circle_scale
+from annotation_crops.prompt_encoding import DEFAULT_CIRCLE_TRUST, CircleAnnotationTrust
 from sam2_segmentation_trainer.data.tiles import build_tile_context, crops_dir_of
+from sam2_segmentation_trainer.encoding_record import read_record, resolve_encoding
 from sam2_segmentation_trainer.paths import DEFAULT_VOLUMES, data_root
 
 
@@ -82,11 +84,14 @@ def _circle_stats(examples) -> dict[str, object]:
     }
 
 
-def circle_overlap_stats(examples, *, sample: int, seed: int = 0) -> dict[str, object]:
+def circle_overlap_stats(
+    examples, *, sample: int, seed: int = 0, trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST
+) -> dict[str, object]:
     """How often a neighbor's circle reaches into the target mask, on a fixed random sample of examples.
 
     Circle negatives are written as background; one that overlaps the target contradicts the ground truth
-    (assessment 1.6). Only examples whose tile holds a circle that is not the target's own are counted.
+    (assessment 1.6). Only examples whose tile holds a circle that is not the target's own are counted. An
+    annotated circle counts as the region it claims under ``trust`` (``rho <= zero_frac``).
     """
     import random
 
@@ -120,6 +125,7 @@ def circle_overlap_stats(examples, *, sample: int, seed: int = 0) -> dict[str, o
             circles,
             example.mask_path.parent,
             target.shape,
+            trust=trust,
         )
         circle_regions = [r for r in regions if r.kind == KIND_CIRCLE]
         if not circle_regions:
@@ -151,6 +157,7 @@ def build_report(
     check_json: bool,
     json_limit: int | None,
     circle_overlap_sample: int = 0,
+    trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST,
 ) -> dict[str, object]:
     examples = index_volumes(volumes=volumes, root=root, skip_missing=False)
     summary = summarize_index(examples)
@@ -166,7 +173,8 @@ def build_report(
     if check_json:
         report["json_stats"] = _read_json_stats(present, limit=json_limit)
     if circle_overlap_sample > 0:
-        report["circle_overlap"] = circle_overlap_stats(present, sample=circle_overlap_sample)
+        report["circle_overlap"] = circle_overlap_stats(present, sample=circle_overlap_sample, trust=trust)
+        report["circle_annotation_trust"] = trust.as_dict()
     return report
 
 
@@ -192,16 +200,30 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="Measure, on N sampled examples, how often a neighbor's circle overlaps the target mask (reads masks; slow on CIFS)",
     )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help="Weights file or run folder whose prompt-encoding record gives the circle-annotation trust "
+        "(default: the library defaults)",
+    )
+    parser.add_argument("--circle-full-frac", type=float, default=None, help="Override circle_annotation_trust.full_frac")
+    parser.add_argument("--circle-zero-frac", type=float, default=None, help="Override circle_annotation_trust.zero_frac")
     args = parser.parse_args(argv)
 
     root = args.root if args.root is not None else data_root()
     volumes = [v.strip() for v in args.volumes.split(",") if v.strip()]
+    record, source = read_record(args.model)
+    trust = resolve_encoding(
+        record, source=source, full_frac=args.circle_full_frac, zero_frac=args.circle_zero_frac
+    ).circle_annotation_trust
     report = build_report(
         root=root,
         volumes=volumes,
         check_json=args.check_json,
         json_limit=args.json_limit,
         circle_overlap_sample=args.circle_overlap,
+        trust=trust,
     )
     text = json.dumps(report, indent=2)
     print(text)

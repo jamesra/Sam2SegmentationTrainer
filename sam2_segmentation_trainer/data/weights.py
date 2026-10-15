@@ -2,7 +2,8 @@
 
 * :func:`edge_weight_map`: ``w(d) = max(w_min, 1 - exp(-d / tau_eff))`` from the distance ``d`` to the ground-truth
   edge on both sides, with ``tau_eff`` capped by the target's own depth.
-* :func:`core_mask`: the pixels at least ``band`` px inside a mask, its *core*.
+* :func:`core_mask`: the pixels at least ``band`` px inside a mask, its *core*. An annotated circle's core is
+  instead ``rho <= full_frac`` of its true radius (:func:`region_core`), since its radius is unreliable.
 * :func:`leak_mask`: the pixels inside another annotation's core and outside the target. A prediction there is a
   merge, the error that breaks connectivity, so the loss weights them up (``loss.leak_weight``) and validation
   counts them (leak, merge rate).
@@ -16,6 +17,7 @@ from typing import Sequence
 
 import numpy as np
 
+from annotation_crops.negatives import NegativeRegion
 from annotation_crops.prompt_encoding import (
     EDGE_TAU_DEPTH_FRAC,
     edge_distance,
@@ -56,21 +58,37 @@ def core_mask(mask: np.ndarray, band: float) -> np.ndarray:
     return edge_distance(mask) >= float(band)
 
 
-def leak_mask(neighbors: Sequence[np.ndarray], target: np.ndarray, band: float) -> np.ndarray:
-    """Pixels inside any neighbor's core and outside ``target``."""
+def region_core(neighbor: NegativeRegion | np.ndarray, band: float) -> np.ndarray:
+    """The core of one neighbor: ``rho <= full_frac`` for an annotated circle, else ``band`` px inside its mask.
+
+    An annotated circle carries its trust map (``NegativeRegion.weight``), whose fully trusted pixels are exactly
+    its core. A bare mask array is a polygon.
+    """
+    if isinstance(neighbor, NegativeRegion):
+        core = neighbor.core
+        return core if core is not None else core_mask(neighbor.mask, band)
+    return core_mask(neighbor, band)
+
+
+def leak_mask(
+    neighbors: Sequence[NegativeRegion | np.ndarray], target: np.ndarray, band: float
+) -> np.ndarray:
+    """Pixels inside any neighbor's core and outside ``target`` (``band`` is the polygon core depth)."""
     target = np.asarray(target, dtype=bool)
     leak = np.zeros(target.shape, dtype=bool)
     for neighbor in neighbors:
-        leak |= core_mask(neighbor, band)
+        leak |= region_core(neighbor, band)
     return leak & ~target
 
 
-def neighbor_core_labels(neighbors: Sequence[np.ndarray], target: np.ndarray, band: float) -> np.ndarray:
+def neighbor_core_labels(
+    neighbors: Sequence[NegativeRegion | np.ndarray], target: np.ndarray, band: float
+) -> np.ndarray:
     """Int16 map: ``i + 1`` on neighbor ``i``'s core (outside ``target``), 0 elsewhere. Later neighbors win overlaps."""
     target = np.asarray(target, dtype=bool)
     labels = np.zeros(target.shape, dtype=np.int16)
     for index, neighbor in enumerate(neighbors):
-        labels[core_mask(neighbor, band) & ~target] = index + 1
+        labels[region_core(neighbor, band) & ~target] = index + 1
     return labels
 
 

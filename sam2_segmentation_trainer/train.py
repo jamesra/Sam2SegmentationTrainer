@@ -50,6 +50,12 @@ from sam2_segmentation_trainer.data.tiles import (
 from sam2_segmentation_trainer.losses import containment_warmup_scale
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
 from annotation_crops.prompt_encoding import CORRECTION_LOGIT, EDGE_TAU_DEPTH_FRAC, EDGE_TAU_PX, SEED_LOGIT
+from sam2_segmentation_trainer.encoding_record import (
+    RECORD_NAME,
+    metadata_from_settings,
+    settings_from_cfg,
+    write_record,
+)
 from annotation_crops.scores import ensure_location_scores_schema
 
 from sam2_segmentation_trainer.data.manifest import (
@@ -620,9 +626,10 @@ def _mixed_prompts_enabled(cfg: DictConfig) -> bool:
 
 
 def _circle_scale(cfg: DictConfig) -> float:
-    """Diameter scale of the circles drawn as prompts and negatives (``prompt.circle_diameter_scale``).
+    """Diameter scale of the seed circles (``prompt.circle_diameter_scale``).
 
-    The exporter writes true radii; the loader rescales each file to this value.
+    The exporter never scales; the loader applies this to inscribed circles only (rescaling an older file's baked-in
+    scale). Circle annotations load at their true radius and are trusted by ``prompt.circle_annotation_trust``.
     """
     return float(OmegaConf.select(cfg, "prompt.circle_diameter_scale", default=DEFAULT_CIRCLE_DIAMETER_SCALE))
 
@@ -642,6 +649,7 @@ def warn_encoding_differences(cfg: DictConfig) -> list[str]:
         correction_logit=value("correction_logit", CORRECTION_LOGIT),
         circle_diameter_scale=_circle_scale(cfg),
         default_circle_diameter_scale=DEFAULT_CIRCLE_DIAMETER_SCALE,
+        circle_annotation_trust=settings_from_cfg(cfg)["circle_annotation_trust"],
     )
     for message in messages:
         print(f"WARNING: {message}. The server implements the library constants; serving this model needs the server's encoding changed to match.")
@@ -1156,6 +1164,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         print(f"migrated from {legacy} -> {run_dir}: {', '.join(migrated)}")
     print(f"run directory (checkpoints): {run_dir}")
     OmegaConf.save(cfg, run_dir / "config.yaml")
+    write_record(run_dir / RECORD_NAME, metadata_from_settings(settings_from_cfg(cfg)))
     warn_encoding_differences(cfg)
 
     volumes = list(cfg.data.volumes)

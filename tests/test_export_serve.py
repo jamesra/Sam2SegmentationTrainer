@@ -44,6 +44,7 @@ class ExportServeTests(unittest.TestCase):
                 "LOGIT_CLIP": enc.LOGIT_CLIP,
                 "LOW_RES": enc.LOW_RES,
                 "circle_diameter_scale": 0.9,
+                "circle_annotation_trust": {"full_frac": 0.5, "zero_frac": 0.95, "ramp": "cosine"},
             },
         )
         self.assertIsInstance(meta["prompt_encoding"], str)

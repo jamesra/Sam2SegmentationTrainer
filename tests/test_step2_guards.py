@@ -19,10 +19,10 @@ except ImportError:
     from helpers import make_crops
 
 
-def _write_circles(crops: Path, scale: float, count: int = 1) -> None:
+def _write_circles(crops: Path, scale: float, count: int = 1, source: str = "annotated") -> None:
     cells = {
         "RC1_0_D1_X0-1_Y0-1": [
-            {"location_id": 1000 + i, "center_x": 8.0, "center_y": 8.0, "radius": 4.0, "source": "annotated"}
+            {"location_id": 1000 + i, "center_x": 8.0, "center_y": 8.0, "radius": 4.0, "source": source}
             for i in range(count)
         ]
     }
@@ -48,19 +48,29 @@ class CircleFileGuardTests(unittest.TestCase):
             context = build_tile_context(examples, require_circles=False, circle_scale=0.95)
             self.assertEqual(context.circles, {})
 
-    def _radius_after_loading(self, file_scale: float, circle_scale: float | None) -> float:
+    def _radius_after_loading(
+        self, file_scale: float, circle_scale: float | None, source: str = "inscribed"
+    ) -> float:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             crops = make_crops(root, "RC1", n=3)
-            _write_circles(crops, file_scale)
+            _write_circles(crops, file_scale, source=source)
             self.assertEqual(load_circle_scale(crops), file_scale)
             examples = index_volumes(volumes=["RC1"], root=root)
             context = build_tile_context(examples, require_circles=True, circle_scale=circle_scale)
             (circles,) = context.circles.values()
             return circles[0].radius
 
-    def test_true_radii_are_shrunk_to_the_prompt_scale(self) -> None:
+    def test_true_radii_are_shrunk_to_the_prompt_scale_for_inscribed_circles(self) -> None:
         self.assertAlmostEqual(self._radius_after_loading(1.0, 0.95), 4.0 * 0.95)
+
+    def test_annotated_radii_are_not_shrunk(self) -> None:
+        # Circle annotations load at their true radius whatever the diameter scale; the trust fractions apply later.
+        self.assertAlmostEqual(self._radius_after_loading(1.0, 0.95, "annotated"), 4.0)
+        self.assertAlmostEqual(self._radius_after_loading(1.0, None, "annotated"), 4.0)
+
+    def test_annotated_radii_of_an_old_file_are_divided_by_its_scale(self) -> None:
+        self.assertAlmostEqual(self._radius_after_loading(0.8, 0.95, "annotated"), 4.0 / 0.8)
 
     def test_baked_in_scale_is_rescaled_not_applied_twice(self) -> None:
         # An older file already has 0.8 in its radii; asking for 0.95 gives 0.95/0.8 of them.

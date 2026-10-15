@@ -11,6 +11,9 @@ process is not all edge. Three kinds of region feed the prompt:
 * a *seed* (trusted, inside the cell): ``+SEED_LOGIT * c(d)``
 * a *mask to correct* (may be wrong): ``+CORRECTION_LOGIT * c(d)``
 * other annotations (negative context): ``-SEED_LOGIT * c(d_neighbor)``, each by its own edge distance
+* a *circle annotation* (negative context whose radius is unreliable): ``-SEED_LOGIT * w(rho)``, with ``rho`` the
+  distance from the circle's center in units of its true radius and ``w`` the cosine taper of
+  :class:`CircleAnnotationTrust` (full trust out to ``full_frac``, nothing beyond ``zero_frac``)
 
 Everything else is 0 (unknown). Overlaps are resolved by the *masks*, not by the confidence values: where a
 positive region (a seed or a mask to correct) and a negative region cover the same pixel the annotations
@@ -19,15 +22,24 @@ positive regions overlap the value is the largest of them; where only negatives 
 negative (``-max``), never a stack, so three neighbors on one pixel read -10, not -30. The full-resolution canvas
 is reduced to the 256x256 ``mask_input`` by area averaging, since the values are continuous.
 
-Needs numpy and scipy only.
+Needs numpy, and scipy for the distance transforms (imported on first use, so the circle encoding runs with numpy
+alone and the annotation gallery needs no scipy).
 """
 
 from __future__ import annotations
 
-from typing import Iterable, NamedTuple, Sequence
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+
+
+def distance_transform_edt(array: np.ndarray) -> np.ndarray:
+    """``scipy.ndimage.distance_transform_edt``, imported on first use."""
+    from scipy.ndimage import distance_transform_edt as edt
+
+    return edt(array)
+
 
 LOW_RES = 256
 """Side of SAM2's ``mask_input`` for a 1024 image (4x the 64x64 image embedding)."""
@@ -54,9 +66,56 @@ LOGIT_CLIP = 10.0
 """Bound of a prompt value for the default logits. Since edge-confidence-v5 the encoder no longer clips (overlaps
 are resolved by the max-or-unknown rule, never summed); the constant stays in the exported metadata."""
 
-PROMPT_ENCODING_VERSION = "edge-confidence-v5"
+PROMPT_ENCODING_VERSION = "edge-confidence-v6"
 """Name of this encoding. Bump it when the way ``mask_input`` is built changes in a way that needs a retrain; an
-exported model carries it so a server can refuse a model whose encoding it does not implement."""
+exported model carries it so a server can refuse a model whose encoding it does not implement. v6 encodes a circle
+annotation by its radius-relative trust (:class:`CircleAnnotationTrust`) instead of the polygon edge curve."""
+
+CIRCLE_TRUST_RAMP = "cosine"
+"""Shape of the taper between ``full_frac`` and ``zero_frac``; recorded in the metadata."""
+
+
+@dataclass(frozen=True, slots=True)
+class CircleAnnotationTrust:
+    """How far a circle annotation is trusted as background, as fractions of its TRUE radius.
+
+    Circle annotations (``source`` "annotated" in ``circle_annotations.json``) have unreliable radii, so they are
+    used only as negatives. Inside ``full_frac`` of the true radius a pixel is fed at full strength
+    (``-SEED_LOGIT``); the strength tapers with a half cosine to 0 at ``zero_frac``, and the circle claims nothing
+    beyond it. Seed circles are a different thing and are not affected.
+    """
+
+    full_frac: float = 0.5
+    zero_frac: float = 0.95
+
+    def __post_init__(self) -> None:
+        full, zero = float(self.full_frac), float(self.zero_frac)
+        if not (np.isfinite(full) and np.isfinite(zero) and 0.0 <= full < zero):
+            raise ValueError(
+                "prompt.circle_annotation_trust must satisfy 0 <= full_frac < zero_frac, "
+                f"got full_frac={self.full_frac}, zero_frac={self.zero_frac}"
+            )
+        object.__setattr__(self, "full_frac", full)
+        object.__setattr__(self, "zero_frac", zero)
+
+    def as_dict(self) -> dict[str, float | str]:
+        """The form written to the exported metadata."""
+        return {"full_frac": self.full_frac, "zero_frac": self.zero_frac, "ramp": CIRCLE_TRUST_RAMP}
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "CircleAnnotationTrust":
+        """From a config or metadata mapping; a missing key keeps its default, None gives the defaults."""
+        defaults = cls()
+        if not values:
+            return defaults
+        return cls(
+            float(values["full_frac"]) if "full_frac" in values else defaults.full_frac,
+            float(values["zero_frac"]) if "zero_frac" in values else defaults.zero_frac,
+        )
+
+
+DEFAULT_CIRCLE_TRUST = CircleAnnotationTrust()
+"""The defaults: what a reader without metadata would assume."""
 
 
 def encoding_metadata(
@@ -66,10 +125,11 @@ def encoding_metadata(
     edge_tau_depth_frac: float = EDGE_TAU_DEPTH_FRAC,
     seed_logit: float = SEED_LOGIT,
     correction_logit: float = CORRECTION_LOGIT,
-) -> dict[str, float | int | str]:
+    circle_annotation_trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST,
+) -> dict[str, Any]:
     """The constants a server must use to build ``mask_input`` for a model trained with this encoding.
 
-    The four configurable values default to this module's constants; an exporter passes the ones the run trained
+    The configurable values default to this module's constants; an exporter passes the ones the run trained
     with. ``LOGIT_CLIP`` and ``LOW_RES`` are not configurable.
     """
     return {
@@ -81,6 +141,7 @@ def encoding_metadata(
         "LOGIT_CLIP": LOGIT_CLIP,
         "LOW_RES": LOW_RES,
         "circle_diameter_scale": float(circle_diameter_scale),
+        "circle_annotation_trust": circle_annotation_trust.as_dict(),
     }
 
 
@@ -92,6 +153,7 @@ def encoding_differences(
     correction_logit: float,
     circle_diameter_scale: float,
     default_circle_diameter_scale: float,
+    circle_annotation_trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST,
 ) -> list[str]:
     """Messages for each value that differs from this module's constants (the ones a server implements)."""
     pairs = (
@@ -102,6 +164,14 @@ def encoding_differences(
         (
             "prompt.circle_diameter_scale", circle_diameter_scale, default_circle_diameter_scale,
             "DEFAULT_CIRCLE_DIAMETER_SCALE",
+        ),
+        (
+            "prompt.circle_annotation_trust.full_frac", circle_annotation_trust.full_frac,
+            DEFAULT_CIRCLE_TRUST.full_frac, "DEFAULT_CIRCLE_TRUST.full_frac",
+        ),
+        (
+            "prompt.circle_annotation_trust.zero_frac", circle_annotation_trust.zero_frac,
+            DEFAULT_CIRCLE_TRUST.zero_frac, "DEFAULT_CIRCLE_TRUST.zero_frac",
         ),
     )
     return [
@@ -257,6 +327,55 @@ def negative_canvas(
     return NegativeCanvas(
         np.asarray(mask, dtype=bool), -np.float32(seed_logit) * edge_confidence(mask, tau, depth_frac)
     )
+
+
+def circle_trust(
+    shape: tuple[int, int], center_x: float, center_y: float, radius: float, trust: CircleAnnotationTrust
+) -> tuple[np.ndarray, np.ndarray]:
+    """A circle annotation's claimed region and trust map ``w`` (bool, float32 in [0, 1]), computed analytically.
+
+    ``rho = |p - c| / radius`` for a pixel center ``p`` (pixel (x, y) is at (x + 0.5, y + 0.5)), ``radius`` the TRUE
+    radius. The mask is ``rho <= zero_frac``; ``w`` is 1 for ``rho <= full_frac``, 0 from ``zero_frac`` out and
+    ``0.5 * (1 + cos(pi * (rho - full_frac) / (zero_frac - full_frac)))`` between. Only the circle's bounding box is
+    evaluated, so the cost follows the circle, not the tile. A circle that misses the tile gives an empty region.
+    """
+    height, width = shape
+    mask = np.zeros((height, width), dtype=bool)
+    weight = np.zeros((height, width), dtype=np.float32)
+    if radius <= 0.0:
+        return mask, weight
+    reach = trust.zero_frac * radius
+    x0, x1 = max(int(np.floor(center_x - reach)) - 1, 0), min(int(np.ceil(center_x + reach)) + 1, width)
+    y0, y1 = max(int(np.floor(center_y - reach)) - 1, 0), min(int(np.ceil(center_y + reach)) + 1, height)
+    if x0 >= x1 or y0 >= y1:
+        return mask, weight
+    dx2 = (np.arange(x0, x1, dtype=np.float32) + np.float32(0.5) - np.float32(center_x)) ** 2
+    dy2 = (np.arange(y0, y1, dtype=np.float32) + np.float32(0.5) - np.float32(center_y)) ** 2
+    d2 = dy2[:, None] + dx2[None, :]
+    claimed = d2 <= np.float32(reach) ** 2
+    full = d2 <= np.float32(trust.full_frac * radius) ** 2
+    rho = np.sqrt(d2) / np.float32(radius)
+    phase = (rho - np.float32(trust.full_frac)) * np.float32(np.pi / (trust.zero_frac - trust.full_frac))
+    taper = np.float32(0.5) * (np.float32(1.0) + np.cos(np.clip(phase, 0.0, np.pi)))
+    mask[y0:y1, x0:x1] = claimed
+    weight[y0:y1, x0:x1] = np.where(full, np.float32(1.0), np.where(claimed, taper, np.float32(0.0)))
+    return mask, weight
+
+
+def circle_negative_canvas(
+    shape: tuple[int, int],
+    center_x: float,
+    center_y: float,
+    radius: float,
+    trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST,
+    seed_logit: float = SEED_LOGIT,
+) -> NegativeCanvas:
+    """A circle annotation as a negative region: its claimed mask and ``-seed_logit * w(rho)`` canvas.
+
+    ``radius`` is the true radius; see :func:`circle_trust`.
+    """
+    claimed, weight = circle_trust(shape, center_x, center_y, radius, trust)
+    return NegativeCanvas(claimed, -np.float32(seed_logit) * weight)
 
 
 def encode_dense_canvas(

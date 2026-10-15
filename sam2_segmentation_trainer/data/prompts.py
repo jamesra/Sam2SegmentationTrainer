@@ -24,8 +24,10 @@ from annotation_crops.prompt_encoding import (
     CORRECTION_LOGIT,
     EDGE_TAU_DEPTH_FRAC,
     EDGE_TAU_PX,
+    DEFAULT_CIRCLE_TRUST,
     LOW_RES,
     SEED_LOGIT,
+    CircleAnnotationTrust,
     NegativeCanvas,
     edge_confidence,
     encode_mask_input,
@@ -90,6 +92,7 @@ class PromptConfig:
     edge_tau_depth_frac: float = EDGE_TAU_DEPTH_FRAC
     seed_logit: float = SEED_LOGIT
     correction_logit: float = CORRECTION_LOGIT
+    circle_annotation_trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST
     adjacent_fit_inside: float = 0.98
     adjacent_fit_grow_px: float = 10.0
     adjacent_scale_range: tuple[float, float] = (0.7, 1.0)
@@ -192,7 +195,9 @@ class PromptConfig:
                 continue
             default = getattr(defaults, name)
             raw = merged[name]
-            if isinstance(default, tuple):
+            if isinstance(default, CircleAnnotationTrust):
+                kwargs[name] = CircleAnnotationTrust.from_mapping(raw)  # raises on full_frac >= zero_frac
+            elif isinstance(default, tuple):
                 kwargs[name] = _pair(raw)
             elif isinstance(default, bool):
                 kwargs[name] = bool(raw)
@@ -398,7 +403,8 @@ def _background_points(
     ]
     sets = [
         sample_points_in_mask(
-            region.mask,
+            # A circle annotation's radius is unreliable, so its points come from the part that is surely inside.
+            region.mask if region.weight is None else region.core,
             benford_count(rng),
             rng,
             min_edge_px=cfg.min_edge_px,
@@ -412,8 +418,17 @@ def _background_points(
 
 
 def negative_region_canvases(regions: list[NegativeRegion], cfg: PromptConfig) -> list[NegativeCanvas]:
-    """The mask and confidence-scaled canvas of each negative region, for ``build_prompt(negative_canvases=...)``."""
-    return [negative_canvas(r.mask, cfg.edge_tau_px, cfg.seed_logit, cfg.edge_tau_depth_frac) for r in regions]
+    """The mask and canvas of each negative region, for ``build_prompt(negative_canvases=...)``.
+
+    A polygon (or inscribed circle) uses the edge-confidence curve; an annotated circle uses its trust map
+    (``-seed_logit * w(rho)``), computed when the region was collected.
+    """
+    return [
+        negative_canvas(r.mask, cfg.edge_tau_px, cfg.seed_logit, cfg.edge_tau_depth_frac)
+        if r.weight is None
+        else NegativeCanvas(r.mask, -np.float32(cfg.seed_logit) * r.weight)
+        for r in regions
+    ]
 
 
 def kept_negative_indices(
@@ -559,8 +574,9 @@ def build_prompt(
         shape,
         seed=seed,
         correction=correction,
-        negatives=[] if shared else [regions[i].mask for i in kept],
-        negative_canvases=[negative_canvases[i] for i in kept] if shared else (),
+        negative_canvases=(
+            [negative_canvases[i] for i in kept] if shared else negative_region_canvases([regions[i] for i in kept], cfg)
+        ),
         tau=cfg.edge_tau_px,
         seed_logit=cfg.seed_logit,
         correction_logit=cfg.correction_logit,
