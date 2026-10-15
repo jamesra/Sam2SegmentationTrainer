@@ -15,7 +15,7 @@ from sam2_segmentation_trainer.interactive import (
     simulate_clicks,
     summarize_noc,
 )
-from sam2_segmentation_trainer.model import decode_grouped, encode_images, predict_masks_mixed
+from sam2_segmentation_trainer.model import _stack_on, decode_grouped, encode_images, predict_masks_mixed
 from sam2_segmentation_trainer.train import _iterative_rounds
 
 
@@ -232,6 +232,20 @@ class IterativePredictTests(unittest.TestCase):
         )
         self.assertEqual(len(out), 3)
         self.assertEqual(tuple(out[2].shape), (2, 4, 4))
+
+
+class StackOnTests(unittest.TestCase):
+    def test_stacks_cpu_masks_onto_the_device(self) -> None:
+        out = _stack_on([torch.zeros(4, 4), torch.ones(4, 4)], "cpu")
+        self.assertEqual(tuple(out.shape), (2, 4, 4))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+    def test_stacks_a_mix_of_cpu_and_gpu_masks(self) -> None:
+        # The click rounds feed back GPU logits for some samples and keep the loader's CPU mask for the others.
+        out = _stack_on([torch.zeros(4, 4), torch.ones(4, 4, device="cuda")], "cuda")
+        self.assertEqual(out.device.type, "cuda")
+        self.assertEqual(tuple(out.shape), (2, 4, 4))
+        self.assertEqual(float(out[1].sum()), 16.0)
 
 
 class SimulateClicksTests(unittest.TestCase):

@@ -296,6 +296,17 @@ def predict_masks_mixed(
     )
 
 
+def _stack_on(masks: Sequence[torch.Tensor], device) -> torch.Tensor:
+    """Stack ``[256, 256]`` mask prompts on ``device``, whichever device each one is on.
+
+    The click rounds mix the previous pass's logits (on the GPU) with the data loader's initial masks (on the
+    CPU), and ``torch.stack`` refuses a mix. A list on one device keeps the single stack-then-copy.
+    """
+    if all(m.device.type == "cpu" for m in masks):
+        return torch.stack(list(masks)).to(device, non_blocking=True)
+    return torch.stack([m.to(device, non_blocking=True) for m in masks])
+
+
 def decode_grouped(
     model,
     image_embed: torch.Tensor,
@@ -330,7 +341,7 @@ def decode_grouped(
             torch.stack([boxes[i] for i in members]).to(device, non_blocking=True) if has_box else None
         )
         group_dense = (
-            torch.stack([dense_masks[i] for i in members]).unsqueeze(1).to(device, non_blocking=True)
+            _stack_on([dense_masks[i] for i in members], device).unsqueeze(1)
             if has_dense
             else None
         )
