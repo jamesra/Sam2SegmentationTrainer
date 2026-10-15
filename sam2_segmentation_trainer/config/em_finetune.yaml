@@ -157,8 +157,10 @@ negative:
   cache_size: 64
   # Leave out a neighbor's circle negative when it reaches into the target mask (it would say background
   # about pixels the loss calls foreground). Choosing by the true mask leaks a little of its extent into the
-  # prompt, so measure first: sam2-em-validate --circle-overlap 2000.
-  drop_overlapping_circles: false
+  # prompt. Measured with sam2-em-validate --circle-overlap 2000 (Oct 14 2026): a circle reached into the target in
+  # 40 of 1637 examples that have circle negatives (2.4%; RC1 1.6%, RC2 0%, RPC1 3.5%, RPC2 3.0%), above the 1%
+  # threshold, so it is on.
+  drop_overlapping_circles: true
 
 loss:
   focal_weight: 20.0
