@@ -7,7 +7,7 @@ Do **not** commit filled copies or Cloudflare tokens.
 
 | Template | Copy to |
 |----------|---------|
-| `build/docker-env-template.txt` | `D:\Docker\Builds\AnnotationGallery\.env` |
+| `docker-env-template.txt` | `D:\Docker\Builds\AnnotationGallery\.env` |
 | Shared Cloudflare DNS token | `D:\Docker\Builds\cloudflare.ini` (one file for all renewers) |
 
 ## Let’s Encrypt (certbot)
@@ -15,7 +15,7 @@ Do **not** commit filled copies or Cloudflare tokens.
 The gallery uses the shared `Servers/certbot` image with its **own** volume
 (`gallery-letsencrypt`). It does not share Identity’s certificate lineage.
 
-1. Copy `build/docker-env-template.txt` → `D:\Docker\Builds\AnnotationGallery\.env`.
+1. Copy `docker-env-template.txt` → `D:\Docker\Builds\AnnotationGallery\.env`.
 2. Set `LETSENCRYPT_EMAIL`. Keep `LETSENCRYPT_PRIMARY_DOMAIN=gallery.codepharm.net`.
 3. For production HTTPS on the public hostname, set the publish and PEM paths in
    that `.env` (see template comments): `80:80` / `443:443`,
@@ -23,10 +23,10 @@ The gallery uses the shared `Servers/certbot` image with its **own** volume
    `GALLERY_PUBLIC_HTTPS_ORIGIN` and OIDC redirect `https://gallery.codepharm.net/callback`.
 4. Ensure `D:\Docker\Builds\cloudflare.ini` exists (DNS-01).
 
-From the Sam2SegmentationTrainer repo root:
+From the Sam2Trainer repo root:
 
 ```bash
-docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml --profile letsencrypt up -d annotation-gallery annotation-gallery-certbot-renewer
+D:\Docker\Builds\AnnotationGallery\rebuild-and-start.ps1   (add -NoLetsEncrypt to skip the renewer)
 ```
 
 The first successful enroll restarts `annotation-gallery` onto the certificate.

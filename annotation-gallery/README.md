@@ -20,14 +20,13 @@
 # Use the shared ``Servers/certbot`` renewer (own ``gallery-letsencrypt`` volume;
 # not Identity's). Domain: ``gallery.codepharm.net``.
 #
-# 1. Copy ``config-template/build/docker-env-template.txt`` to
+# 1. Copy ``config-template/docker-env-template.txt`` to
 #    ``D:\Docker\Builds\AnnotationGallery\.env`` and set ``LETSENCRYPT_EMAIL``.
 # 2. Ensure ``D:\Docker\Builds\cloudflare.ini`` exists for DNS-01.
-# 3. From the trainer repo:
+# 3. Run:
 #
-# ```bash
-# docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml \
-#   --profile letsencrypt up -d annotation-gallery annotation-gallery-certbot-renewer
+# ```powershell
+# D:\Docker\Builds\AnnotationGallery\rebuild-and-start.ps1   (add -NoLetsEncrypt to skip the renewer)
 # ```
 #
 # First enroll restarts ``annotation-gallery`` onto the PEMs. Smoke:

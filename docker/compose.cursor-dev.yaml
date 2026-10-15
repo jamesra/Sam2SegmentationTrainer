@@ -110,11 +110,17 @@ services:
       GALLERY_OIDC_REDIRECT_URI: "${GALLERY_OIDC_REDIRECT_URI:-https://127.0.0.1:8443/callback}"
       GALLERY_READ_PERMISSION: "${GALLERY_READ_PERMISSION:-Read}"
       GALLERY_REVIEW_PERMISSION: "${GALLERY_REVIEW_PERMISSION:-Review}"
-      SSL_CERT_PATH: /certs/fullchain.pem
-      SSL_KEY_PATH: /certs/privkey.pem
+      # Local: PEMs dropped in SAM2_CERTS_HOST (/certs). Production: GALLERY_SSL_*
+      # point into the gallery-letsencrypt volume the certbot renewer fills.
+      SSL_CERT_PATH: "${GALLERY_SSL_CERT_PATH:-/certs/fullchain.pem}"
+      SSL_KEY_PATH: "${GALLERY_SSL_KEY_PATH:-/certs/privkey.pem}"
+      GALLERY_PUBLIC_HTTPS_ORIGIN: "${GALLERY_PUBLIC_HTTPS_ORIGIN:-}"
+      GALLERY_HTTP_PUBLIC_PORT: "${GALLERY_HTTP_PUBLIC_PORT:-80}"
+      GALLERY_HTTPS_PUBLIC_PORT: "${GALLERY_HTTPS_PUBLIC_PORT:-443}"
     ports:
-      - "8080:80"
-      - "127.0.0.1:8443:443"
+      # Prod: GALLERY_HTTP_PUBLISH=80:80  GALLERY_HTTPS_PUBLISH=443:443
+      - "${GALLERY_HTTP_PUBLISH:-8080:80}"
+      - "${GALLERY_HTTPS_PUBLISH:-127.0.0.1:8443:443}"
     volumes:
       - type: bind
         source: ${SAM2_LOCAL_DATA_HOST}
@@ -125,9 +131,53 @@ services:
         source: ${SAM2_CERTS_HOST:-D:/Docker/mounted-configs/sam2-trainer}
         target: /certs
         read_only: true
+      # Filled by annotation-gallery-certbot-renewer (empty until it enrolls).
+      - type: volume
+        source: gallery-letsencrypt
+        target: /etc/letsencrypt
+        read_only: true
       # Rasterizer for one-location mask refresh. Missing mount returns an error
       # and does not change mask files. The gallery image does not install Nornir.
       - type: bind
         source: ${NORNIR_BUILDMANAGER_HOST:-../../nornir/nornir-buildmanager}
         target: /opt/nornir-buildmanager
         read_only: true
+
+  # Shared Servers/certbot image (VikingServers repo) with the gallery's own
+  # lineage and volume for gallery.codepharm.net. DNS-01 via Cloudflare, so no
+  # inbound port is needed for enrollment. After a new certificate it restarts
+  # annotation-gallery, which binds HTTPS on startup.
+  # Started only with: --profile letsencrypt
+  annotation-gallery-certbot-renewer:
+    profiles: ["letsencrypt"]
+    container_name: annotation-gallery-certbot-renewer
+    build:
+      context: ${CERTBOT_BUILD_CONTEXT:-../../VikingSlackUsersAI/VikingServers/Servers/certbot}
+      dockerfile: Dockerfile
+    image: annotation-gallery-certbot-renewer:latest
+    restart: unless-stopped
+    environment:
+      LETSENCRYPT_PRIMARY_DOMAIN: "${LETSENCRYPT_PRIMARY_DOMAIN:-gallery.codepharm.net}"
+      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
+      CERTBOT_STAGING: "${CERTBOT_STAGING:-false}"
+      CERTBOT_AUTH_METHOD: "${CERTBOT_AUTH_METHOD:-dns-cloudflare}"
+      CERTBOT_RESTART_CONTAINER: annotation-gallery
+      CF_DNS_API_CREDENTIALS_FILE: /run/secrets/cloudflare.ini
+      CF_DNS_PROPAGATION_SECONDS: "${CF_DNS_PROPAGATION_SECONDS:-60}"
+    volumes:
+      - gallery-letsencrypt:/etc/letsencrypt
+      - gallery-certbot-lib:/var/lib/letsencrypt
+      - gallery-certbot-logs:/var/log/letsencrypt
+      - type: bind
+        source: ${CF_DNS_API_CREDENTIALS_HOST_PATH:-D:/Docker/Builds/cloudflare.ini}
+        target: /run/secrets/cloudflare.ini
+        read_only: true
+      - type: bind
+        source: ${DOCKER_SOCKET_PATH:-//var/run/docker.sock}
+        target: /var/run/docker.sock
+    entrypoint: ["bash", "/opt/identity-certbot/renew-loop.sh"]
+
+volumes:
+  gallery-letsencrypt:
+  gallery-certbot-lib:
+  gallery-certbot-logs:

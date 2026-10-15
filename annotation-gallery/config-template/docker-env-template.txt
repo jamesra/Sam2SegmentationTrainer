@@ -1,0 +1,22 @@
+# Copy to D:\Docker\Builds\AnnotationGallery\.env (not committed).
+# Read by the Compose env_file of annotation-gallery-certbot-renewer and, when
+# passed with --env-file, by Compose substitution.
+
+# --- Let's Encrypt (shared Servers/certbot image, own gallery-letsencrypt volume) ---
+LETSENCRYPT_EMAIL=you@example.com
+LETSENCRYPT_PRIMARY_DOMAIN=gallery.codepharm.net
+# Set true while testing to avoid Let's Encrypt rate limits.
+CERTBOT_STAGING=false
+CERTBOT_AUTH_METHOD=dns-cloudflare
+CF_DNS_PROPAGATION_SECONDS=60
+# CF_DNS_API_CREDENTIALS_HOST_PATH=D:/Docker/Builds/cloudflare.ini
+
+# --- Public HTTPS on gallery.codepharm.net ---
+GALLERY_HTTP_PUBLISH=80:80
+GALLERY_HTTPS_PUBLISH=443:443
+GALLERY_HTTP_PUBLIC_PORT=80
+GALLERY_HTTPS_PUBLIC_PORT=443
+GALLERY_PUBLIC_HTTPS_ORIGIN=https://gallery.codepharm.net
+GALLERY_OIDC_REDIRECT_URI=https://gallery.codepharm.net/callback
+GALLERY_SSL_CERT_PATH=/etc/letsencrypt/live/gallery.codepharm.net/fullchain.pem
+GALLERY_SSL_KEY_PATH=/etc/letsencrypt/live/gallery.codepharm.net/privkey.pem
