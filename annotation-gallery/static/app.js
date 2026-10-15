@@ -2771,12 +2771,85 @@
     renderSortStack();
     render();
   });
-  els.locate.addEventListener("input", showLocations);
+  // A searched id the volume does not have is looked up on the server. If OData has it and the crop images it
+  // needs are on disk, the server imports it and the catalog is reloaded.
+  const locateCheck = { timer: 0, active: new Set(), hideTimer: 0 };
+
+  function showLocateStatus(text, kind) {
+    window.clearTimeout(locateCheck.hideTimer);
+    const bar = document.getElementById("locate-status");
+    bar.hidden = !text;
+    bar.textContent = text;
+    bar.className = `locate-status ${kind || ""}`.trim();
+    if (text && kind !== "busy" && kind !== "error") {
+      locateCheck.hideTimer = window.setTimeout(() => showLocateStatus(""), 5000);
+    }
+  }
+
+  function scheduleLocateCheck() {
+    window.clearTimeout(locateCheck.timer);
+    const ids = parseLocationIds(els.locate.value);
+    const missing = ids ? [...ids].filter((id) => !state.rows.some((row) => Number(row.location_id) === id)) : [];
+    if (!missing.length || state.permission !== "review") {
+      if (!locateCheck.active.size) {
+        showLocateStatus("");
+      }
+      return;
+    }
+    locateCheck.timer = window.setTimeout(() => checkMissingLocations(missing), 600);
+  }
+
+  async function checkMissingLocations(missing) {
+    const todo = missing.filter((id) => !locateCheck.active.has(id));
+    if (!todo.length) {
+      return;
+    }
+    showLocateStatus("Checking server", "busy");
+    const notes = [];
+    let imported = false;
+    for (const id of todo) {
+      locateCheck.active.add(id);
+      try {
+        const result = await getJson(`/api/volumes/${encodeURIComponent(state.volume)}/import-location`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ location_id: id }),
+        });
+        if (result.status === "imported") {
+          imported = true;
+          notes.push(`${id} imported`);
+        } else if (result.status === "not_found") {
+          notes.push(`${id} is not on the server`);
+        } else if (result.status === "no_tiles") {
+          notes.push(`${id} found, but missing image tiles (${result.reason})`);
+        } else if (result.status === "circle") {
+          notes.push(`${id} is a circle; circle file updated`);
+        } else if (result.status === "busy") {
+          notes.push(`${id}: ${result.reason}`);
+        }
+      } catch (error) {
+        notes.push(`${id}: ${error.message}`);
+      } finally {
+        locateCheck.active.delete(id);
+      }
+    }
+    if (imported) {
+      await loadCatalog(false, true);
+    }
+    const failed = notes.some((note) => !note.endsWith("imported"));
+    showLocateStatus(notes.join("; "), failed ? "error" : "");
+  }
+
+  els.locate.addEventListener("input", () => {
+    showLocations();
+    scheduleLocateCheck();
+  });
   els.locate.addEventListener("change", showLocations);
   els.locate.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       showLocations();
+      scheduleLocateCheck();
     }
   });
 

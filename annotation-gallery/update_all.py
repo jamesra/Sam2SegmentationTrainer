@@ -639,3 +639,45 @@ def idle_status(crops: str | os.PathLike[str]) -> dict[str, Any]:
         "lastCounts": state.get("last_counts") or {},
         "skippedPending": len(state.get("skipped_ids") or []),
     }
+
+
+# ------------------------------------------------------------ one location on demand
+
+def import_location(
+    crops: str | os.PathLike[str],
+    entity: dict[str, Any],
+    *,
+    deps: Dependencies | None = None,
+) -> dict[str, Any]:
+    """Bring one location OData has and the volume lacks into the volume, as Update All would.
+
+    The result's ``status`` is ``imported`` (rows, masks and circle entries written), ``exists`` (the catalog
+    already has it), ``circle`` (a circle: only ``circle_annotations.json`` changes), or ``no_tiles`` (a crop
+    image the annotation needs is not on disk; nothing was written, ``reason`` says why).
+    """
+    deps = deps or Dependencies()
+    crops = Path(crops)
+    location_id = int(entity["ID"])
+    if location_id in _catalog_ids(crops):
+        return {"status": "exists", "location_id": location_id}
+    index = deps.tile_index(crops)
+
+    def update_circle() -> bool:
+        circle_file = CircleFile(crops)
+        if not circle_file.exists:
+            return False
+        circle = deps.circle_for(entity)
+        windows = window_refs(index, int(entity["Z"]))
+        circle_file.replace(location_id, entries_for_circle(circle, windows) if circle is not None else {})
+        return circle_file.save()
+
+    if is_circle_entity(entity):
+        return {"status": "circle", "location_id": location_id, "circles": update_circle()}
+    added, reason = deps.add(crops, entity, index)
+    if added is None:
+        return {"status": "no_tiles", "location_id": location_id, "reason": reason or "no tile image"}
+    _insert_rows(crops, added)
+    keys = [window["image_key"] for window in added["windows"]]
+    update_circle()
+    deps.drop_stale(crops, sorted(set(keys)))
+    return {"status": "imported", "location_id": location_id, "imageKeys": keys}

@@ -232,6 +232,37 @@ button.reverse.active,
   border-bottom-left-radius: 0;
 }
 
+.locate-status {
+  position: relative;
+  margin-top: 4px;
+  padding: 3px 8px 5px;
+  overflow: hidden;
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: var(--muted);
+  background: rgba(127, 127, 127, 0.15);
+}
+
+.locate-status.busy::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 35%;
+  height: 2px;
+  background: currentColor;
+  animation: locate-sweep 1.1s ease-in-out infinite;
+}
+
+.locate-status.error {
+  color: #c0392b;
+}
+
+@keyframes locate-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(300%); }
+}
+
 .status {
   margin: 8px 16px;
   color: var(--muted);

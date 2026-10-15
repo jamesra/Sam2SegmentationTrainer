@@ -560,6 +560,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_refresh_location(match.group(1))
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/import-location", path)
+        if match:
+            self._handle_import_location(match.group(1))
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/review-batch", path)
         if match:
             self._handle_review_batch(match.group(1))
@@ -946,6 +950,56 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         drop_stale_thumbnails(crops, keys)
         self._send_json({"ok": True, "location_id": location_id, "imageKeys": keys})
+
+    def _handle_import_location(self, volume: str) -> None:
+        """Look a location id up in OData and, when the volume has the crop images, import it."""
+        principal = self._principal()
+        role = principal.grants.get(volume)
+        if role is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        if role != PERMISSION_REVIEW:
+            self._send_json({"error": "review required"}, status=403)
+            return
+        try:
+            location_id = int(self._read_json().get("location_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "location_id required"}, status=400)
+            return
+        try:
+            crops = crops_dir(self._registry(), volume)
+        except (ValueError, FileNotFoundError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        job = update_all.current_job(volume)
+        if job is not None and job.running:
+            self._send_json({"status": "busy", "location_id": location_id,
+                             "reason": "Update all is running"})
+            return
+        url = odata_endpoint(volume, load_source_document(crops)).strip()
+        try:
+            entity = fetch_odata_location(url, location_id)
+        except HTTPError as exc:
+            if exc.code == 404:
+                self._send_json({"status": "not_found", "location_id": location_id})
+            else:
+                self._send_json({"error": f"OData lookup failed: {exc}"}, status=502)
+            return
+        except (URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as exc:
+            self._send_json({"error": f"OData lookup failed: {exc}"}, status=502)
+            return
+        if nornir_buildmanager_root() is None:
+            self._send_json({"error": "Importing needs the nornir-buildmanager mount."}, status=503)
+            return
+        try:
+            result = update_all.import_location(crops, entity)
+        except RefreshUnavailable as exc:
+            self._send_json({"error": str(exc)}, status=503)
+            return
+        except (TypeError, ValueError, KeyError) as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._send_json(result)
 
     def _handle_catalog(self, volume: str) -> None:
         principal = self._principal()

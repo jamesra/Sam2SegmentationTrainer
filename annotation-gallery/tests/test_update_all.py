@@ -430,3 +430,23 @@ def test_circles_are_not_created_when_the_volume_has_no_circle_file(tmp_path: Pa
         odata.close()
     assert result["circles"] == 0 and any("circle_annotations.json is missing" in n for n in result["notes"])
     assert not (crops / "circle_annotations.json").exists()
+
+
+def test_import_location_adds_missing_skips_untiled_and_ignores_known(tmp_path: Path) -> None:
+    from update_all import import_location
+
+    crops = _crops(tmp_path)
+    deps, calls = _deps(_FakeOData([]), skip_ids={6})
+
+    assert import_location(crops, _entity(1, "x"), deps=deps)["status"] == "exists"
+    assert calls["add"] == []
+
+    missing = import_location(crops, _entity(6, "x"), deps=deps)
+    assert missing["status"] == "no_tiles" and "missing" in missing["reason"]
+    assert 6 not in {row[0] for row in connect(crops).execute("SELECT location_id FROM locations")}
+
+    done = import_location(crops, _entity(5, "x"), deps=deps)
+    assert done == {"status": "imported", "location_id": 5, "imageKeys": [KEY_A]}
+    assert calls["drop"] == [[KEY_A]]
+    rows = connect(crops).execute("SELECT image_key FROM locations WHERE location_id = 5").fetchall()
+    assert [row[0] for row in rows] == [KEY_A]
