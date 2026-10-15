@@ -53,9 +53,10 @@ from sam2_segmentation_trainer.data.weights import (
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-VAL_PROMPTS = ("centroid", "point", "circle_mask", "correction", "near_correct")
+VAL_PROMPTS = ("centroid", "point", "circle_mask", "correction", "near_correct", "circle_mask_noneg")
 """Validation prompts: the legacy mask centroid, the deepest interior point, the inscribed circle seed
-(production), a mask to correct, and a near-correct mask (the "do no harm" check)."""
+(production), a mask to correct, a near-correct mask (the "do no harm" check) and the circle seed with every
+negative region and background point removed (how much the model leans on neighbors being sent)."""
 
 VAL_FAMILY_CODES = {name: code for code, name in enumerate(VAL_PROMPTS)}
 """A fixed number per validation family, so a family's prompt seed does not depend on which families run."""
@@ -64,8 +65,15 @@ VAL_MIXED_TYPES = {
     "circle_mask": PromptType.CIRCLE_SEED,
     "correction": PromptType.CORRECTION,
     "near_correct": PromptType.NEAR_CORRECT,
+    "circle_mask_noneg": PromptType.CIRCLE_SEED,
 }
 """Validation prompts that go through the mixed pipeline, and the prompt family each forces."""
+
+NO_NEGATIVE_PROMPTS = frozenset({"circle_mask_noneg"})
+"""Validation prompts whose prompt carries no negative context (the loss weights and metrics still see the neighbors)."""
+
+CIRCLE_PROMPTS = frozenset({"circle_mask", "circle_mask_noneg"})
+"""Validation prompts that need the target's circle."""
 
 
 class MissingTileFlag:
@@ -285,7 +293,12 @@ class EMSegDataset(Dataset):
                 if self.val_families:
                     return self._families_item(example)
                 if self.val_prompt in VAL_MIXED_TYPES:
-                    return self._mixed_item(example, index, forced=VAL_MIXED_TYPES[self.val_prompt])
+                    return self._mixed_item(
+                        example,
+                        index,
+                        forced=VAL_MIXED_TYPES[self.val_prompt],
+                        no_negatives=self.val_prompt in NO_NEGATIVE_PROMPTS,
+                    )
                 if self.val_prompt is not None:
                     return self._item_from_example(example, self.val_prompt)
                 if self.mixed_prompts:
@@ -375,7 +388,8 @@ class EMSegDataset(Dataset):
             mask = (mask > 127).astype(np.uint8)
         target = mask > 0
         circle_mask: np.ndarray | None = None
-        if "circle_mask" in self.val_families:
+        needs_circle = any(f in CIRCLE_PROMPTS for f in self.val_families)
+        if needs_circle:
             own = tiles.circle_for(key, example.location_id)
             if own is not None and own.center_in(shape):
                 disc = rasterize_circle(shape, own.center_x, own.center_y, own.radius)
@@ -399,15 +413,15 @@ class EMSegDataset(Dataset):
             if m.any()
         ]
         circle_aug = masks_aug[-1] if circle_mask is not None else None
-        if "circle_mask" in self.val_families and (circle_aug is None or not circle_aug.any()):
+        if needs_circle and (circle_aug is None or not circle_aug.any()):
             fitted = inscribed_circle_xyr(target_aug, self.circle_scale)
             if fitted is None:
                 raise KeyError(f"{example.split_key} has no mask to fit a circle to")
             circle_aug = rasterize_circle(shape, *fitted)
 
         sample_id = zlib.crc32(f"{example.volume}|{example.image_key}|{example.location_id}".encode("utf-8"))
-        mixed = [f for f in self.val_families if f in VAL_MIXED_TYPES]
-        canvases = negative_region_canvases(regions_aug, prompt_cfg) if mixed and regions_aug else None
+        with_negatives = [f for f in self.val_families if f in VAL_MIXED_TYPES and f not in NO_NEGATIVE_PROMPTS]
+        canvases = negative_region_canvases(regions_aug, prompt_cfg) if with_negatives and regions_aug else None
         variants: list[dict[str, Any]] = []
         for family in self.val_families:
             if family in VAL_MIXED_TYPES:
@@ -415,10 +429,10 @@ class EMSegDataset(Dataset):
                     VAL_MIXED_TYPES[family],
                     target_mask=target_aug,
                     circle_mask=circle_aug,
-                    regions=regions_aug,
+                    regions=[] if family in NO_NEGATIVE_PROMPTS else regions_aug,
                     cfg=prompt_cfg,
                     rng=np.random.default_rng([self.seed, sample_id, VAL_FAMILY_CODES[family]]),
-                    negative_canvases=canvases,
+                    negative_canvases=None if family in NO_NEGATIVE_PROMPTS else canvases,
                 )
                 variant = _variant_from_prompt(prompt)
             else:
@@ -446,6 +460,7 @@ class EMSegDataset(Dataset):
             split_key=example.split_key,
             full_tile=is_full_tile(example, self.full_tile_threshold),
             approved=self._is_approved(example),
+            has_negatives=bool(regions_aug),
         )
         terms = (
             ground_truth_terms(target_aug, self.core_band_px, MIN_COMPONENT_PX) if self.core_band_px > 0.0 else None
@@ -542,7 +557,12 @@ class EMSegDataset(Dataset):
         return chosen
 
     def _mixed_item(
-        self, example: CropExample, index: int, *, forced: PromptType | None = None
+        self,
+        example: CropExample,
+        index: int,
+        *,
+        forced: PromptType | None = None,
+        no_negatives: bool = False,
     ) -> dict[str, Any]:
         """One sample with prompt variants, negative context, and the matching dense masks and points.
 
@@ -614,18 +634,25 @@ class EMSegDataset(Dataset):
                 raise KeyError(f"{example.split_key} has no mask to fit a circle to")
             circle_aug = rasterize_circle(shape, *fitted)
 
-        canvases = negative_region_canvases(regions_aug, prompt_cfg) if len(types) > 1 and regions_aug else None
+        canvases = (
+            negative_region_canvases(regions_aug, prompt_cfg)
+            if len(types) > 1 and regions_aug and not no_negatives
+            else None
+        )
+        # Negative-context dropout applies to training variants after the first (variant 0 is the production prompt).
+        train_dropout = forced is None and self.split == "train"
         variants: list[dict[str, Any]] = []
         for k, kind in enumerate(types):
             prompt = build_prompt(
                 kind,
                 target_mask=target_aug,
                 circle_mask=circle_aug,
-                regions=regions_aug,
+                regions=[] if no_negatives else regions_aug,
                 cfg=prompt_cfg,
                 rng=np.random.default_rng([self.seed, epoch, int(index), k]),
                 adjacent_shape=adjacent_shape,
                 negative_canvases=canvases,
+                negative_dropout=train_dropout and k >= 1,
             )
             variants.append(
                 {
@@ -653,6 +680,7 @@ class EMSegDataset(Dataset):
             split_key=example.split_key,
             full_tile=full_tile,
             approved=self._is_approved(example),
+            has_negatives=bool(regions_aug),
         )
         return {
             "image": imagenet_normalize(np.ascontiguousarray(image_aug)),

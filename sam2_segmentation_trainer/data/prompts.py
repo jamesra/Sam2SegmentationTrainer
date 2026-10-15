@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Collection, Mapping
+from typing import Any, Collection, Mapping, Sequence
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
@@ -108,6 +108,8 @@ class PromptConfig:
     bg_point_prob_polygon: float = 0.15
     cache_size: int = 64
     drop_overlapping_circles: bool = False
+    context_dropout: float = 0.2
+    region_dropout: float = 0.2
     corrupt_max_shift_px: int = 30
     corrupt_polygon_tolerance: float = 0.04
 
@@ -166,7 +168,7 @@ class PromptConfig:
             raise ValueError("prompt.corrupt_polygon_tolerance must be > 0")
         if not isinstance(self.drop_overlapping_circles, bool):
             raise ValueError("negative.drop_overlapping_circles must be true or false")
-        for name in ("bg_point_prob_circle", "bg_point_prob_polygon"):
+        for name in ("bg_point_prob_circle", "bg_point_prob_polygon", "context_dropout", "region_dropout"):
             if not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"negative.{name} must be within [0, 1]")
 
@@ -414,6 +416,26 @@ def negative_region_canvases(regions: list[NegativeRegion], cfg: PromptConfig) -
     return [negative_canvas(r.mask, cfg.edge_tau_px, cfg.seed_logit, cfg.edge_tau_depth_frac) for r in regions]
 
 
+def kept_negative_indices(
+    candidates: Sequence[int], cfg: PromptConfig, rng: np.random.Generator
+) -> list[int]:
+    """The negative regions (indices into the sample's list) a training prompt keeps after dropout.
+
+    With probability ``context_dropout`` the prompt carries none of them (no negative area, no background points);
+    otherwise each is dropped independently with probability ``region_dropout``. A rate of 0 draws nothing from
+    ``rng``. The ground truth is unchanged, so the loss weights still see every neighbor.
+    """
+    kept = list(candidates)
+    if not kept:
+        return kept
+    if cfg.context_dropout > 0.0 and rng.random() < cfg.context_dropout:
+        return []
+    if cfg.region_dropout > 0.0:
+        keep = rng.random(len(kept)) >= cfg.region_dropout
+        kept = [index for index, flag in zip(kept, keep) if flag]
+    return kept
+
+
 def build_prompt(
     prompt_type: PromptType,
     *,
@@ -424,6 +446,7 @@ def build_prompt(
     rng: np.random.Generator,
     adjacent_shape: np.ndarray | None = None,
     negative_canvases: list[NegativeCanvas] | None = None,
+    negative_dropout: bool = False,
 ) -> PromptSample:
     """Assemble the prompt for one sample from augmented masks.
 
@@ -438,6 +461,11 @@ def build_prompt(
 
     ``negative_canvases`` are :func:`negative_region_canvases` of ``regions``, computed once by a caller that
     builds several variants of one sample; they save an edge distance transform per region and variant.
+
+    ``negative_dropout`` (training variants after the first) applies ``negative.context_dropout`` and
+    ``negative.region_dropout``: the dense negative area and the background points use only the regions that
+    survive (:func:`kept_negative_indices`, drawn from ``rng`` after the family's own draws). A mask to correct can
+    still merge a dropped neighbor, and the seed's containment weight still treats every neighbor as a negative.
     """
     shape = target_mask.shape
     kwargs = dict(
@@ -518,19 +546,21 @@ def build_prompt(
         raise ValueError(f"unknown prompt type {prompt_type!r}")
 
     # After the correction is drawn, so a neighbor merged into it never gets a background point.
-    background = _background_points([r for r in regions if r is not merged_region], cfg, rng)
+    candidates = [i for i, r in enumerate(regions) if r is not merged_region]
+    kept = kept_negative_indices(candidates, cfg, rng) if negative_dropout else candidates
+    background = _background_points([regions[i] for i in kept], cfg, rng)
     coords = np.concatenate([points, background]) if background.shape[0] else points
     labels = np.concatenate(
         [np.ones(points.shape[0], dtype=np.int32), np.zeros(background.shape[0], dtype=np.int32)]
     )
-    negatives = [r.mask for r in regions if r is not merged_region]
+    negatives = [regions[i].mask for i in candidates]  # every neighbor, for the containment weight
     shared = negative_canvases is not None and merged_region is None
     dense = encode_mask_input(
         shape,
         seed=seed,
         correction=correction,
-        negatives=[] if shared else negatives,
-        negative_canvases=negative_canvases if shared else (),
+        negatives=[] if shared else [regions[i].mask for i in kept],
+        negative_canvases=[negative_canvases[i] for i in kept] if shared else (),
         tau=cfg.edge_tau_px,
         seed_logit=cfg.seed_logit,
         correction_logit=cfg.correction_logit,

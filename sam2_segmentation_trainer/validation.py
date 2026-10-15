@@ -51,9 +51,14 @@ from sam2_segmentation_trainer.metrics import boundary_f1_multi, iou_dice_pr, to
 from sam2_segmentation_trainer.model import predict_masks, predict_masks_mixed
 from sam2_segmentation_trainer.overlays import denorm_preview, overlay_panel
 
-DEFAULT_VAL_PROMPTS = ("circle_mask", "correction", "near_correct", "point", "centroid")
+DEFAULT_VAL_PROMPTS = ("circle_mask", "correction", "near_correct", "point", "centroid", "circle_mask_noneg")
 """Validation prompts when ``eval.val_prompts`` is unset: the production circle seed, a mask to correct, a
-near-correct mask ("do no harm"), the interior point, and the legacy centroid."""
+near-correct mask ("do no harm"), the interior point, the legacy centroid, and the circle seed without negative
+context (a diagnostic; it never selects a checkpoint)."""
+
+NEG_SPLIT_PROMPTS = ("circle_mask", "circle_mask_noneg")
+"""Circle-seed families whose results are also split by whether the sample has negative context (``with_neg`` and
+``no_neg``)."""
 
 RAW_IOU_PROMPTS = frozenset({"centroid"})
 """Prompts scored with the plain IoU, kept for continuity with earlier runs. The others use the tolerant IoU."""
@@ -102,6 +107,12 @@ class ModeResult:
     recall_by_depth: dict[str, DepthBin] = field(default_factory=dict)
     """Core recall by the ground truth's maximum depth (see ``goal_metrics.DEPTH_BINS``)."""
     approved_by_volume: dict[str, int] = field(default_factory=dict)
+    with_neg: GoalSummary | None = None
+    """Goal metrics over the samples whose tile has negative context (None when the records do not say)."""
+    no_neg: GoalSummary | None = None
+    """... and over the samples without any."""
+    with_neg_n: int = 0
+    no_neg_n: int = 0
     fulltile_iou: float | None = None
     fulltile_n: int = 0
 
@@ -143,6 +154,12 @@ def summarize_mode(records: Sequence[dict[str, Any]], *, target: float = CORE_RE
         result.input_iou = float(np.mean([r["input_iou"] for r in with_input]))
         result.gain = float(np.mean([r["iou"] - r["input_iou"] for r in with_input]))
         result.no_harm = float(np.mean([sample_no_harm(r) for r in with_input]))
+    if any("has_neg" in r for r in scored):
+        with_neg = [r for r in scored if r.get("has_neg")]
+        no_neg = [r for r in scored if "has_neg" in r and not r["has_neg"]]
+        result.with_neg_n, result.no_neg_n = len(with_neg), len(no_neg)
+        result.with_neg = summarize_goal(with_neg, target=target) if with_neg else None
+        result.no_neg = summarize_goal(no_neg, target=target) if no_neg else None
     approved = [r for r in scored if r.get("approved")]
     result.approved_n = len(approved)
     if approved:
@@ -263,6 +280,7 @@ def score_sample(
         "bf20": bf20,
         "full_tile": bool(item.get("full_tile", False)),
         "approved": bool(item.get("approved", False)),
+        "has_neg": bool(item.get("has_negatives", False)),
     }
     if truth is None:
         truth = ground_truth_terms(gt_np, band, MIN_COMPONENT_PX)
@@ -731,6 +749,15 @@ def log_results(
             writer.add_scalar(f"{root}/gain/{mode}", result.gain, epoch)
         if result.no_harm is not None and mode == "near_correct":
             writer.add_scalar(f"{root}/no_harm/{mode}", result.no_harm, epoch)
+        if mode in NEG_SPLIT_PROMPTS:
+            for name, goal, count in (
+                ("with_neg", result.with_neg, result.with_neg_n),
+                ("no_neg", result.no_neg, result.no_neg_n),
+            ):
+                writer.add_scalar(f"{root}_neg/n/{mode}/{name}", count, epoch)
+                if goal is not None:
+                    for tag, attribute in _GOAL_TAGS:
+                        writer.add_scalar(f"{root}_neg/{tag}/{mode}/{name}", getattr(goal, attribute), epoch)
         if result.approved is not None:
             _log_goal(writer, f"{root}_approved", mode, result.approved, epoch)
         writer.add_scalar(f"{root}_approved/n/{mode}", result.approved_n, epoch)
@@ -784,6 +811,9 @@ def format_summary(
     )
     if main.approved is not None:
         text += f"; approved (n={main.approved_n}): {_goal_text(main.approved)}"
+    for name, goal, count in (("with_neg", main.with_neg, main.with_neg_n), ("no_neg", main.no_neg, main.no_neg_n)):
+        if goal is not None and primary in NEG_SPLIT_PROMPTS:
+            text += f"; {name} (n={count}): {_goal_text(goal)}"
     others = []
     for mode, result in results.items():
         if mode == primary:

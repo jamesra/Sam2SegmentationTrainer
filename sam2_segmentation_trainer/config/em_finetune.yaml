@@ -161,6 +161,13 @@ negative:
   # 40 of 1637 examples that have circle negatives (2.4%; RC1 1.6%, RC2 0%, RPC1 3.5%, RPC2 3.0%), above the 1%
   # threshold, so it is on.
   drop_overlapping_circles: true
+  # Training variants after the first (variant 0 is the production prompt) sometimes lose their negative context,
+  # so the model does not depend on neighbors always being sent: context_dropout is the chance a variant carries
+  # none (no negative area, no background points); region_dropout is then the chance each remaining neighbor is
+  # dropped on its own. Drawn from the variant's own rng. The ground truth is unchanged, so the leak weight and the
+  # containment weight still see every neighbor; validation never drops anything.
+  context_dropout: 0.2
+  region_dropout: 0.2
 
 loss:
   focal_weight: 20.0
@@ -264,9 +271,12 @@ eval:
   #                 of samples whose core recall drops at most 0.5 points and whose spill rises at most 0.5%
   #   point         one foreground point at the deepest interior pixel
   #   centroid      one point at the mask centroid (the original prompt; raw IoU, for continuity with earlier runs)
+  #   circle_mask_noneg  the circle seed with every negative region and background point removed: how much the model
+  #                 leans on neighbors being sent. Never selects a checkpoint. circle_mask is also split into
+  #                 with_neg / no_neg (whether the sample's tile has other annotations).
   # All families of a sample share one image load and one encoder pass (see val:).
   # Validation runs in fp32 like infer.py and interactive.py; its precision should follow the server's inference precision.
-  val_prompts: [circle_mask, correction, near_correct, point, centroid]
+  val_prompts: [circle_mask, correction, near_correct, point, centroid, circle_mask_noneg]
   # The prompt whose goal metrics pick best_model.pt and drive early stopping (see val:).
   primary_val_prompt: circle_mask
   grid_every: 10

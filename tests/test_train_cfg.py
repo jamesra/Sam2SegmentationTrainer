@@ -79,7 +79,7 @@ class TrainCfgTests(unittest.TestCase):
         self.assertTrue(bool(cfg.model.unfreeze_mask_cnn))
         self.assertEqual(int(cfg.negative.cache_size), 64)
         self.assertEqual(
-            list(cfg.eval.val_prompts), ["circle_mask", "correction", "near_correct", "point", "centroid"]
+            list(cfg.eval.val_prompts), ["circle_mask", "correction", "near_correct", "point", "centroid", "circle_mask_noneg"]
         )
 
     def test_training_start_warns_when_the_encoding_differs_from_the_library_constants(self) -> None:

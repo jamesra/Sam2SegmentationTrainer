@@ -14,6 +14,13 @@ The goal is to identify cells and their connectivity, with at least 97.5% of eac
 - **Shelved:** excursion truncation and SEAL/STEAL-style label realignment (section 10).
 - **Phase A follow-ups** from the code review are listed in section 9.
 
+**Later on Oct 14 (negative context and overlaps):**
+- **Overlaps:** a pixel covered by both a positive and a negative region is 0 (unknown), whatever the confidences; positives take the larger value and negatives the strongest, never a sum. Encoding `edge-confidence-v5` (section 2). Done, `816374e`.
+- **Overlapping circle negatives** are dropped (`negative.drop_overlapping_circles: true`), measured at 2.4% of samples (section 3.6). Done, `cdd4b92`.
+- **Negative-context dropout** and a `circle_mask_noneg` validation family, so the model does not depend on neighbors always being sent (sections 3.6 and 6). Done.
+- **Overlap scoring:** pixels inside both the target and a neighbor's trace count as target, in the loss and in validation (sections 4 and 6). This is the current behaviour, now stated.
+- **Circle radii:** the exporter writes true radii; the trainer applies `prompt.circle_diameter_scale` (sections 3 and 8).
+
 ## Summary
 
 This plan changes how the trainer uses masks, both as prompts and as targets.
@@ -58,7 +65,8 @@ The negative-only prompt is removed (assessment 1.5); this plan assumes it is go
 | Overlap of several negatives | the strongest one (−10 × c at best), never a stack |
 | Overlap of + and − | 0 (unknown), whatever the confidences: decided by the masks, not the values |
 
-- **Overlaps are decided by masks.** A pixel covered by a positive region and a negative region is a contradiction, so it is unknown (0) however deep either is; summing would let a deep seed outvote a shallow neighbor, or the reverse, in a way the annotations do not support. The encoder takes the union of the positive masks and the union of the negative masks, marks their intersection unknown, and elsewhere uses the larger positive value or the strongest negative (no sum, no clip). A negative region's mask travels with its canvas, because c(d) is 0 on its outermost pixels. The encoding version string is `edge-confidence-v5`.
+- **Overlaps are decided by masks.** A pixel covered by a positive region and a negative region is a contradiction, so it is unknown (0) however deep either is; summing would let a deep seed outvote a shallow neighbor, or the reverse, in a way the annotations do not support. The encoder takes the union of the positive masks and the union of the negative masks, marks their intersection unknown, and elsewhere uses the larger positive value or the strongest negative (no sum, no clip). A negative region's mask travels with its canvas, because c(d) is 0 on its outermost pixels. The encoding version string is `edge-confidence-v5`. Any number of overlapping regions follows the same rule: three neighbors on one pixel read −10, not −30, and a seed under any of them reads 0. This applies to masks to correct too, so where a grown or merged mask to correct covers a neighbor, the prompt is unknown and the image and the leak penalty decide.
+- **Where the negatives come from** is section 3.6.
 - **Two strengths.** M_corr is lower so the mask network can learn that a mask to correct is a suggestion, while a seed is trusted. SAM 2 itself was trained to correct its own soft prediction logits.
 - **Downsampling.** Downsample to the 256×256 `mask_input` by area averaging, not nearest-neighbor.
 - **Neighbor-merge samples (section 3.3).** Leave out the merged neighbor's negative context; otherwise the error is labelled for the model.
@@ -74,7 +82,7 @@ The full-mask prompt is replaced. Starting mix, configurable:
 | Points only | 10% | 1–9 positive points | none (plus negative context) | no |
 | Box only | 5% | jittered box | none (plus negative context) | no |
 | Box + points | 5% | box + 1–3 points | none (plus negative context) | no |
-| Circle seed | 40% | inscribed circle × 0.95 + center point | seed | core only |
+| Circle seed | 40% | inscribed circle × `circle_diameter_scale` (0.95) + center point | seed | core only |
 | Adjacent-section seed | 15% | linked polygon from z ± 1–2, scaled to fit inside | seed | core only |
 | Shrunk or cut seed | 10% | subset of the true mask | seed | core only |
 | Mask to correct | 10% | grown, scaled, warped or merged mask | correction | no |
@@ -83,6 +91,7 @@ The full-mask prompt is replaced. Starting mix, configurable:
 - Every family is trained against the true polygon of the target section. Background points and negative context from other annotations ride along as now.
 - **Effective mix.** Variant 0 of each sample is always the production prompt (section 5), and the shares above steer variants 1 onwards. The share each family actually receives is therefore not the table's. The trainer logs the per-family counts every epoch, and the config comment states the effective mix.
 - **Correction clicks.** Where a family adds a foreground click, the click is placed from the *input* mask, not from the ground truth; otherwise the click leaks where the true cell is.
+- **Circle scale.** The exporter's circle file holds true radii (`diameter_scale` 1.0, nornir `3b6fe2f`). The trainer applies `prompt.circle_diameter_scale` (0.95) to circle seeds; the exporter never scales.
 
 ### 3.1 Adjacent-section seed (the Viking workflow)
 
@@ -133,6 +142,31 @@ It teaches the model to leave a good mask at least as good. Without it, a refine
 - Tiles where the target covers at least 99% of the tile (assessment 1.9) get only point or circle prompts. They have no edge to refine.
 - If a derived seed or mask is empty after augmentation, the sample falls back to a circle seed.
 
+### 3.6 Negative context
+
+**Sources.** Every other annotation in the tile is negative context, as the Viking client does in production (it always sends neighboring annotations as background):
+- neighbor polygon masks;
+- inscribed circles of polygon cells that appear in the tile without their own mask there (about 90% of circle entries);
+- annotated circles, Viking TypeCode 1 (`source: "annotated"`, about 10%). These are used only as negatives, background points, leak cores and validation neighbor cores, never as targets.
+
+All of them are cells or cell subtypes: the exporter's default filter is `(TypeCode eq 4 or TypeCode eq 6) and (Parent/TypeID eq 1 or Parent/Type/ParentID eq 1)`, and the server already sends only those as negatives. Nothing to change there.
+
+**Overlapping circles.** `negative.drop_overlapping_circles: true` removes a circle negative that overlaps the target. Measured on 2,000 samples: 82% have circle negatives, and 2.4% of samples (43 of 2,396 circles) have one overlapping the target, above the 1% threshold. The v5 overlap rule (section 2) would also make those pixels unknown; the drop removes the conflict at its source.
+
+**Dropout (done).** Negative context is present in 72–82% of samples, so the model may learn to rely on it. Two dropouts, drawn from each variant's own generator (`rng([seed, epoch, index, k])`):
+- `negative.context_dropout` (0.2): the variant's prompt carries no negative regions and no background points;
+- `negative.region_dropout` (0.2): after that draw, each remaining negative region is dropped independently, with its background points.
+
+**Variant 0 is exempt** from both, because it is the production prompt and production always sends neighbors. With three variants, about 13% of prompts lose all negative context.
+
+What dropout does not change:
+- the leak weight and neighbor cores in the loss (section 4), which use every neighbor, since the ground truth has not changed;
+- the containment weight, still zero under every real neighbor;
+- merged neighbors, still left out of the negatives (section 3.3); a mask to correct can still merge a neighbor that was dropped from its context;
+- validation, which never drops anything (the `circle_mask_noneg` family in section 6 removes negatives on purpose).
+
+The encoding rule does not change, so there is no version bump. A rate of 0 draws nothing from the generator, so a run without dropout reproduces its earlier prompts.
+
 ## 4. Edge-tolerant loss with a leak penalty
 
 **Labels stay hard (0/1). The loss is weighted per pixel:**
@@ -141,6 +175,7 @@ w(d) = max(w_min, 1 − exp(−d / τ_eff)) × (λ_leak where the pixel is in a 
 
 - d is the distance to the ground-truth polygon edge, on both sides; τ_eff is the target's capped τ (section 1).
 - w_min = 0.05 keeps a little gradient at the edge.
+- **Overlapping traces:** a pixel inside both the target's trace and a neighbor's trace is labelled target (1). The prompt calls it unknown (section 2), but the label is the target's polygon, so the model is not taught to cut the target where traces overlap.
 - **Leak penalty:** pixels inside another annotation's core (at least 10 px inside that neighbor, and outside the target) get λ_leak = 3. A merge into a neighbor is the error that breaks connectivity, so it costs more than an equal area of edge error. It also applies to neighbor-merge samples, where removing the merged region is the lesson.
 
 **How it applies to each term:**
@@ -172,7 +207,7 @@ w(d) = max(w_min, 1 − exp(−d / τ_eff)) × (λ_leak where the pixel is in a 
 
 Use a fixed seed and the z-slab validation split.
 
-**Definitions.** b = 10 px is the core band (`val.core_band_px`).
+**Definitions.** b = 10 px is the core band (`val.core_band_px`). The ground truth is the target's trace alone, with no neighbor subtracted: pixels where the target and a neighbor overlap count as target, and neighbor cores exclude the target.
 - **Core recall:** the share of ground-truth pixels at least b inside the traced edge that are predicted foreground. Reported pooled over all pixels (the "interior volume" figure), and per sample as the 10th percentile and the share of samples at or above 97.5%.
 - **Leak:** the share of predicted pixels that fall in annotated neighbors' cores (at least b inside a neighbor).
 - **Merge rate:** the share of samples whose prediction covers at least 5% of any one neighbor's visible core and at least `val.merge_min_px` (500) px of it. The floor keeps a stray blob into a neighbor clipped by the tile edge from counting as a merge, since the merge rate selects the checkpoint.
@@ -185,7 +220,8 @@ Use a fixed seed and the z-slab validation split.
 
 | Check | Metrics |
 | --- | --- |
-| Circle seed (production) | Core recall, leak, merge rate, spill, fragmentation |
+| Circle seed (production) | Core recall, leak, merge rate, spill, fragmentation. Also split by `with_neg` and `no_neg` (whether the sample has any negative context): `val_*_neg/<metric>/<family>/<with_neg or no_neg>`, counts in `val_*_neg/n/...`, and the same two figures in the epoch summary line |
+| Circle seed without negatives (`circle_mask_noneg`) | The same circle seed with every negative region and background point removed; same target and metrics. In the per-epoch subset, the full pass and `--goal`. Compare with the `with_neg` subset of circle seeds to see how much the model leans on neighbors being sent (on `no_neg` samples the two prompts are identical); the same split is reported for this family. Not used for selection |
 | Adjacent-section seed | Same |
 | Mask to correct | Same, and the change from the input mask on each |
 | Near-correct ("do no harm") | Share of samples where the output is no worse than the input: core recall down by no more than 0.5 points, and spill up by no more than 0.5% of the ground-truth area |
@@ -212,7 +248,7 @@ Use a fixed seed and the z-slab validation split.
 
 ## 7. Production requirements (server and Viking)
 
-- **Shared encoding:** the server builds `mask_input` with the shared function and constants from section 2. **A v4 model must not be served until it does.** `sam2-em-export-serve` writes the constants (`EDGE_TAU_PX`, `EDGE_TAU_DEPTH_FRAC`, `SEED_LOGIT`, `CORRECTION_LOGIT`, `LOGIT_CLIP`, `LOW_RES`, `circle_diameter_scale`) and a `prompt_encoding` version string into the exported file next to the weights, so the server can check them.
+- **Shared encoding:** the server builds `mask_input` with the shared function and constants from section 2. **A v4 model must not be served until it does.** `sam2-em-export-serve` writes the constants (`EDGE_TAU_PX`, `EDGE_TAU_DEPTH_FRAC`, `SEED_LOGIT`, `CORRECTION_LOGIT`, `LOGIT_CLIP`, `LOW_RES`, `circle_diameter_scale`) and a `prompt_encoding` version string (now `edge-confidence-v5`) into the exported file next to the weights, so the server can check them. The server must implement the v5 overlap rule (section 2), not the old sum and clip.
 - **Adjacent-section polygon:** when an annotator brings a polygon from the adjacent section and scales it to fit inside the cell, Viking sends it as a **seed**.
 - **New command, "Resegment this polygon":** sends an existing polygon as a **mask to correct** (M_corr), optionally with correction clicks.
 - **Clamp:** no hard clamp on masks to correct. If the +6 clamp is adopted at all, it applies only to a seed's trusted core.
@@ -232,6 +268,10 @@ Use a fixed seed and the z-slab validation split.
 | `prompt.prob_correction` | 0.10 | Mask to correct |
 | `prompt.prob_near_correct` | 0.05 | Near-correct mask |
 | `prompt.prob_points_only`, `prob_box_only`, `prob_box_points` | 0.10, 0.05, 0.05 | Unchanged |
+| `prompt.circle_diameter_scale` | 0.95 | Applied by the trainer to the exporter's true circle radii |
+| `negative.drop_overlapping_circles` | true | Drop a circle negative that overlaps the target (measured 2.4% of samples) |
+| `negative.context_dropout` | 0.2 | Chance a variant (not variant 0) carries no negatives or background points |
+| `negative.region_dropout` | 0.2 | Per-region drop of the remaining negatives (not variant 0); dropped regions still count for leak and metrics |
 | `prompt.adjacent_fit_inside` | 0.98 | Minimum share of the scaled seed inside the target grown by `adjacent_fit_grow_px` |
 | `prompt.adjacent_fit_grow_px` | 10 | Growth of the target for the fit test |
 | `prompt.adjacent_scale_range` | [0.7, 1.0] | Factor applied to the fitted scale |
@@ -283,6 +323,11 @@ Removed: `prompt.prob_full_mask`, `prompt.prob_negative_only`, `negative.allow_c
 9. No `.item()` syncs in the loss path; stale comments (the "50K" mask CNN size) fixed.
 10. Tests: shrunk and cut seeds stay inside the truth; masks to correct differ from it; near-correct masks have mean displacement 5–12 px and peak excursion no more than 30 px; leak weights appear only in neighbor cores.
 11. Second review (Oct 14): merge corrections click outside the merged neighbor; Approved discovery per volume with whole-location entries; a merge floor of 500 px (`val.merge_min_px`); corrective clicks aimed at goal errors, and NoC reported by IoU and by core recall with no merge; encoding constants written into the exported model; per-category, per-volume and per-depth goal metrics on full passes; losses in fp32; merges drawn from neighbors within 20 px; `sam2-em-eval --goal` for baselines.
+12. Negative context (Oct 14, evening):
+    - the v5 overlap rule (section 2). **Done**, `816374e`;
+    - `negative.drop_overlapping_circles: true`. **Done**, `cdd4b92`;
+    - negative-context and per-region dropout (section 3.6). **Done**;
+    - the `circle_mask_noneg` family and the `with_neg`/`no_neg` split of circle-seed results (section 6). **Done**.
 
 **Acceptance for Phase A**, on the z-slab validation split, against the current model:
 - pooled core recall on circle seeds does not drop, and merge rate does not rise;
@@ -328,6 +373,7 @@ Removed: `prompt.prob_full_mask`, `prompt.prob_negative_only`, `negative.allow_c
 - **λ_leak and the 5% merge threshold.** Starting values; tune after the first per-family validation.
 - **The mix.** The shares in section 3 are a starting point. Adjust after the first per-family validation.
 - **M_corr = 3.** It could be tuned by validating with the input mask at a few strengths.
+- **Radius-relative seed trust (proposed, not decided; do not implement).** Circle radii in production are untrusted (some carry a 2× radius bug). One option: full seed trust within the inner half of a seed's depth, a cosine fall to 0 at its edge, about 10% of training circle seeds scaled 1.2–2×, circle-neighbor cores limited to their inner half, and a `circle_oversize` validation family. It would need its own encoding version bump.
 
 ## References
 

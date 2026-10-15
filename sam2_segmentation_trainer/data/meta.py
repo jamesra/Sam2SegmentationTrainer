@@ -25,6 +25,8 @@ class SampleMeta:
     """The target fills at least ``data.full_tile_threshold`` of the tile; validation scores these apart."""
     approved: bool = False
     """The mask is in ``approved.json``; validation reports these as a reference set."""
+    has_negatives: bool = False
+    """The tile holds other annotations (negative context) for this sample; validation splits circle-seed results by it."""
 
     def as_dict(self) -> dict[str, Any]:
         """Mapping stored on a collated batch. Keys match this record."""
@@ -37,6 +39,7 @@ class SampleMeta:
             "split_key": self.split_key,
             "full_tile": self.full_tile,
             "approved": self.approved,
+            "has_negatives": self.has_negatives,
         }
 
     @property

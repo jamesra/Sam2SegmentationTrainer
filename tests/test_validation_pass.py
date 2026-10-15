@@ -236,6 +236,10 @@ class PassTests(unittest.TestCase):
                 )
             self.assertEqual(len(old), len(new[family]))
             for a, b in zip(old, new[family]):
+                if family in ("point", "centroid"):
+                    # The one-point loaders never look at the tile's other annotations, so they cannot say whether
+                    # there are any; the split by negative context is only reported for the circle families.
+                    a, b = {**a, "has_neg": None}, {**b, "has_neg": None}
                 self.assertEqual(a, b, family)
 
     def test_the_subset_is_the_same_whether_run_alone_or_taken_from_a_full_pass(self) -> None:
