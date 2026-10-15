@@ -179,7 +179,7 @@ Tolerant IoU (ignoring pixels whose loss weight is below 0.5) and boundary F1 at
 
 ## Train / eval / infer
 
-After `pip install -e .` (the Dev Container postAttach already does this):
+After `pip install -e .` (the Dev Container postAttach already does this, and installs pytest; `pip install -e ".[dev]"` does too):
 
 ```bash
 # Index check (add --check-json for area/category stats; slow on CIFS)

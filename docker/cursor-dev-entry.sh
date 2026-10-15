@@ -102,6 +102,18 @@ ensure_tb_profiler_plugin() {
   return 0
 }
 
+# The unit tests need pytest; an image built before it was added gets it here. Not fatal: training does not need it.
+ensure_pytest() {
+  if python -c "import pytest" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "cursor-dev-entry: installing pytest"
+  if ! pip install --no-cache-dir pytest; then
+    echo "cursor-dev-entry: pytest install failed; run tests after installing it by hand" >&2
+    return 0
+  fi
+}
+
 # Training writes SummaryWriter events to $SAM2_CHECKPOINT_ROOT/runs/<run_name>/tb/
 # (CIFS). Prefer that over the Windows /outputs bind for large last.pt writes.
 ensure_tensorboard() {
@@ -169,6 +181,7 @@ ensure_tensorboard() {
 
 if [[ "${SAM2_CURSOR_DEV_SETUP_ONLY:-}" == "1" ]]; then
   install_editables
+  ensure_pytest
   install_nornir_mqtt
   ensure_tensorboard
   if [[ $# -gt 0 ]]; then
@@ -179,6 +192,7 @@ fi
 
 apply_network_shares
 install_editables
+ensure_pytest
 install_nornir_mqtt
 ensure_checkpoint
 ensure_tensorboard

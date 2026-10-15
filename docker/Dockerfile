@@ -61,6 +61,9 @@ RUN git clone https://github.com/facebookresearch/sam2.git /opt/sam2 \
 # TensorBoard PYTORCH_PROFILER tab. Separate layer so this does not rebuild SAM2.
 RUN pip install --no-cache-dir torch-tb-profiler
 
+# Test runner (the unit tests run in the container). Own layer so it does not rebuild SAM2.
+RUN pip install --no-cache-dir pytest
+
 COPY docker/mount-network-shares.sh docker/drop-sys-admin-after-mounts.sh docker/cursor-dev-entry.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/mount-network-shares.sh \
         /usr/local/bin/drop-sys-admin-after-mounts.sh \
