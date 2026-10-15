@@ -79,6 +79,23 @@ class OverlapMeasurementTests(unittest.TestCase):
             self.assertEqual(report["share_of_examples"], 0.0)
 
 
+class CircleStatsTests(unittest.TestCase):
+    def test_each_volumes_circle_file_is_parsed_once_not_once_per_example(self) -> None:
+        from unittest import mock
+
+        from sam2_segmentation_trainer import validate
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crops = make_crops(root, "RC1", n=6)
+            examples = index_volumes(volumes=["RC1"], root=root)
+            _write_circles(crops, examples[0].image_key, 99999, 16.0, 16.0, 4.0)
+            with mock.patch.object(validate, "load_circle_scale", wraps=validate.load_circle_scale) as spy:
+                report = validate._circle_stats(examples)
+            self.assertEqual(spy.call_count, 1)
+            self.assertEqual(report["circle_diameter_scale_by_volume"], {"RC1": 0.95})
+
+
 class DatasetOptionTests(unittest.TestCase):
     def test_option_removes_the_overlapping_circle_from_the_prompt(self) -> None:
         with TemporaryDirectory() as tmp:

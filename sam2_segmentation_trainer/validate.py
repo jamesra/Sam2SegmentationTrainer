@@ -67,7 +67,8 @@ def _circle_stats(examples) -> dict[str, object]:
             by_source[circle.source] += 1
     scales: dict[str, float | None] = {}
     for example in examples:
-        scales.setdefault(example.volume, load_circle_scale(crops_dir_of(example)))
+        if example.volume not in scales:  # setdefault would parse the whole circle file for every example
+            scales[example.volume] = load_circle_scale(crops_dir_of(example))
     with_context = 0
     for key, ids in context.neighbors.items():
         if len(ids) > 1 or any(c.location_id not in ids for c in context.circles_in(key)):
