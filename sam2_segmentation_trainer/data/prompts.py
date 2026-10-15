@@ -26,6 +26,7 @@ from annotation_crops.prompt_encoding import (
     EDGE_TAU_PX,
     LOW_RES,
     SEED_LOGIT,
+    NegativeCanvas,
     edge_confidence,
     encode_mask_input,
     negative_canvas,
@@ -408,8 +409,8 @@ def _background_points(
     return np.concatenate(sets) if sets else np.zeros((0, 2), dtype=np.float32)
 
 
-def negative_region_canvases(regions: list[NegativeRegion], cfg: PromptConfig) -> list[np.ndarray]:
-    """The confidence-scaled negative canvas of each region, for ``build_prompt(negative_canvases=...)``."""
+def negative_region_canvases(regions: list[NegativeRegion], cfg: PromptConfig) -> list[NegativeCanvas]:
+    """The mask and confidence-scaled canvas of each negative region, for ``build_prompt(negative_canvases=...)``."""
     return [negative_canvas(r.mask, cfg.edge_tau_px, cfg.seed_logit, cfg.edge_tau_depth_frac) for r in regions]
 
 
@@ -422,7 +423,7 @@ def build_prompt(
     cfg: PromptConfig,
     rng: np.random.Generator,
     adjacent_shape: np.ndarray | None = None,
-    negative_canvases: list[np.ndarray] | None = None,
+    negative_canvases: list[NegativeCanvas] | None = None,
 ) -> PromptSample:
     """Assemble the prompt for one sample from augmented masks.
 

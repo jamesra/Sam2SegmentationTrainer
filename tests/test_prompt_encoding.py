@@ -8,7 +8,6 @@ import numpy as np
 from annotation_crops.prompt_encoding import (
     CORRECTION_LOGIT,
     EDGE_TAU_PX,
-    LOGIT_CLIP,
     LOW_RES,
     SEED_LOGIT,
     negative_canvas,
@@ -148,12 +147,62 @@ class DenseCanvasTests(unittest.TestCase):
         corrected = encode_dense_canvas(seed.shape, correction=seed, tau=2.5)
         self.assertAlmostEqual(float(corrected[60, 60]), CORRECTION_LOGIT, delta=0.1)
 
-    def test_overlap_sums_and_clips(self) -> None:
+    def test_positive_layers_take_the_larger_value_not_the_sum(self) -> None:
         a = _square(100, 10, 90)
         canvas = encode_dense_canvas(a.shape, seed=a, correction=a, tau=2.5)
-        self.assertAlmostEqual(float(canvas[50, 50]), LOGIT_CLIP, places=4)  # 10 + 3 clipped
-        both = encode_dense_canvas(a.shape, seed=a, negatives=[a], tau=2.5)
-        self.assertAlmostEqual(float(both[50, 50]), 0.0, places=4)
+        self.assertAlmostEqual(float(canvas[50, 50]), SEED_LOGIT, places=4)  # max(10, 3), not 13
+        inside_correction_only = encode_dense_canvas(a.shape, seed=_square(100, 40, 60), correction=a, tau=2.5)
+        self.assertAlmostEqual(float(inside_correction_only[20, 20]), CORRECTION_LOGIT, delta=0.1)
+
+    def test_a_seed_and_a_neighbor_that_overlap_are_unknown_on_the_overlap(self) -> None:
+        seed = _square(100, 10, 70)
+        neighbor = _square(100, 40, 95)
+        canvas = encode_dense_canvas(seed.shape, seed=seed, negatives=[neighbor], tau=2.5)
+        overlap = seed & neighbor
+        self.assertTrue(overlap.any())
+        self.assertTrue((canvas[overlap] == 0.0).all())  # even the deepest pixel of either mask
+        # Outside the overlap each keeps its own value.
+        self.assertAlmostEqual(float(canvas[25, 25]), SEED_LOGIT, delta=0.1)
+        self.assertAlmostEqual(float(canvas[80, 80]), -SEED_LOGIT, delta=0.5)
+        self.assertEqual(float(canvas[2, 2]), 0.0)
+
+    def test_three_overlapping_neighbors_on_a_seed_are_all_unknown(self) -> None:
+        seed = _square(120, 10, 80)
+        neighbors = [_square(120, 30, 100), _square(120, 40, 110), _square(120, 35, 105)]
+        canvas = encode_dense_canvas(seed.shape, seed=seed, negatives=neighbors, tau=2.5)
+        self.assertTrue((canvas[seed & (neighbors[0] | neighbors[1] | neighbors[2])] == 0.0).all())
+        self.assertAlmostEqual(float(canvas[20, 20]), SEED_LOGIT, delta=0.5)  # outside every neighbor
+        self.assertLess(float(canvas[95, 95]), -9.0)
+
+    def test_a_mask_to_correct_and_a_neighbor_that_overlap_are_unknown_on_the_overlap(self) -> None:
+        correction = _square(100, 10, 70)
+        neighbor = _square(100, 40, 95)
+        canvas = encode_dense_canvas(correction.shape, correction=correction, negatives=[neighbor], tau=2.5)
+        self.assertTrue((canvas[correction & neighbor] == 0.0).all())
+        self.assertAlmostEqual(float(canvas[25, 25]), CORRECTION_LOGIT, delta=0.1)
+        self.assertAlmostEqual(float(canvas[80, 80]), -SEED_LOGIT, delta=0.5)
+
+    def test_overlapping_negatives_alone_do_not_stack(self) -> None:
+        neighbors = [_square(120, 20, 100), _square(120, 30, 110), _square(120, 25, 105)]
+        canvas = encode_dense_canvas((120, 120), negatives=neighbors, tau=2.5)
+        deep = canvas[40:90, 40:90]
+        self.assertAlmostEqual(float(deep.min()), -SEED_LOGIT, delta=0.1)  # not -30, and no clip involved
+        self.assertGreaterEqual(float(canvas.min()), -SEED_LOGIT - 1e-4)
+        # Where regions overlap the strongest negative wins; a pixel near one edge but deep in another is deep.
+        single = encode_dense_canvas((120, 120), negatives=[neighbors[0]], tau=2.5)
+        self.assertTrue((canvas <= single + 1e-6).all())
+
+    def test_the_outermost_ring_of_a_negative_counts_as_negative(self) -> None:
+        # c(d) is 0 on a region's outermost pixels, so a canvas-derived mask would miss them.
+        seed = _square(64, 8, 40)
+        neighbor = _square(64, 30, 56)
+        ring = np.zeros_like(neighbor)
+        ring[30, 30:56] = True  # the neighbor's top row, inside the seed
+        self.assertTrue((seed & ring)[30, 30:40].all())
+        canvas = encode_dense_canvas(seed.shape, seed=seed, negatives=[neighbor], tau=8.0)
+        self.assertTrue((canvas[30, 30:40] == 0.0).all())
+        shared = encode_dense_canvas(seed.shape, seed=seed, negative_canvases=[negative_canvas(neighbor, 8.0)], tau=8.0)
+        np.testing.assert_array_equal(canvas, shared)
 
     def test_area_downsampling_averages(self) -> None:
         canvas = np.zeros((1024, 1024), dtype=np.float32)

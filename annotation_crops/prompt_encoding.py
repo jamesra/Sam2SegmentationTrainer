@@ -12,15 +12,19 @@ process is not all edge. Three kinds of region feed the prompt:
 * a *mask to correct* (may be wrong): ``+CORRECTION_LOGIT * c(d)``
 * other annotations (negative context): ``-SEED_LOGIT * c(d_neighbor)``, each by its own edge distance
 
-Everything else is 0 (unknown). Overlaps sum and are clipped to ``+/-LOGIT_CLIP``. The full-resolution canvas is
-reduced to the 256x256 ``mask_input`` by area averaging, since the values are continuous.
+Everything else is 0 (unknown). Overlaps are resolved by the *masks*, not by the confidence values: where a
+positive region (a seed or a mask to correct) and a negative region cover the same pixel the annotations
+contradict each other, so the pixel is 0 (unknown) however deep either is, and nothing is summed. Where only
+positive regions overlap the value is the largest of them; where only negatives overlap it is the strongest
+negative (``-max``), never a stack, so three neighbors on one pixel read -10, not -30. The full-resolution canvas
+is reduced to the 256x256 ``mask_input`` by area averaging, since the values are continuous.
 
 Needs numpy and scipy only.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
@@ -47,9 +51,10 @@ CORRECTION_LOGIT = 3.0
 """M_corr. Lower than a seed so the mask network learns that a mask to correct is a suggestion."""
 
 LOGIT_CLIP = 10.0
-"""Overlapping positive and negative contributions are summed and clipped to +/- this."""
+"""Bound of a prompt value for the default logits. Since edge-confidence-v5 the encoder no longer clips (overlaps
+are resolved by the max-or-unknown rule, never summed); the constant stays in the exported metadata."""
 
-PROMPT_ENCODING_VERSION = "edge-confidence-v4"
+PROMPT_ENCODING_VERSION = "edge-confidence-v5"
 """Name of this encoding. Bump it when the way ``mask_input`` is built changes in a way that needs a retrain; an
 exported model carries it so a server can refuse a model whose encoding it does not implement."""
 
@@ -227,18 +232,31 @@ def area_resize(array: np.ndarray, size: int = LOW_RES) -> np.ndarray:
     return (rows @ array.astype(np.float32, copy=False) @ cols.T).astype(np.float32)
 
 
+class NegativeCanvas(NamedTuple):
+    """One negative region ready to encode: its boolean ``mask`` and its ``canvas`` of ``-seed_logit * c(d)``.
+
+    The mask rides along because the confidence is 0 on the region's outermost pixels, so ``canvas != 0`` would
+    miss them, and overlaps are decided by the mask.
+    """
+
+    mask: np.ndarray
+    canvas: np.ndarray
+
+
 def negative_canvas(
     mask: np.ndarray,
     tau: float = EDGE_TAU_PX,
     seed_logit: float = SEED_LOGIT,
     depth_frac: float = EDGE_TAU_DEPTH_FRAC,
-) -> np.ndarray:
-    """One negative region as its ``-seed_logit * c(d)`` canvas (float32, <= 0), with its own ``tau_eff``.
+) -> NegativeCanvas:
+    """One negative region as its mask and ``-seed_logit * c(d)`` canvas (float32, <= 0), with its own ``tau_eff``.
 
     A sample with several prompt variants shares its negatives between them, so it computes these once and
     passes them to :func:`encode_dense_canvas` as ``negative_canvases``.
     """
-    return -np.float32(seed_logit) * edge_confidence(mask, tau, depth_frac)
+    return NegativeCanvas(
+        np.asarray(mask, dtype=bool), -np.float32(seed_logit) * edge_confidence(mask, tau, depth_frac)
+    )
 
 
 def encode_dense_canvas(
@@ -247,24 +265,45 @@ def encode_dense_canvas(
     seed: np.ndarray | None = None,
     correction: np.ndarray | None = None,
     negatives: Iterable[np.ndarray] = (),
-    negative_canvases: Iterable[np.ndarray] = (),
+    negative_canvases: Iterable[NegativeCanvas | np.ndarray] = (),
     tau: float = EDGE_TAU_PX,
     seed_logit: float = SEED_LOGIT,
     correction_logit: float = CORRECTION_LOGIT,
     depth_frac: float = EDGE_TAU_DEPTH_FRAC,
 ) -> np.ndarray:
-    """Full-resolution float32 logit canvas of ``shape`` (see the module docstring for the values)."""
-    canvas = np.zeros(shape, dtype=np.float32)
-    if seed is not None and np.any(seed):
-        canvas += np.float32(seed_logit) * edge_confidence(seed, tau, depth_frac)
-    if correction is not None and np.any(correction):
-        canvas += np.float32(correction_logit) * edge_confidence(correction, tau, depth_frac)
+    """Full-resolution float32 logit canvas of ``shape`` (see the module docstring for the values).
+
+    ``negative_canvases`` are :func:`negative_canvas` results. A bare canvas array is accepted too, with its
+    region taken as ``canvas != 0``, which misses the region's outermost pixels; pass a :class:`NegativeCanvas`.
+    """
+    positive = np.zeros(shape, dtype=np.float32)
+    positive_mask = np.zeros(shape, dtype=bool)
+    for layer, logit in ((seed, seed_logit), (correction, correction_logit)):
+        if layer is not None and np.any(layer):
+            positive_mask |= np.asarray(layer, dtype=bool)
+            np.maximum(positive, np.float32(logit) * edge_confidence(layer, tau, depth_frac), out=positive)
+
+    strength = np.zeros(shape, dtype=np.float32)  # the strongest negative at each pixel, as a magnitude
+    negative_mask = np.zeros(shape, dtype=bool)
+
+    def add_negative(region: NegativeCanvas) -> None:
+        np.logical_or(negative_mask, region.mask, out=negative_mask)
+        np.maximum(strength, -region.canvas, out=strength)
+
     for region in negatives:
         if np.any(region):
-            canvas += negative_canvas(region, tau, seed_logit, depth_frac)
+            add_negative(negative_canvas(region, tau, seed_logit, depth_frac))
     for ready in negative_canvases:
-        canvas += ready
-    return np.clip(canvas, -LOGIT_CLIP, LOGIT_CLIP, out=canvas)
+        if not isinstance(ready, NegativeCanvas):
+            canvas = np.asarray(ready, dtype=np.float32)
+            ready = NegativeCanvas(canvas != 0, canvas)
+        add_negative(ready)
+
+    # A pixel claimed by both a positive and a negative region is unknown, however deep either is.
+    canvas = np.where(positive_mask & ~negative_mask, positive, np.float32(0.0)).astype(np.float32, copy=False)
+    only_negative = negative_mask & ~positive_mask
+    canvas[only_negative] = -strength[only_negative]
+    return canvas
 
 
 def encode_mask_input(
@@ -273,7 +312,7 @@ def encode_mask_input(
     seed: np.ndarray | None = None,
     correction: np.ndarray | None = None,
     negatives: Sequence[np.ndarray] = (),
-    negative_canvases: Sequence[np.ndarray] = (),
+    negative_canvases: Sequence[NegativeCanvas | np.ndarray] = (),
     tau: float = EDGE_TAU_PX,
     seed_logit: float = SEED_LOGIT,
     correction_logit: float = CORRECTION_LOGIT,

@@ -268,6 +268,34 @@ class BuildPromptTests(unittest.TestCase):
         self.assertFalse(prompt.foreground_weight[24:32, 24:40].any())
         self.assertTrue(prompt.foreground_weight[34:38, 28:36].all())
 
+    def test_containment_weight_is_zero_under_every_overlapping_negative_and_the_prompt_is_unknown_there(self) -> None:
+        from sam2_segmentation_trainer.data.prompts import negative_region_canvases
+
+        regions = []
+        for index, (r0, r1, c0, c1) in enumerate([(24, 32, 24, 40), (28, 36, 30, 44), (26, 30, 20, 34)]):
+            mask = np.zeros((64, 64), dtype=bool)
+            mask[r0:r1, c0:c1] = True
+            regions.append(NegativeRegion(20 + index, KIND_POLYGON, mask))
+        union = np.any(np.stack([r.mask for r in regions]), axis=0)
+        cfg = _only(PromptType.CIRCLE_SEED)
+        for canvases in (None, negative_region_canvases(regions, cfg)):
+            prompt = build_prompt(
+                PromptType.CIRCLE_SEED,
+                target_mask=self.target,
+                circle_mask=self.circle,
+                regions=regions,
+                cfg=cfg,
+                rng=np.random.default_rng(0),
+                negative_canvases=canvases,
+            )
+            self.assertFalse(prompt.foreground_weight[union].any())
+            self.assertTrue(prompt.foreground_weight[34:38, 26:30].any())  # trust elsewhere in the circle survives
+            # The dense prompt agrees: the 64 px tile is replicated 4x to 256, and the seed/negative overlap is 0.
+            tile = prompt.dense_logits.reshape(64, 4, 64, 4).mean(axis=(1, 3))
+            self.assertTrue((tile[union & self.circle] == 0.0).all())
+            self.assertTrue((tile[union & ~self.circle] <= 0.0).all())
+            self.assertGreaterEqual(float(tile.min()), -10.0 - 1e-4)  # overlapping negatives never stack
+
     def test_circle_seed_requires_a_circle(self) -> None:
         with self.assertRaises(ValueError):
             self._build(PromptType.CIRCLE_SEED, circle=False)

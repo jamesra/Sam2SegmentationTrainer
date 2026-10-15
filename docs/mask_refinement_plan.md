@@ -54,8 +54,11 @@ The negative-only prompt is removed (assessment 1.5); this plan assumes it is go
 | Mask to correct, or near-correct mask (may be wrong) | +M_corr × c(d), with M_corr = 3 |
 | Other annotations (negative context) | −10 × c(d_neighbor), using each neighbor's own edge distance and cap |
 | Everywhere else | 0 (unknown) |
-| Overlap of + and − | sum, clipped to ±10 |
+| Overlap of two positive layers (seed and mask to correct) | the larger value, not the sum |
+| Overlap of several negatives | the strongest one (−10 × c at best), never a stack |
+| Overlap of + and − | 0 (unknown), whatever the confidences: decided by the masks, not the values |
 
+- **Overlaps are decided by masks.** A pixel covered by a positive region and a negative region is a contradiction, so it is unknown (0) however deep either is; summing would let a deep seed outvote a shallow neighbor, or the reverse, in a way the annotations do not support. The encoder takes the union of the positive masks and the union of the negative masks, marks their intersection unknown, and elsewhere uses the larger positive value or the strongest negative (no sum, no clip). A negative region's mask travels with its canvas, because c(d) is 0 on its outermost pixels. The encoding version string is `edge-confidence-v5`.
 - **Two strengths.** M_corr is lower so the mask network can learn that a mask to correct is a suggestion, while a seed is trusted. SAM 2 itself was trained to correct its own soft prediction logits.
 - **Downsampling.** Downsample to the 256×256 `mask_input` by area averaging, not nearest-neighbor.
 - **Neighbor-merge samples (section 3.3).** Leave out the merged neighbor's negative context; otherwise the error is labelled for the model.
