@@ -927,15 +927,15 @@ class _LossWindow:
 
     Besides the four always-present losses, the optional prompt-containment and mask-containment losses are
     carried when ``stats`` has them. The per-sample losses ride along with each sample's prompt type so the
-    log can show which prompt families are hard.
+    log can show which prompt families are hard. A step may have an optional loss that the one before lacked (the
+    mask-containment term appears when its warmup scale leaves 0), so each row keeps its own optional keys.
     """
 
     _OPTIONAL = ("loss_containment", "loss_mask_contain")
 
     def __init__(self) -> None:
         self._rows: list[torch.Tensor] = []
-        self._meta: list[tuple[int, int, int, float, list, list[str]]] = []
-        self._extras: tuple[str, ...] = ()
+        self._meta: list[tuple[int, int, int, float, list, list[str], tuple[str, ...]]] = []
 
     def add(
         self,
@@ -948,27 +948,30 @@ class _LossWindow:
         meta: list,
         prompt_types: list[str] | None = None,
     ) -> None:
-        self._extras = tuple(key for key in self._OPTIONAL if key in stats)
+        extras = tuple(key for key in self._OPTIONAL if key in stats)
         head = [
             stats["loss"].reshape(1),
             stats["loss_focal"].reshape(1),
             stats["loss_dice"].reshape(1),
             stats["loss_iou"].reshape(1),
         ]
-        head.extend(stats[key].reshape(1) for key in self._extras)
+        head.extend(stats[key].reshape(1) for key in extras)
         packed = torch.cat(head + [stats["sample_losses"].reshape(-1)])
         self._rows.append(packed.detach())
-        self._meta.append((epoch, step, global_step, duration_s, meta, list(prompt_types or [])))
+        self._meta.append((epoch, step, global_step, duration_s, meta, list(prompt_types or []), extras))
 
     def drain(self) -> list[dict]:
         if not self._rows:
             return []
-        extras = self._extras
-        head_len = 4 + len(extras)
-        packed = torch.stack(self._rows).float().cpu()
+        # Rows differ in length when the optional losses changed mid-window: pad to the longest so they still
+        # leave the GPU in one transfer, and read each back at its own length.
+        width = max(int(row.numel()) for row in self._rows)
+        padded = [torch.nn.functional.pad(row, (0, width - int(row.numel()))) for row in self._rows]
+        packed = torch.stack(padded).float().cpu()
         records = []
-        for i, (epoch, step, global_step, duration_s, meta, prompt_types) in enumerate(self._meta):
-            row = packed[i].tolist()
+        for i, (epoch, step, global_step, duration_s, meta, prompt_types, extras) in enumerate(self._meta):
+            head_len = 4 + len(extras)
+            row = packed[i, : int(self._rows[i].numel())].tolist()
             record = {
                 "epoch": epoch,
                 "step": step,
