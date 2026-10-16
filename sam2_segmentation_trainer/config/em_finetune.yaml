@@ -302,7 +302,7 @@ eval:
   # Validation runs in fp32 like infer.py and interactive.py; its precision should follow the server's inference precision.
   val_prompts: [circle_mask, correction, near_correct, point, centroid, circle_mask_noneg, circle_annotator]
   # The prompt whose goal metrics pick best_model.pt and drive early stopping (see val:).
-  primary_val_prompt: circle_mask
+  primary_val_prompt: circle_annotator
   grid_every: 10
   max_grids: 40
 

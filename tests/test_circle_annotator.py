@@ -304,12 +304,12 @@ class FamilyRegistrationTests(unittest.TestCase):
         self.assertIn("circle_annotator", CIRCLE_PROMPTS)
         self.assertNotIn("circle_annotator", NO_NEGATIVE_PROMPTS)
 
-    def test_the_suite_defaults_and_the_split_include_it_but_the_primary_stays_circle_mask(self) -> None:
+    def test_the_suite_defaults_and_the_split_include_it_and_it_is_the_primary(self) -> None:
         self.assertEqual(DEFAULT_VAL_PROMPTS[-2:], ("circle_mask_noneg", "circle_annotator"))
         self.assertIn("circle_annotator", NEG_SPLIT_PROMPTS)
         cfg = load_train_cfg()
         self.assertEqual(list(cfg.eval.val_prompts)[-2:], ["circle_mask_noneg", "circle_annotator"])
-        self.assertEqual(str(cfg.eval.primary_val_prompt), "circle_mask")
+        self.assertEqual(str(cfg.eval.primary_val_prompt), "circle_annotator")
         self.assertEqual(tuple(cfg.eval.val_prompts), DEFAULT_VAL_PROMPTS)
 
     def test_the_one_prompt_evaluation_leaves_it_out_and_refuses_it(self) -> None:

@@ -51,7 +51,7 @@ class EvaluateGoalTests(unittest.TestCase):
         for family in written["families"].values():
             self.assertIn("core_recall", family["goal"])
         self.assertAlmostEqual(written["families"]["circle_mask"]["goal"]["core_recall"], 1.0)
-        self.assertIn("val [circle_mask", out.getvalue())
+        self.assertIn("val [circle_annotator", out.getvalue())  # the primary prompt in the shipped config
 
 
 if __name__ == "__main__":
