@@ -50,6 +50,8 @@ from sam2_segmentation_trainer.data.tiles import (
 from sam2_segmentation_trainer.losses import containment_warmup_scale
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
 from annotation_crops.prompt_encoding import CORRECTION_LOGIT, EDGE_TAU_DEPTH_FRAC, EDGE_TAU_PX, SEED_LOGIT
+from sam2_segmentation_trainer.data_record import build_data_record, write_data_record
+from sam2_segmentation_trainer.export_serve import BEST_EPOCH_FILE, launch_epoch_export
 from sam2_segmentation_trainer.encoding_record import (
     RECORD_NAME,
     metadata_from_settings,
@@ -1122,6 +1124,26 @@ def _move_ignored_masks(volumes: list[str], data_dir: Path) -> None:
             print(f"index {volume}: {moved} ignored mask(s) moved")
 
 
+def _record_training_data(
+    run_dir: Path, data_dir: Path, volumes: list[str], train_ex, val_ex, cfg: DictConfig
+) -> None:
+    """Write ``training_data.json`` (which data set and files this run trains on); a failure only warns."""
+    try:
+        write_data_record(
+            run_dir,
+            build_data_record(
+                data_dir,
+                volumes,
+                train_counts=_counts_by_volume(train_ex),
+                val_counts=_counts_by_volume(val_ex),
+                split_seed=int(cfg.training.seed),
+                train_fraction=float(cfg.data.train_split),
+            ),
+        )
+    except Exception as exc:
+        print(f"WARNING: could not write the training data record: {exc}")
+
+
 def _write_run_inputs(path: Path, inputs: RunInputs) -> None:
     if path.is_file():
         return
@@ -1240,6 +1262,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     val_counts = _counts_by_volume(val_ex)
     print(f"train per volume: {train_counts}")
     print(f"val per volume: {val_counts}")
+    _record_training_data(run_dir, data_dir, volumes, train_ex, val_ex, cfg)
     _write_run_inputs(
         run_dir / "inputs.json",
         RunInputs(
@@ -1466,6 +1489,18 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             ),
         )
 
+    export_each_epoch = bool(cfg.training.get("export_serve_each_epoch", True))
+
+    def export_epoch(epoch_done: int) -> None:
+        """Start the detached serve export for the weights just saved; a failure never stops training."""
+        if not export_each_epoch:
+            return
+        try:
+            out = launch_epoch_export(model, run_dir, epoch_done)
+            progress.transcript(f"started the serve export for epoch {epoch_done}: {out}")
+        except Exception as exc:
+            progress.transcript(f"serve export for epoch {epoch_done} not started: {exc}")
+
     num_epochs = int(cfg.training.num_epochs)
     val_images_every = int(cfg.training.get("val_images_every_n_steps", 2500))
     val_images_per_volume = max(0, int(cfg.training.get("val_images_per_volume", 3)))
@@ -1517,6 +1552,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 f"epoch {epoch}: inventory rebuilt, "
                 f"train={len(train_ex)} val={len(val_ex)}"
             )
+            _record_training_data(run_dir, data_dir, volumes, train_ex, val_ex, cfg)
         step0 = start_step if epoch == start_epoch else 0
         epoch_counter.set(epoch)
         indices = remaining_epoch_indices(
@@ -1790,6 +1826,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 best_selection = val_key
                 epochs_without_improve = 0
                 atomic_torch_save(model.state_dict(), run_dir / "best_model.pt")
+                # Which epoch best_model.pt is, so exporting it can name the model v<VERSION>.<EPOCH>.
+                (run_dir / BEST_EPOCH_FILE).write_text(
+                    json.dumps({"epoch": epoch, "global_step": global_step}) + "\n", encoding="utf-8"
+                )
                 goal = val_results[val_suite.primary].goal
                 progress.transcript(
                     f"  saved best_model.pt (core recall {goal.core_recall:.4f}, merge rate {goal.merge_rate:.3f}, "
@@ -1810,6 +1850,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                             )
                         )
                     save_now(epoch + 1, 0)
+                    export_epoch(epoch)
                     progress.transcript(f"early stopping at epoch {epoch}")
                     break
             progress.stage("train", "start")
@@ -1820,6 +1861,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 model.state_dict(), run_dir / f"checkpoint_epoch{epoch}.pt"
             )
         save_now(epoch + 1, 0)
+        export_epoch(epoch)
         start_step = 0
         if stop.stop:
             progress.mark_stopped()

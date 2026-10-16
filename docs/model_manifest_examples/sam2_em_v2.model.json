@@ -1,0 +1,44 @@
+{
+  "capabilities": {
+    "resolution_mode": "single",
+    "submission_mode": "full_viewport"
+  },
+  "client_contract": {
+    "background_mask": "none",
+    "circle_diameter_scale": 1.0,
+    "contract_version": 1,
+    "mask_format": "none",
+    "mask_roles": [],
+    "notes": "Hand-written. Whole-screen image via UploadImage and SegmentImage, points only, no mask prompt. resolution_mode is not consulted for full_viewport.",
+    "requires_model_id": false,
+    "window": 0
+  },
+  "code": {
+    "prompt_encoding": "legacy-flat-v1",
+    "trainer_git_sha": "unknown"
+  },
+  "model": {
+    "base_checkpoint": "sam2.1_hiera_large.pt",
+    "description": "Whole-screen model trained before the trainer wrote manifests. Fill in what it was trained on and what it is good for.",
+    "display_name": "SAM2 EM v2",
+    "epoch": 8,
+    "exported_at": "unknown",
+    "model_id": "v2",
+    "model_version": "v2.8",
+    "run": "sam2_em_v2"
+  },
+  "prompt_encoding": {
+    "prompt_encoding": "legacy-flat-v1"
+  },
+  "schema_version": 1,
+  "server_contract": {
+    "builds_mask_input": false,
+    "encoding": "legacy-flat-v1"
+  },
+  "training_data": {
+    "fingerprint": "unknown",
+    "requested": "unknown",
+    "schema_version": 1,
+    "set": "unknown"
+  }
+}

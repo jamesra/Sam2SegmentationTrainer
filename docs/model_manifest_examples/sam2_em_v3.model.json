@@ -1,0 +1,44 @@
+{
+  "capabilities": {
+    "resolution_mode": "single",
+    "submission_mode": "tile_grid"
+  },
+  "client_contract": {
+    "background_mask": "neighbour-annotations-union",
+    "circle_diameter_scale": 0.95,
+    "contract_version": 1,
+    "mask_format": "png-l8-binary",
+    "mask_roles": [],
+    "notes": "Hand-written. Predates the trainer's export. Binary masks, no roles, the old flat mask prompt.",
+    "requires_model_id": false,
+    "window": 1024
+  },
+  "code": {
+    "prompt_encoding": "legacy-flat-v1",
+    "trainer_git_sha": "unknown"
+  },
+  "model": {
+    "base_checkpoint": "sam2.1_hiera_large.pt",
+    "description": "Tiled model trained before the trainer wrote manifests. Fill in what it was trained on and what it is good for.",
+    "display_name": "SAM2 EM v3",
+    "epoch": 9,
+    "exported_at": "unknown",
+    "model_id": "v3",
+    "model_version": "v3.9",
+    "run": "sam2_em_v3"
+  },
+  "prompt_encoding": {
+    "prompt_encoding": "legacy-flat-v1"
+  },
+  "schema_version": 1,
+  "server_contract": {
+    "builds_mask_input": true,
+    "encoding": "legacy-flat-v1"
+  },
+  "training_data": {
+    "fingerprint": "unknown",
+    "requested": "unknown",
+    "schema_version": 1,
+    "set": "unknown"
+  }
+}

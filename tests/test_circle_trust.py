@@ -418,7 +418,9 @@ class RecordRoundTripTests(unittest.TestCase):
             out = Path(tmp) / "serve" / "best_TEM_model.pt"
             with mock.patch("sam2_segmentation_trainer.export_serve.load_finetuned_model", return_value=nn.Linear(2, 2)), \
                     contextlib.redirect_stdout(io.StringIO()):
-                export_serve_checkpoint(finetuned=run / "best_model.pt", base_ckpt=Path("b.pt"), out=out)
+                export_serve_checkpoint(
+                    finetuned=run / "best_model.pt", base_ckpt=Path("b.pt"), out=out, model_id="v1", epoch=0
+                )
             embedded = torch.load(out, weights_only=True)["prompt_encoding"]
             sidecar = sidecar_path(out)
             self.assertEqual(sidecar.name, "best_TEM_model.prompt_encoding.json")

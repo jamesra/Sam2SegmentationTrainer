@@ -41,7 +41,7 @@ Optional `--build-arg` files in that folder (Nornir names; the `example.*` templ
 - `.build.sam2-trainer-dev.env` (tag `sam2-trainer:dev`)
 
 ```powershell
-Copy-Item D:\src\git\Sam2SegmentationTrainer\docker\example.sam2-trainer-dev.build.env `
+Copy-Item D:\src\git\Sam2Trainer\docker\example.sam2-trainer-dev.build.env `
     D:\Docker\Builds\sam2-trainer\.build.sam2-trainer-dev.env
 ```
 
@@ -52,7 +52,7 @@ Open **this folder** (not a multi-root workspace) and **Reopen in Container**. C
 CLI:
 
 ```powershell
-& D:\src\git\Sam2SegmentationTrainer\docker\run-cursor-dev.ps1
+& D:\src\git\Sam2Trainer\docker\run-cursor-dev.ps1
 ```
 
 ## Paths inside the container
@@ -253,10 +253,23 @@ sam2-em-eval --goal --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v3/best_mode
 sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt --point 512,400 --out /outputs/pred.png
 
 # SegmentationServer loads Meta {"model": state_dict}, not the raw trainer file.
+# Training does this itself after every epoch (training.export_serve_each_epoch, default true): it starts a separate
+# detached CPU process that writes <run>/serve/serve_epoch<N>.pt and its .prompt_encoding.json (log: serve/export.log).
+# Copy that file to the segmentation server, together with its <stem>.model.json (the model manifest: model id and
+# version, the training data it saw, tiled or whole-screen, the mask-prompt encoding, and what a client must do to its
+# masks; see docs/model_manifest.md). The server reads the manifest next to the checkpoint and reports it to clients.
+# training_data.json in the run folder records which data folder (v3, ...) and which file fingerprints the run saw;
+# the manifest carries it as training_data, separate from the model's own version. v2 and v3 predate the exporter and
+# need hand-written manifests (examples in docs/model_manifest_examples/, checked with
+# `python -m sam2_segmentation_trainer.model_manifest check <file>`).
+# The command below exports best_model.pt by hand. Name the file for the model: v<VERSION>.<EPOCH>.pt, here v1.6.pt
+# for run sam2_em_v1 and epoch 6 (VERSION comes from the run name, EPOCH from best_model.json that training writes
+# beside best_model.pt; for an older run pass --epoch N, and --model-id v<N> when the run name has no _vN).
+# --description "..." sets the operator's description; leave it out to keep the one already in the manifest.
 # best_model.pt is weights only; this writes the file the server expects.
 sam2-em-export-serve \
   --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt \
-  --out /path/to/best_TEM_model.pt
+  --out /path/to/v1.6.pt
 # The file is {"model": state_dict, "prompt_encoding": {...}}: build_sam2 reads only "model"; the other key records
 # EDGE_TAU_PX, EDGE_TAU_DEPTH_FRAC, SEED_LOGIT, CORRECTION_LOGIT, LOGIT_CLIP, LOW_RES, circle_diameter_scale,
 # circle_annotation_trust {full_frac, zero_frac, ramp: cosine} and a prompt_encoding version string
@@ -268,8 +281,10 @@ sam2-em-export-serve \
 # a prompt.* value differs from the annotation_crops.prompt_encoding constants the server implements.
 ```
 
-**Do not serve a v4 model until the server builds `mask_input` with `annotation_crops/prompt_encoding.py` and the
-constants in the exported file.** The mask network was trained on edge-confidence canvases (a seed at +10 times the
+**Do not serve a v4 model with a segmentation server that builds `mask_input` the old way.** The server in the Viking
+repo (`Servers/SegmentationServer`) reads the model manifest and builds `mask_input` with
+`annotation_crops/prompt_encoding.py` and the constants in the exported file when the manifest names
+`edge-confidence-v6`; an older build does not. The mask network was trained on edge-confidence canvases (a seed at +10 times the
 edge confidence, a mask to correct at +3, other annotations at -10, area-averaged to 256 x 256), not on the mask
 encoding of earlier models. A server that still builds `mask_input` the old way gives the model a differently scaled
 input than it saw in training. Check the `prompt_encoding` version and constants against the server's before switching.

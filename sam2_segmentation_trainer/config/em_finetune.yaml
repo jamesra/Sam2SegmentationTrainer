@@ -54,6 +54,9 @@ training:
   val_images_every_n_steps: 2500
   val_images_per_volume: 3
   save_every_n_epochs: 3
+  # After each epoch, start a separate process that writes <run>/serve/serve_epoch<N>.pt (the file the segmentation
+  # server loads, with its prompt_encoding record). Training does not wait for it.
+  export_serve_each_epoch: true
   save_every_n_steps: 200
   resume: true
   # Epochs without a better checkpoint before training stops. "Better" follows the checkpoint rule (see
