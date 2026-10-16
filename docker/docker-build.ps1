@@ -3,7 +3,7 @@
   Build the sam2-trainer:dev image (build-phase counterpart to run-cursor-dev.ps1).
 
 .DESCRIPTION
-  Builds docker/Dockerfile from the Sam2SegmentationTrainer repository root and tags
+  Builds docker/Dockerfile from the Sam2Trainer repository root and tags
   sam2-trainer:dev. Separating this from run-cursor-dev.ps1 keeps image build-args
   out of the Compose/CIFS run path.
 
