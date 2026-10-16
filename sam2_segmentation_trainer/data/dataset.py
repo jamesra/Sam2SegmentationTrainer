@@ -685,6 +685,7 @@ class EMSegDataset(Dataset):
         for k, kind in enumerate(types):
             circle_k = circle_aug
             jittered = False
+            drawn: dict = {}
             if jitter_on and kind in (PromptType.CIRCLE_SEED, PromptType.ADJACENT_SEED):
                 # Its own generator (the trailing 2), so no other draw moves; prob 0 never gets here and draws nothing.
                 # An adjacent seed that cannot be fitted falls back to a circle, which is then this circle.
@@ -692,7 +693,7 @@ class EMSegDataset(Dataset):
                 if jrng.random() < jitter.prob:
                     if depth is None:
                         depth = target_depth(target_aug)
-                    disc = annotator_circle(target_aug, jrng, jitter, depth)
+                    disc = annotator_circle(target_aug, jrng, jitter, depth, drawn)
                     if disc is not None:
                         circle_k, jittered = disc, True
             prompt = build_prompt(
@@ -723,6 +724,10 @@ class EMSegDataset(Dataset):
                     "prompt_type": prompt.prompt_type.value,
                     # Whether the circle this variant was given is an annotator-like one (False for other families).
                     "circle_jittered": jittered and prompt.prompt_type is PromptType.CIRCLE_SEED,
+                    # For a jittered circle: whether the fit cap d(p) + fit_grow_px set its radius, not s * D.
+                    "circle_fit_capped": bool(
+                        jittered and prompt.prompt_type is PromptType.CIRCLE_SEED and drawn.get("capped", False)
+                    ),
                 }
             )
         meta = SampleMeta(

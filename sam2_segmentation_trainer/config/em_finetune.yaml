@@ -195,8 +195,9 @@ loss:
   dice_weight: 1.0
   iou_weight: 1.0   # the IoU head is trained with absolute (L1) error, as in SAM 2; there is no other form
   # Hinge penalty for predicting background where a seed said foreground (the seed is a core the engine grows
-  # beyond), weighted by the seed's edge confidence. Never applied to masks to correct. 0 disables. Ramps up
-  # linearly over containment_warmup_epochs.
+  # beyond), weighted by the seed's edge confidence and counted only where the seed overlaps the ground-truth target
+  # (an annotator-like circle may reach past it; the prompt itself is not clipped). Never applied to masks to
+  # correct. 0 disables. Ramps up linearly over containment_warmup_epochs.
   mask_contain_weight: 0.5
   containment_warmup_epochs: 2
   # Penalizes predicting background at prompted point locations (BCE toward 1

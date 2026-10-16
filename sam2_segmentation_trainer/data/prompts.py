@@ -280,7 +280,9 @@ class PromptSample:
     ``box`` is (x1, y1, x2, y2) or None. ``dense_logits`` is the 256x256 float mask prompt (see
     :mod:`annotation_crops.prompt_encoding`) or None, meaning "use the learned no-mask embedding".
     ``foreground_weight`` is the full-resolution trust of a seed (its edge confidence, zero where a negative
-    covers it) for the mask-containment loss, or None when the prompt has no seed.
+    covers it and zero outside the ground-truth target) for the mask-containment loss, or None when the prompt has no
+    seed or none of it lies on the target. It is a loss weight only: the seed in ``dense_logits`` and ``input_mask`` is
+    not clipped to the target.
     ``input_mask`` is the full-resolution boolean seed or mask to correct, for scoring how far the model moved
     away from it; None when the prompt has no such mask.
     """
@@ -371,6 +373,7 @@ def annotator_circle(
     rng: np.random.Generator,
     cfg: CircleSeedJitter,
     depth: np.ndarray | None = None,
+    info: dict | None = None,
 ) -> np.ndarray | None:
     """Boolean disc for an annotator-like circle seed inside the boolean ``target``, or None (the caller keeps the
     inscribed seed).
@@ -383,7 +386,9 @@ def annotator_circle(
     reorder it. Returns None for an empty target and when the radius falls below ``cfg.min_radius_px``.
 
     ``depth`` is :func:`target_depth` of ``target`` when the caller already has it (it saves a distance transform);
-    it does not change what is drawn.
+    it does not change what is drawn. ``info``, when given, is filled with what was drawn: ``row``/``col`` of the
+    centre, ``depth_at_centre`` (the centre's own depth d(p)), ``max_depth`` (D), ``scale`` (s), ``radius`` and
+    ``capped``, whether the fit cap ``d(p) + fit_grow_px`` set the radius instead of ``s * D``.
     """
     mask = np.asarray(target, dtype=bool)
     if not mask.any():
@@ -402,7 +407,13 @@ def annotator_circle(
         candidates = np.flatnonzero((gap == gap.min()).ravel())
     row, col = divmod(int(candidates[rng.integers(candidates.size)]), mask.shape[1])
     scale = rng.uniform(cfg.scale_range[0], cfg.scale_range[1])
-    radius = min(scale * deepest, float(depth[row, col]) + cfg.fit_grow_px)
+    centre_depth = float(depth[row, col])
+    radius = min(scale * deepest, centre_depth + cfg.fit_grow_px)
+    if info is not None:
+        info.update(
+            row=row, col=col, depth_at_centre=centre_depth, max_depth=deepest, scale=float(scale),
+            radius=float(radius), capped=bool(centre_depth + cfg.fit_grow_px < scale * deepest),
+        )
     if radius < cfg.min_radius_px:
         return None
     return rasterize_circle(mask.shape, col + 0.5, row + 0.5, radius)
@@ -704,6 +715,10 @@ def build_prompt(
         weight = edge_confidence(seed, cfg.edge_tau_px, cfg.edge_tau_depth_frac)
         if negatives:
             weight = weight * ~np.any(np.stack(negatives), axis=0)
+        # The containment loss asks the model to call the trusted seed core object. Where the seed reaches past the
+        # ground truth (an annotator-like circle may, by up to fit_grow_px) that would contradict the label, so the
+        # trust counts only where the seed overlaps the target. The prompt itself is not clipped.
+        weight = weight * np.asarray(target_mask, dtype=bool)
         if not weight.any():
             weight = None
     input_mask = seed if seed is not None else correction

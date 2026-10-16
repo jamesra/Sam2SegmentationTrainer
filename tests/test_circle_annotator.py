@@ -681,5 +681,161 @@ class TrainingRuleTests(unittest.TestCase):
                 self.assertTrue(seed[int(point[1]), int(point[0])], "the click is the disc's centre, inside it")
 
 
+
+class ContainmentWeightTests(unittest.TestCase):
+    """The mask-containment weight counts only where the seed overlaps the ground-truth target."""
+
+    SHAPE = (96, 96)
+
+    @staticmethod
+    def square_target() -> np.ndarray:
+        target = np.zeros((96, 96), dtype=bool)
+        target[30:70, 30:70] = True  # 40 x 40
+        return target
+
+    @staticmethod
+    def disc(cx: float, cy: float, radius: float) -> np.ndarray:
+        ys, xs = np.mgrid[:96, :96]
+        return (xs + 0.5 - cx) ** 2 + (ys + 0.5 - cy) ** 2 <= radius**2
+
+    def build(self, target: np.ndarray, seed: np.ndarray, **kwargs):
+        return prompts_module.build_prompt(
+            PromptType.CIRCLE_SEED, target_mask=target, circle_mask=seed, regions=[], cfg=PromptConfig(),
+            rng=np.random.default_rng(7), **kwargs,
+        )
+
+    def test_a_seed_that_reaches_past_the_target_has_no_weight_outside_it_and_unchanged_weight_inside(self) -> None:
+        target = self.square_target()
+        seed = self.disc(50, 50, 30)  # radius 30 around the centre: reaches 10 px past the 40 px square on every side
+        self.assertTrue((seed & ~target).any() and (seed & target).any(), "the premise: the seed overhangs the target")
+        cfg = PromptConfig()
+
+        prompt = self.build(target, seed)
+
+        weight = prompt.foreground_weight
+        self.assertIsNotNone(weight)
+        self.assertEqual(float(weight[~target].max()), 0.0)
+        expected = prompts_module.edge_confidence(seed, cfg.edge_tau_px, cfg.edge_tau_depth_frac)
+        self.assertTrue(np.array_equal(weight[target], expected[target]), "inside the target the weight is unchanged")
+        self.assertGreater(float(weight[target].max()), 0.5)
+
+    def test_the_prompt_itself_is_not_changed_and_the_seed_disc_is_not_clipped(self) -> None:
+        target = self.square_target()
+        seed = self.disc(50, 50, 30)
+        everywhere = np.ones_like(target)  # a target covering the tile cannot clip anything: the old behaviour
+
+        clipped_weight = self.build(target, seed)
+        unrestricted = self.build(everywhere, seed)
+
+        self.assertTrue(np.array_equal(clipped_weight.input_mask, seed), "the seed is not clipped to the target")
+        self.assertTrue(np.array_equal(clipped_weight.input_mask, unrestricted.input_mask))
+        self.assertTrue(np.array_equal(clipped_weight.dense_logits, unrestricted.dense_logits))
+        self.assertTrue(np.array_equal(clipped_weight.point_coords, unrestricted.point_coords))
+        self.assertTrue(np.array_equal(clipped_weight.point_labels, unrestricted.point_labels))
+        self.assertGreater(float(unrestricted.foreground_weight[~target].max()), 0.0, "the unrestricted weight had trust outside")
+
+    def test_a_seed_inside_the_target_is_unaffected(self) -> None:
+        target = self.square_target()
+        seed = self.disc(50, 50, 15)
+        cfg = PromptConfig()
+        weight = self.build(target, seed).foreground_weight
+        expected = prompts_module.edge_confidence(seed, cfg.edge_tau_px, cfg.edge_tau_depth_frac)
+        self.assertTrue(np.array_equal(weight, expected))
+
+    def test_a_seed_wholly_outside_the_target_has_no_containment_weight(self) -> None:
+        self.assertIsNone(self.build(self.square_target(), self.disc(10, 10, 6)).foreground_weight)
+
+    def test_the_loss_ignores_background_predicted_where_the_seed_overhangs(self) -> None:
+        from sam2_segmentation_trainer.losses import mask_containment_loss_per_sample
+
+        target = self.square_target()
+        seed = self.disc(50, 50, 30)
+        prediction = torch.where(torch.from_numpy(target), torch.tensor(5.0), torch.tensor(-5.0))[None]  # the truth
+
+        restricted = torch.from_numpy(self.build(target, seed).foreground_weight.astype(np.float32))[None]
+        unrestricted = torch.from_numpy(self.build(np.ones_like(target), seed).foreground_weight.astype(np.float32))[None]
+
+        self.assertEqual(float(mask_containment_loss_per_sample(prediction, restricted)), 0.0)
+        self.assertGreater(float(mask_containment_loss_per_sample(prediction, unrestricted)), 0.0)
+
+    def test_every_jittered_training_seed_has_zero_weight_outside_its_target(self) -> None:
+        fixture = TrainingRuleTests()
+        fixture.setUp()
+        try:
+            dataset = fixture.dataset(1.0)
+            overhanging = 0
+            for epoch in (0, 1, 2):
+                dataset.counter.set(epoch)
+                for index in range(len(dataset)):
+                    item = dataset[index]
+                    target = item["mask"].numpy().astype(bool)
+                    for variant in item["variants"]:
+                        if not variant["circle_jittered"]:
+                            continue
+                        seed = variant["prompt_input"].numpy().astype(bool)
+                        trust = variant["prompt_fg"].numpy()
+                        self.assertEqual(float(trust[~target].max()), 0.0)
+                        overhanging += int((seed & ~target).any())
+            self.assertGreater(overhanging, 0, "no jittered seed overhung the test targets, so nothing was tested")
+        finally:
+            fixture.tearDown()
+
+
+class FitCapTests(unittest.TestCase):
+    """``annotator_circle`` can say whether the fit cap d(p) + fit_grow_px, not s * D, set the radius."""
+
+    def test_info_reports_the_draw_and_whether_the_cap_set_the_radius(self) -> None:
+        cfg = CircleSeedJitter()
+        seen = {True: 0, False: 0}
+        for name, make in (("disc", disc_target), ("ellipse", ellipse_target), ("c_shape", c_target)):
+            target = make()
+            for seed in range(80):
+                info: dict = {}
+                disc = annotator_circle(target, np.random.default_rng(seed), cfg, info=info)
+                if disc is None:
+                    continue
+                uncapped = info["scale"] * info["max_depth"]
+                capped_radius = info["depth_at_centre"] + cfg.fit_grow_px
+                self.assertAlmostEqual(info["radius"], min(uncapped, capped_radius), places=9, msg=f"{name} {seed}")
+                self.assertEqual(info["capped"], capped_radius < uncapped, f"{name} {seed}")
+                seen[info["capped"]] += 1
+        self.assertGreater(seen[True], 0)
+        self.assertGreater(seen[False], 0)
+
+    def test_info_does_not_change_what_is_drawn(self) -> None:
+        target, cfg = ellipse_target(), CircleSeedJitter()
+        for seed in range(20):
+            plain = annotator_circle(target, np.random.default_rng(seed), cfg)
+            informed = annotator_circle(target, np.random.default_rng(seed), cfg, info={})
+            self.assertTrue((plain is None and informed is None) or np.array_equal(plain, informed))
+
+    def test_the_training_variant_carries_the_same_flag(self) -> None:
+        fixture = TrainingRuleTests()
+        fixture.setUp()
+        try:
+            dataset = fixture.dataset(1.0)
+            flagged = checked = 0
+            for epoch in (0, 1, 2, 3):
+                dataset.counter.set(epoch)
+                for index in range(len(dataset)):
+                    item = dataset[index]
+                    target = item["mask"].numpy().astype(bool)
+                    for k, variant in enumerate(item["variants"]):
+                        if not variant["circle_jittered"]:
+                            self.assertFalse(variant["circle_fit_capped"])
+                            continue
+                        rng = np.random.default_rng([fixture.SEED, epoch, index, k, 2])
+                        rng.random()
+                        info: dict = {}
+                        annotator_circle(target, rng, dataset.prompt_cfg.circle_seed_jitter, info=info)
+                        self.assertEqual(variant["circle_fit_capped"], info["capped"])
+                        checked += 1
+                        flagged += info["capped"]
+            self.assertGreater(checked, 20)
+            self.assertEqual(flagged, 0, "the 16 px fixture targets are too small for the fit cap to bind")
+        finally:
+            fixture.tearDown()
+
+
 if __name__ == "__main__":
     unittest.main()
