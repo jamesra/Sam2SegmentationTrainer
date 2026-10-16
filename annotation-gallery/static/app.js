@@ -1317,17 +1317,35 @@
         buckets.set(key, [cell.row]);
       }
     }
-    const span = shape.rows;
-    // A shape wider than the screen is cut into bands of `columns` and stacked.
-    const bandCount = Math.max(1, Math.ceil(shape.cols / columns));
+    // A shape wider than the screen is cut into bands of `columns` and stacked. Each band keeps only the rows it
+    // uses, so a sparse shape does not leave empty rows above it (the grid draws only the rows near the viewport,
+    // so a card that starts rows down the page would show as a blank grid) or between its bands.
+    const bandRows = new Map();
+    for (const key of buckets.keys()) {
+      const [dr, dc] = key.split(",").map(Number);
+      const band = Math.floor(dc / columns);
+      const range = bandRows.get(band);
+      if (range) {
+        range.lo = Math.min(range.lo, dr);
+        range.hi = Math.max(range.hi, dr);
+      } else {
+        bandRows.set(band, { lo: dr, hi: dr });
+      }
+    }
+    let layerHeight = 0;
+    for (const band of [...bandRows.keys()].sort((a, b) => a - b)) {
+      const range = bandRows.get(band);
+      range.start = layerHeight;
+      layerHeight += range.hi - range.lo + 1;
+    }
     const offsets = [];
     for (const [key, rows] of buckets) {
       const [dr, dc] = key.split(",").map(Number);
-      const band = Math.floor(dc / columns);
+      const range = bandRows.get(Math.floor(dc / columns));
       rows.forEach((row, copy) => {
         offsets.push({
           row,
-          dr: (band + copy * bandCount) * span + dr,
+          dr: copy * layerHeight + range.start + dr - range.lo,
           dc: dc % columns,
         });
       });

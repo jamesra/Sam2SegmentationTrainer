@@ -264,13 +264,14 @@ def test_review_can_ignore_and_restore(httpd: tuple[str, int], registry: Path) -
     assert (crops / "masks" / "RC2_17_D1_X0_Y0_42.png").is_file()
 
 
-def test_location_search_scrolls_and_sort_stacks() -> None:
+def test_location_search_filters_and_sort_stacks() -> None:
     html = (GALLERY_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
     assert 'id="locate"' in html
     assert 'href="https://tensor.codepharm.net"' in html
-    assert "Other cards stay in the list." in html
-    assert "scrollToLocation" in js
+    assert "Show only this location id" in html
+    assert "function parseLocationIds" in js
+    assert "function showLocations" in js
     assert '["structure_id", "Structure ID"]' in js
     assert '["location_id", "Location ID"]' in js
     assert "SORTS_PER_COLUMN = 5" in js
@@ -351,7 +352,7 @@ def test_each_window_has_review_icons_and_names_thumbnail_state() -> None:
     assert "link-hot" in js
     assert "link-hot" in css
     assert "refreshMarks" in js
-    refresh = js.split("async function refreshLocation", 1)[1].split('document.getElementById("volume-settings")', 1)[0]
+    refresh = js.split("async function refreshLocation", 1)[1].split("// Update all: one background job", 1)[0]
     assert "loadCatalog(" not in refresh
     assert "maskGeneration" not in js
     assert "locationGenerations.set" in refresh
@@ -1204,3 +1205,13 @@ def test_update_all_endpoints(httpd: tuple[str, int], registry: Path, monkeypatc
     assert status == 403
     status, payload = _request(httpd, "POST", "/api/volumes/RC2/update-all/cancel", body=b"{}", bearer="review")
     assert status == 200 and payload["running"] is False
+
+
+def test_sparse_shape_bands_start_at_the_top_of_the_grid() -> None:
+    # A band that uses only low rows of a sparse shape must not leave empty rows above it: the grid draws only the
+    # rows near the viewport, so a card that starts rows down the page shows as a blank grid.
+    js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    offsets = js.split("function shapeOffsets", 1)[1].split("function cellHtml", 1)[0]
+    assert "range.lo" in offsets
+    assert "range.start" in offsets
+    assert "span" not in offsets
