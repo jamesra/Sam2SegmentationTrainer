@@ -1,0 +1,78 @@
+---
+description: Naming conventions for training sets (v#.#), models (v<VERSION>.<EPOCH>) and their metadata sidecars; read before naming, exporting, syncing or serving either
+globs: scripts/WSL/**, sam2_segmentation_trainer/export_serve.py, sam2_segmentation_trainer/model_manifest.py, sam2_segmentation_trainer/data_record.py, sam2_segmentation_trainer/paths.py, docs/model_manifest.md, docs/model_manifest_examples/**
+alwaysApply: false
+---
+
+# Naming: training sets and models have separate version numbers
+
+A training **set** and a **model** each have their own version counter. The number in a set's name says nothing about
+the number in a model's name: "train v4 from v3 data" is a model version 4 trained on set 3. Both are written with a
+leading `v`, so **always say which one you mean**: "set v3", "model v4.3", in chat, logs, commit messages and UI text.
+
+| Thing | Name | Examples | Sidecar |
+|-------|------|----------|---------|
+| Training set | `v<SET>` or `v<SET>.<REVISION>` | `v2`, `v2.1` | `training_set.json` in the set's folder |
+| Model | `v<VERSION>.<EPOCH>` | `v4.3` | `<stem>.model.json` beside the weights |
+
+## Training sets: `v#` / `v#.#`
+
+- `v2` is a set made by one exporter recipe. `v2.1` is a repopulated or tweaked `v2`: **the same creation rules**, new
+  contents (a re-export after annotation edits, an updated ignore list, a corrected crop). A change to the creation
+  rules (crop size, diameter handling, filtering, what counts as a sample) is a new set number, `v3`, not `v2.2`.
+- A published set is immutable. Never overwrite `v2` in place: make `v2.1`.
+- Revisions compare numerically: `v2` < `v2.1` < `v2.2` < `v2.10` < `v3`.
+- The `current` symlink is a pointer, not a version. Anything that records a set stores the resolved folder name
+  (`data_record.py` already does: `set` is the realpath's basename, `requested` is `current`).
+- Every set is generated with a sidecar, **`training_set.json`, in each volume's folder** (for example
+  `Y:\Sam2TrainingData\v2.1\RC1\training_set.json`). Nornir's `ExportTrainingData` writes it into its `-Output` folder
+  (`-SetVersion v2.1`, optional `-ParentSet`, `-SetDescription`), and `version-sync` copies the folder, so it travels with
+  the volume's data. Fields: `schema_version`, `set_version` (equals the set's folder name), `parent` (`v2` for `v2.1`,
+  null for a new set), `created_at`, `updated_at`, `generator` (tool and version), `creation_rules` (the exporter
+  parameters that define a sample), `creation_rules_fingerprint` (hash of `creation_rules`: **equal across a set and its
+  revisions**, different across set numbers), `source` (the annotation source, not a rule), and `description` (free text
+  an operator may edit; a re-export keeps it). The exporter refuses to export under a set number whose rules have
+  changed. See Nornir's `Training-set-naming` rule.
+- The trainer's `training_data.json` (the run's record of what it saw) names the set the same way; its `set` field is
+  this folder name.
+
+## Models: `v<VERSION>.<EPOCH>`
+
+- `VERSION` is the model's own counter (the `4` in run `sam2_em_v4`). `EPOCH` is the trainer's epoch index as printed in
+  the log and used in `checkpoint_epoch<N>.pt` and `serve_epoch<N>.pt`; it starts at 0, so `v4.0` is the model after
+  the first epoch. State the base when it matters.
+- The weights file stem is the model name: `v4.3.pt` with `v4.3.model.json` beside it. A dot in the stem is fine
+  (`model_manifest.manifest_path` appends `.model.json` to `Path.stem`).
+- The manifest's `model.model_version` is `v<VERSION>.<EPOCH>` and `model.model_id` is `v<VERSION>`. The server's
+  per-model host name follows the id (`v4.segmentation.codepharm.net`) and clients send `model_id` with requests.
+- The sidecar `<stem>.model.json` (`docs/model_manifest.md`) carries a **`description`** field the operator fills in to
+  say what the model is (what changed, what to use it for). The exporter writes it empty and must never overwrite a
+  description that is already there when it re-exports.
+- The model sidecar records the training set separately (`training_data.set`, a set name as above) and never
+  derives one number from the other.
+
+## Existing names stay as they are
+
+Do not rename old files. `v1`, `v1b` (a letter suffix is legacy; do not create new ones), `v3` sets and weights such as
+`sam2_em_v3_epoch_9.pt` or `v2_epoch_8.pt` keep their names; give them a hand-written manifest whose `model_version`
+follows the convention (`v3.9`, `v2.8`).
+
+## Where this is implemented
+
+- Set names: `scripts/WSL/training_data_common.sh` (`version_name_ok`, `version_sort_key`: `v#`, `v#.#`, the old `v1b`,
+  numeric order), tested by `tests/test_training_data_versions.py`.
+- Model names and `description`: `model_manifest.py` (validates `v<VERSION>` / `v<VERSION>.<EPOCH>`) and
+  `export_serve.py` (`--model-id`, `--epoch`, `--description`; keeps an existing description; refuses before loading
+  weights when the version or epoch is unknown). Training writes `best_model.json` (the epoch of `best_model.pt`) so a
+  hand export can name it. The Viking server passes `description` on in `ModelInfo`.
+- Set sidecar: Nornir's `training_set.py` (`CheckTrainingSet` first, `WriteTrainingSetInfo` last in `ExportTrainingData`).
+
+## Status: not done yet
+
+Delete an item when it is done.
+
+- `scripts/NAS/version-bump` and `version-sync` do not check that a volume's `training_set.json` `set_version` equals
+  the set folder they copy it into, or that a revision's `creation_rules_fingerprint` matches its parent's.
+- The trainer's `training_data.json` and the model manifest's `training_data` block do not read each volume's
+  `training_set.json` yet (they fingerprint the manifest, approved and ignore files themselves). Carrying the set's
+  `set_version`, `creation_rules_fingerprint` and `description` into them would make the lineage visible to clients.

@@ -11,6 +11,7 @@ The `.mdc` frontmatter `globs:` line says which paths each rule covers.
 | Rule | Applies to |
 |------|-----------|
 | `.cursor/rules/sam2-pin.mdc` | `docker/Dockerfile` and SAM2 integration (pin `SAM2_GIT_SHA`; tell James when upstream `main` is newer, never unpin silently) |
+| `.cursor/rules/naming-conventions.mdc` | Naming or exporting training sets (`v#.#`) and models (`v<VERSION>.<EPOCH>`), their metadata sidecars (`training_set.json`, `<stem>.model.json` with an operator `description`), `scripts/WSL/**`, `export_serve.py`, `model_manifest.py`, `data_record.py`. Sets and models have separate version numbers; say which one you mean. |
 
 ## Skills (`.cursor/skills/<name>/SKILL.md`)
 

@@ -26,8 +26,10 @@ venv/
 Thumbs.db
 Desktop.ini
 
-# Cursor IDE
-.cursor/
+# Cursor IDE: keep the shared rules and skills (CLAUDE.md links to them); everything else in .cursor/ stays local
+.cursor/*
+!.cursor/rules/
+!.cursor/skills/
 
 # Hypothesis test cache
 .hypothesis/

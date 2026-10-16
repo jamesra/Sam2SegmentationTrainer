@@ -100,7 +100,7 @@ done
 
 if [[ -n "$ver" ]]; then
   if ! version_name_ok "$ver"; then
-    echo "version must look like v1, v1b, or v2 (got ${ver})" >&2
+    echo "version must look like v2 or v2.1, or the old v1b (got ${ver})" >&2
     exit 2
   fi
 else
@@ -122,7 +122,7 @@ fi
 
 if [[ -n "$seed_from" ]]; then
   if ! version_name_ok "$seed_from"; then
-    echo "-seed-from version must look like v1, v1b, or v2 (got ${seed_from})" >&2
+    echo "-seed-from version must look like v2 or v2.1, or the old v1b (got ${seed_from})" >&2
     exit 2
   fi
   if [[ "$seed_from" == "$ver" ]]; then

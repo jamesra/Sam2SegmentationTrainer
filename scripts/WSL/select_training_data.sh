@@ -46,7 +46,7 @@ if [[ -z "$ver" ]]; then
   fi
   echo "selected highest local version ${ver}"
 elif ! version_name_ok "$ver"; then
-  echo "version must look like v1, v1b, or v2 (got ${ver})" >&2
+  echo "version must look like v2 or v2.1, or the old v1b (got ${ver})" >&2
   exit 2
 fi
 

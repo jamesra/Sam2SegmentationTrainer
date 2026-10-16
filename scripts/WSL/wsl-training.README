@@ -16,6 +16,15 @@ Source of truth: Y:\SAM2TrainingData\<version>\<VOL> (the NAS, built with
 version-bump / version-sync). WSL copies are plain ext4 (no reflinks), so every
 version costs its full size.
 
+Version names
+-------------
+A training SET is v<SET> or v<SET>.<REVISION>: v2, v2.1. v2.1 is a repopulated or
+tweaked v2 made with the same creation rules; new creation rules mean a new number
+(v3). Revisions order numerically (v2 < v2.1 < v2.10 < v3). A trailing letter (v1b)
+is the old style: still accepted, do not create new ones. current is a pointer, not
+a version. Models have their own numbers (v<VERSION>.<EPOCH>); see
+.cursor/rules/naming-conventions.mdc.
+
 Review state that must survive a mirror
 ---------------------------------------
 Per volume: approved.json, ignore.json, ignored/ (rejected mask PNGs), and the
@@ -52,7 +61,7 @@ One-time setup
   Errors: (2)/(113) host unreachable; (13) bad user or password.
 
   # Repo scripts (D: drive), strip CRLF that git on Windows may have added
-  cd /mnt/d/src/git/SAM2SegmentationTrainer
+  cd /mnt/d/src/git/Sam2Trainer
   sed -i 's/\r$//' scripts/WSL/*.sh
   chmod +x scripts/WSL/*.sh
 
@@ -62,8 +71,8 @@ One-time setup
   ln -sf "$PWD/scripts/WSL/sync_training_data.sh" ~/bin/sync_training_data.sh
   ln -sf "$PWD/scripts/WSL/select_training_data.sh" ~/bin/select_training_data.sh
   rm -f ~/bin/training_data_common.sh          # a stale copy from before, if any
-  # If the checkout is not at /mnt/d/src/git/SAM2SegmentationTrainer, say where it is:
-  export SAM2_TRAINER_REPO=/mnt/d/src/git/SAM2SegmentationTrainer
+  # If the checkout is not at /mnt/d/src/git/Sam2Trainer, say where it is:
+  export SAM2_TRAINER_REPO=/mnt/d/src/git/Sam2Trainer
 
   # Put these in ~/.bashrc to skip typing them
   export TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData
@@ -80,7 +89,7 @@ Back up the review state first (every time before a mirror)
 
 Mirror a NEW version (example: v3, carrying review state from v2)
 -----------------------------------------------------------------
-  cd /mnt/d/src/git/SAM2SegmentationTrainer
+  cd /mnt/d/src/git/Sam2Trainer
   scripts/WSL/sync_training_data.sh -n -clone-from v2 v3    # dry run, changes nothing
   scripts/WSL/sync_training_data.sh -clone-from v2 v3       # real run, then points current at v3
 

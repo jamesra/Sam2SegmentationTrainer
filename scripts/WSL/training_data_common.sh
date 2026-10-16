@@ -1,19 +1,24 @@
 # Shared helpers for versioned AnnotationCrops mirrors.
 # Source this file; do not execute it.
 
-# v1 < v1b < v2 < v10. Optional single letter after the number.
+# A training SET name: v<SET> or v<SET>.<REVISION> (v2, v2.1). The revision starts at 1, so v2.0 is just v2.
+# A single trailing letter (v1b) is the old style: still accepted, but do not create new ones.
+# These name sets only; a model is v<VERSION>.<EPOCH>, a different number (.cursor/rules/naming-conventions.mdc).
+# Order is numeric: v1 < v1b < v2 < v2.1 < v2.2 < v2.10 < v3 < v10.
+# Groups: 1 = set number, 3 = revision, 4 = old-style letter.
+_VERSION_NAME_RE='^v([0-9]+)(\.([1-9][0-9]*)|([a-zA-Z]))?$'
+
 version_name_ok() {
-  [[ "$1" =~ ^v[0-9]+[a-zA-Z]?$ ]]
+  [[ "$1" =~ $_VERSION_NAME_RE ]]
 }
 
 version_sort_key() {
   local name="$1"
-  if [[ ! "$name" =~ ^v([0-9]+)([a-zA-Z])?$ ]]; then
-    return 1
-  fi
-  local letter="${BASH_REMATCH[2]:-}"
+  [[ "$name" =~ $_VERSION_NAME_RE ]] || return 1
+  local letter="${BASH_REMATCH[4]:-}"
   letter="${letter,,}"
-  printf '%05d%s\n' "${BASH_REMATCH[1]}" "${letter}"
+  # 10# reads the numbers as decimal, so a name such as v08 is not taken for octal.
+  printf '%05d.%05d%s\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[3]:-0}))" "${letter}"
 }
 
 # Print the highest matching version directory name under $1.
@@ -164,12 +169,12 @@ find_trainer_repo() {
     fi
     dir="$(dirname "$dir")"
   done
-  if [[ -f "/mnt/d/src/git/SAM2SegmentationTrainer/${marker}" ]]; then
-    echo "/mnt/d/src/git/SAM2SegmentationTrainer"
+  if [[ -f "/mnt/d/src/git/Sam2Trainer/${marker}" ]]; then
+    echo "/mnt/d/src/git/Sam2Trainer"
     return 0
   fi
-  echo "cannot find the SAM2SegmentationTrainer checkout (no ${marker})." >&2
-  echo "Set SAM2_TRAINER_REPO=/mnt/d/src/git/SAM2SegmentationTrainer and re-run." >&2
+  echo "cannot find the Sam2Trainer checkout (no ${marker})." >&2
+  echo "Set SAM2_TRAINER_REPO=/mnt/d/src/git/Sam2Trainer and re-run." >&2
   return 1
 }
 
