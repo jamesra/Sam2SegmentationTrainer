@@ -410,7 +410,6 @@ def run_throughput_benchmark(
                 containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
                 prompt_foreground=inputs["prompt_fg"],
                 mask_contain_weight=_mask_contain_weight(cfg, 1.0),
-                iou_use_l1=_iou_use_l1(cfg),
                 edge_weight=inputs["edge_weight"],
                 variant_index=inputs["variant_index"],
                 num_samples=images.shape[0],
@@ -795,11 +794,6 @@ def _cap_full_tiles(train_ex: list, cfg: DictConfig) -> list:
     if dropped:
         print(f"fully masked tiles: kept {sum(is_full_tile(e, threshold) for e in capped)}, dropped {dropped} from training")
     return capped
-
-
-def _iou_use_l1(cfg: DictConfig) -> bool:
-    """SAM 2 trains the IoU head with L1 (``iou_use_l1_loss``); ``loss.iou_use_l1: false`` restores MSE."""
-    return bool(OmegaConf.select(cfg, "loss.iou_use_l1", default=True))
 
 
 def _edge_loss_settings(cfg: DictConfig) -> tuple[float, float]:
@@ -1702,7 +1696,6 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     containment_radius=float(cfg.loss.get("containment_radius", 8.0)),
                     prompt_foreground=inputs["prompt_fg"],
                     mask_contain_weight=_mask_contain_weight(cfg, contain_scale),
-                    iou_use_l1=_iou_use_l1(cfg),
                     edge_weight=inputs["edge_weight"],
                     variant_index=inputs["variant_index"],
                     num_samples=images.shape[0],

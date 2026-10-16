@@ -44,7 +44,8 @@ class EvaluateGoalTests(unittest.TestCase):
             written = json.loads((root / "out" / "goal_metrics.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["model"], "zero-shot")
         self.assertEqual(
-            set(written["families"]), {"circle_mask", "correction", "near_correct", "point", "centroid", "circle_mask_noneg"}
+            set(written["families"]),
+            {"circle_mask", "correction", "near_correct", "point", "centroid", "circle_mask_noneg", "circle_annotator"},
         )
         self.assertGreater(written["samples"], 0)
         for family in written["families"].values():

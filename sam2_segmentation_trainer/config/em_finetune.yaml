@@ -110,6 +110,15 @@ prompt:
   circle_annotation_trust:
     full_frac: 0.5    # full -SEED_LOGIT inside this fraction of the TRUE radius
     zero_frac: 0.95   # taper reaches 0 here; the circle claims nothing beyond
+  # Annotator-like circle seeds (docs/circle_annotator_spec.md). The circle_annotator validation family always draws
+  # one with these ranges. prob (the share of TRAINING circle seeds replaced by one) is not used by training yet.
+  # Not part of the prompt encoding: it changes which circles are drawn, not how a prompt is encoded.
+  circle_seed_jitter:
+    prob: 0.7             # share of training circle seeds replaced by an annotator-like circle; 0 disables
+    depth_range: [0.3, 1.0]   # centre depth as a fraction of the target's maximum depth (1 = deepest point)
+    scale_range: [0.45, 1.0]  # radius as a fraction of the maximum depth, before the fit cap
+    fit_grow_px: 10       # the radius may exceed the centre's own depth by this much
+    min_radius_px: 6      # a smaller circle falls back to the inscribed seed
   # Prompt variants decoded per encoded sample. Variant 1 is always the production prompt (a circle seed; with an
   # adjacent-section shape, an adjacent seed with probability prob_adjacent_seed / (prob_adjacent_seed +
   # prob_circle_seed)). The others are drawn from the prob_* mix below without replacement. So the prob_* values
@@ -184,9 +193,7 @@ negative:
 loss:
   focal_weight: 20.0
   dice_weight: 1.0
-  iou_weight: 1.0
-  # true: the IoU head is trained with L1 as in SAM 2 (iou_use_l1_loss). false: squared error.
-  iou_use_l1: true
+  iou_weight: 1.0   # the IoU head is trained with absolute (L1) error, as in SAM 2; there is no other form
   # Hinge penalty for predicting background where a seed said foreground (the seed is a core the engine grows
   # beyond), weighted by the seed's edge confidence. Never applied to masks to correct. 0 disables. Ramps up
   # linearly over containment_warmup_epochs.
@@ -286,9 +293,13 @@ eval:
   #   circle_mask_noneg  the circle seed with every negative region and background point removed: how much the model
   #                 leans on neighbors being sent. Never selects a checkpoint. circle_mask is also split into
   #                 with_neg / no_neg (whether the sample's tile has other annotations).
+  #   circle_annotator  an annotator-like circle seed: a random centre depth and radius (prompt.circle_seed_jitter's
+  #                 ranges; its prob is ignored) instead of the inscribed circle x 0.95, with negatives kept and
+  #                 the same with_neg / no_neg split. Production seeds are drawn by annotators, so this is the
+  #                 harder, truer circle. Never selects a checkpoint.
   # All families of a sample share one image load and one encoder pass (see val:).
   # Validation runs in fp32 like infer.py and interactive.py; its precision should follow the server's inference precision.
-  val_prompts: [circle_mask, correction, near_correct, point, centroid, circle_mask_noneg]
+  val_prompts: [circle_mask, correction, near_correct, point, centroid, circle_mask_noneg, circle_annotator]
   # The prompt whose goal metrics pick best_model.pt and drive early stopping (see val:).
   primary_val_prompt: circle_mask
   grid_every: 10

@@ -19,7 +19,7 @@ from typing import Any, Collection, Mapping, Sequence
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-from annotation_crops.negatives import KIND_CIRCLE, KIND_POLYGON, NegativeRegion
+from annotation_crops.negatives import KIND_CIRCLE, KIND_POLYGON, NegativeRegion, rasterize_circle
 from annotation_crops.prompt_encoding import (
     CORRECTION_LOGIT,
     EDGE_TAU_DEPTH_FRAC,
@@ -76,6 +76,66 @@ def _pair(value: Any) -> tuple[float, float]:
 
 
 @dataclass(frozen=True, slots=True)
+class CircleSeedJitter:
+    """How an annotator-like circle seed differs from the inscribed one (``prompt.circle_seed_jitter``).
+
+    Annotators draw circles that are smaller than the inscribed circle and often off its centre
+    (docs/circle_annotator_spec.md). :func:`annotator_circle` draws one: a centre at a random depth and a random
+    radius. ``prob`` is the share of *training* circle seeds replaced by one; the ``circle_annotator`` validation
+    family ignores it and always draws one.
+    """
+
+    prob: float = 0.7
+    """Share of training circle seeds replaced by an annotator-like circle. 0 disables it and draws nothing."""
+    depth_range: tuple[float, float] = (0.3, 1.0)
+    """Centre depth as a fraction of the target's maximum depth (1 is the deepest point, 0 the edge)."""
+    scale_range: tuple[float, float] = (0.45, 1.0)
+    """Radius as a fraction of the maximum depth, before the fit cap."""
+    fit_grow_px: float = 10.0
+    """The radius may exceed the centre's own depth by this much (annotators fit to the visible membrane)."""
+    min_radius_px: float = 6.0
+    """A smaller circle falls back to the inscribed seed."""
+
+    _KEYS = ("prob", "depth_range", "scale_range", "fit_grow_px", "min_radius_px")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prob", float(self.prob))
+        object.__setattr__(self, "depth_range", _pair(self.depth_range))
+        object.__setattr__(self, "scale_range", _pair(self.scale_range))
+        object.__setattr__(self, "fit_grow_px", float(self.fit_grow_px))
+        object.__setattr__(self, "min_radius_px", float(self.min_radius_px))
+        self.validate()
+
+    def validate(self) -> None:
+        """Raise ValueError when a value is outside its range (``prompt.circle_seed_jitter.*``)."""
+        if not 0.0 <= self.prob <= 1.0:
+            raise ValueError(f"prompt.circle_seed_jitter.prob must be within [0, 1], got {self.prob}")
+        low, high = self.depth_range
+        if not 0.0 < low <= high <= 1.0:
+            raise ValueError(f"prompt.circle_seed_jitter.depth_range must satisfy 0 < low <= high <= 1, got {self.depth_range}")
+        low, high = self.scale_range
+        if not 0.0 < low <= high:
+            raise ValueError(f"prompt.circle_seed_jitter.scale_range must satisfy 0 < low <= high, got {self.scale_range}")
+        if not self.fit_grow_px >= 0.0:
+            raise ValueError(f"prompt.circle_seed_jitter.fit_grow_px must be >= 0, got {self.fit_grow_px}")
+        if not self.min_radius_px >= 1.0:
+            raise ValueError(f"prompt.circle_seed_jitter.min_radius_px must be >= 1, got {self.min_radius_px}")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "CircleSeedJitter":
+        """From a config mapping; a missing key keeps its default, None gives the defaults, an unknown key is refused."""
+        if not values:
+            return cls()
+        unknown = [key for key in values if key not in cls._KEYS]
+        if unknown:
+            raise ValueError(f"unknown prompt.circle_seed_jitter key(s) {unknown}; choose from {list(cls._KEYS)}")
+        return cls(**{key: values[key] for key in cls._KEYS if key in values})
+
+
+DEFAULT_CIRCLE_SEED_JITTER = CircleSeedJitter()
+
+
+@dataclass(frozen=True, slots=True)
 class PromptConfig:
     """Sampling settings from the ``prompt:`` and ``negative:`` sections of the training config."""
 
@@ -93,6 +153,7 @@ class PromptConfig:
     seed_logit: float = SEED_LOGIT
     correction_logit: float = CORRECTION_LOGIT
     circle_annotation_trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST
+    circle_seed_jitter: CircleSeedJitter = DEFAULT_CIRCLE_SEED_JITTER
     adjacent_fit_inside: float = 0.98
     adjacent_fit_grow_px: float = 10.0
     adjacent_scale_range: tuple[float, float] = (0.7, 1.0)
@@ -143,6 +204,7 @@ class PromptConfig:
             raise ValueError("prompt.box_points_max must be >= 1")
         if self.variants_per_sample < 1:
             raise ValueError("prompt.variants_per_sample must be >= 1")
+        self.circle_seed_jitter.validate()
         if self.edge_tau_px < 0.0:
             raise ValueError("prompt.edge_tau_px must be >= 0 (0 disables the edge curve)")
         if self.seed_logit <= 0.0 or self.correction_logit <= 0.0:
@@ -197,6 +259,8 @@ class PromptConfig:
             raw = merged[name]
             if isinstance(default, CircleAnnotationTrust):
                 kwargs[name] = CircleAnnotationTrust.from_mapping(raw)  # raises on full_frac >= zero_frac
+            elif isinstance(default, CircleSeedJitter):
+                kwargs[name] = CircleSeedJitter.from_mapping(raw)  # raises on an inverted range or an unknown key
             elif isinstance(default, tuple):
                 kwargs[name] = _pair(raw)
             elif isinstance(default, bool):
@@ -293,6 +357,59 @@ def _padded_depth(mask: np.ndarray) -> np.ndarray:
     if box is not None:
         depth[box] = distance_transform_edt(np.pad(mask[box], 1))[1:-1, 1:-1]
     return depth
+
+
+def target_depth(target: np.ndarray) -> np.ndarray:
+    """Distance of each pixel of the boolean ``target`` to the nearest background pixel, the tile edge counted as
+    background (0 outside the target). Pass it to :func:`annotator_circle` when several circles are drawn for one
+    target, so the distance transform is done once."""
+    return _padded_depth(np.asarray(target, dtype=bool))
+
+
+def annotator_circle(
+    target: np.ndarray,
+    rng: np.random.Generator,
+    cfg: CircleSeedJitter,
+    depth: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Boolean disc for an annotator-like circle seed inside the boolean ``target``, or None (the caller keeps the
+    inscribed seed).
+
+    The centre is a target pixel at a random depth (``cfg.depth_range``, as a fraction of the target's maximum depth)
+    and the radius a random fraction of that maximum (``cfg.scale_range``), capped at the centre's own depth plus
+    ``cfg.fit_grow_px``. Depth is measured with the tile edge counted as background, like the edge weights.
+
+    Draws from ``rng`` in a fixed order: the depth, then the centre, then the scale. Tests pin that order; do not
+    reorder it. Returns None for an empty target and when the radius falls below ``cfg.min_radius_px``.
+
+    ``depth`` is :func:`target_depth` of ``target`` when the caller already has it (it saves a distance transform);
+    it does not change what is drawn.
+    """
+    mask = np.asarray(target, dtype=bool)
+    if not mask.any():
+        return None
+    if depth is None:
+        depth = _padded_depth(mask)
+    deepest = float(depth.max())
+    if deepest <= 0.0:
+        return None
+    wanted = rng.uniform(cfg.depth_range[0], cfg.depth_range[1])
+    gap = np.abs(depth / deepest - wanted)
+    candidates = np.flatnonzero((mask & (gap <= _CENTRE_DEPTH_TOLERANCE)).ravel())
+    if candidates.size == 0:
+        # No pixel at that depth (a thin or small target): the pixel(s) nearest to it.
+        gap = np.where(mask, gap, np.inf)
+        candidates = np.flatnonzero((gap == gap.min()).ravel())
+    row, col = divmod(int(candidates[rng.integers(candidates.size)]), mask.shape[1])
+    scale = rng.uniform(cfg.scale_range[0], cfg.scale_range[1])
+    radius = min(scale * deepest, float(depth[row, col]) + cfg.fit_grow_px)
+    if radius < cfg.min_radius_px:
+        return None
+    return rasterize_circle(mask.shape, col + 0.5, row + 0.5, radius)
+
+
+_CENTRE_DEPTH_TOLERANCE = 0.05
+"""How far, as a fraction of the maximum depth, a candidate centre's depth may be from the drawn depth."""
 
 
 def interior_point_xy(mask: np.ndarray) -> tuple[float, float] | None:

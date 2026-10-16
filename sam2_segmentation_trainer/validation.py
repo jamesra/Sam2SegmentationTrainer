@@ -51,12 +51,14 @@ from sam2_segmentation_trainer.metrics import boundary_f1_multi, iou_dice_pr, to
 from sam2_segmentation_trainer.model import predict_masks, predict_masks_mixed
 from sam2_segmentation_trainer.overlays import denorm_preview, overlay_panel
 
-DEFAULT_VAL_PROMPTS = ("circle_mask", "correction", "near_correct", "point", "centroid", "circle_mask_noneg")
+DEFAULT_VAL_PROMPTS = (
+    "circle_mask", "correction", "near_correct", "point", "centroid", "circle_mask_noneg", "circle_annotator",
+)
 """Validation prompts when ``eval.val_prompts`` is unset: the production circle seed, a mask to correct, a
-near-correct mask ("do no harm"), the interior point, the legacy centroid, and the circle seed without negative
-context (a diagnostic; it never selects a checkpoint)."""
+near-correct mask ("do no harm"), the interior point, the legacy centroid, the circle seed without negative
+context and an annotator-like circle seed (both diagnostics; neither selects a checkpoint)."""
 
-NEG_SPLIT_PROMPTS = ("circle_mask", "circle_mask_noneg")
+NEG_SPLIT_PROMPTS = ("circle_mask", "circle_mask_noneg", "circle_annotator")
 """Circle-seed families whose results are also split by whether the sample has negative context (``with_neg`` and
 ``no_neg``)."""
 

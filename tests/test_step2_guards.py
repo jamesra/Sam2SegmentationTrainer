@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
+from omegaconf import OmegaConf
 
 from annotation_crops.negatives import load_circle_scale
 from sam2_segmentation_trainer.data.manifest import index_volumes
@@ -86,24 +87,39 @@ class CircleFileGuardTests(unittest.TestCase):
 
 
 class IouLossTests(unittest.TestCase):
-    def test_l1_and_mse_differ_as_expected(self) -> None:
-        pred = torch.full((1, 4, 4), 10.0)
+    def test_the_iou_head_loss_is_the_absolute_error(self) -> None:
+        pred = torch.full((1, 4, 4), 10.0)  # every pixel predicted foreground, and the target is all foreground: IoU 1
         target = torch.ones(1, 4, 4)
         iou_preds = torch.tensor([[0.5]])
-        l1 = iou_prediction_loss_per_sample(pred, target, iou_preds, use_l1=True)
-        mse = iou_prediction_loss_per_sample(pred, target, iou_preds, use_l1=False)
-        self.assertAlmostEqual(float(l1), 0.5, places=5)
-        self.assertAlmostEqual(float(mse), 0.25, places=5)
+        loss = iou_prediction_loss_per_sample(pred, target, iou_preds)
+        self.assertAlmostEqual(float(loss), 0.5, places=5)  # |0.5 - 1|, not (0.5 - 1) ** 2 = 0.25
 
-    def test_combined_loss_passes_the_flag(self) -> None:
+    def test_an_error_above_one_costs_its_size_not_its_square(self) -> None:
+        pred = torch.full((2, 4, 4), 10.0)
+        target = torch.ones(2, 4, 4)
+        loss = iou_prediction_loss_per_sample(pred, target, torch.tensor([[0.2], [0.9]]))
+        self.assertAlmostEqual(float(loss[0]), 0.8, places=5)  # a squared error would be 0.64
+        self.assertAlmostEqual(float(loss[1]), 0.1, places=5)  # a squared error would be 0.01
+        # Linear: the badly wrong sample costs 8x the nearly right one, not 64x.
+        self.assertAlmostEqual(float(loss[0] / loss[1]), 8.0, places=3)
+
+    def test_combined_loss_uses_it_with_weight_one(self) -> None:
         pred = torch.zeros(2, 4, 4)
         target = torch.ones(2, 4, 4)
         iou_preds = torch.full((2, 1), 0.9)
         kwargs = dict(focal_weight=0.0, dice_weight=0.0, iou_weight=1.0)
-        loss_l1, _ = combined_loss(pred, target, iou_preds, iou_use_l1=True, **kwargs)
-        loss_mse, _ = combined_loss(pred, target, iou_preds, iou_use_l1=False, **kwargs)
-        self.assertAlmostEqual(float(loss_l1), 0.9, places=5)
-        self.assertAlmostEqual(float(loss_mse), 0.81, places=5)
+        loss, stats = combined_loss(pred, target, iou_preds, **kwargs)
+        self.assertAlmostEqual(float(loss), 0.9, places=5)  # |0.9 - 0|: the prediction is all background, IoU 0
+        self.assertAlmostEqual(float(stats["loss_iou"]), 0.9, places=5)
+
+    def test_there_is_no_switch_back_to_squared_error(self) -> None:
+        import inspect
+
+        self.assertNotIn("use_l1", inspect.signature(iou_prediction_loss_per_sample).parameters)
+        self.assertNotIn("iou_use_l1", inspect.signature(combined_loss).parameters)
+        cfg = OmegaConf.load(Path(__file__).resolve().parent.parent / "sam2_segmentation_trainer" / "config" / "em_finetune.yaml")
+        self.assertNotIn("iou_use_l1", cfg.loss)
+        self.assertEqual(float(cfg.loss.iou_weight), 1.0)
 
 
 class PromptMixTests(unittest.TestCase):

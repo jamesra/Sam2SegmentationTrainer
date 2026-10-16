@@ -34,11 +34,13 @@ from sam2_segmentation_trainer.data.prompts import (
     PromptConfig,
     PromptType,
     FULL_TILE_PROMPTS,
+    annotator_circle,
     build_prompt,
     choose_prompt_type,
     negative_region_canvases,
     inscribed_circle_xyr,
     interior_point_xy,
+    target_depth,
 )
 from sam2_segmentation_trainer.data.fulltile import is_full_tile
 from sam2_segmentation_trainer.goal_metrics import MIN_COMPONENT_PX, ground_truth_terms
@@ -53,10 +55,15 @@ from sam2_segmentation_trainer.data.weights import (
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-VAL_PROMPTS = ("centroid", "point", "circle_mask", "correction", "near_correct", "circle_mask_noneg")
+VAL_PROMPTS = (
+    "centroid", "point", "circle_mask", "correction", "near_correct", "circle_mask_noneg", "circle_annotator",
+)
 """Validation prompts: the legacy mask centroid, the deepest interior point, the inscribed circle seed
-(production), a mask to correct, a near-correct mask (the "do no harm" check) and the circle seed with every
-negative region and background point removed (how much the model leans on neighbors being sent)."""
+(production), a mask to correct, a near-correct mask (the "do no harm" check), the circle seed with every
+negative region and background point removed (how much the model leans on neighbors being sent) and an
+annotator-like circle seed (a random centre depth and radius, see ``annotator_circle``).
+
+New families go at the END: a family's number is its position, and its prompt seed uses that number."""
 
 VAL_FAMILY_CODES = {name: code for code, name in enumerate(VAL_PROMPTS)}
 """A fixed number per validation family, so a family's prompt seed does not depend on which families run."""
@@ -66,14 +73,18 @@ VAL_MIXED_TYPES = {
     "correction": PromptType.CORRECTION,
     "near_correct": PromptType.NEAR_CORRECT,
     "circle_mask_noneg": PromptType.CIRCLE_SEED,
+    "circle_annotator": PromptType.CIRCLE_SEED,
 }
 """Validation prompts that go through the mixed pipeline, and the prompt family each forces."""
 
 NO_NEGATIVE_PROMPTS = frozenset({"circle_mask_noneg"})
 """Validation prompts whose prompt carries no negative context (the loss weights and metrics still see the neighbors)."""
 
-CIRCLE_PROMPTS = frozenset({"circle_mask", "circle_mask_noneg"})
+CIRCLE_PROMPTS = frozenset({"circle_mask", "circle_mask_noneg", "circle_annotator"})
 """Validation prompts that need the target's circle."""
+
+FAMILIES_ONLY_PROMPTS = frozenset({"circle_annotator"})
+"""Validation prompts built only by the families path (``val_families``): the one-prompt path has no such prompt."""
 
 
 class MissingTileFlag:
@@ -270,6 +281,11 @@ class EMSegDataset(Dataset):
     ):
         if val_prompt is not None and val_prompt not in VAL_PROMPTS:
             raise ValueError(f"val_prompt must be one of {VAL_PROMPTS}, got {val_prompt!r}")
+        if val_prompt in FAMILIES_ONLY_PROMPTS:
+            raise ValueError(
+                f"val_prompt {val_prompt!r} is only available as a family: pass val_families=[{val_prompt!r}] "
+                "(the one-prompt path would score it as a plain circle_mask)"
+            )
         families = tuple(dict.fromkeys(val_families or ()))
         unknown = [f for f in families if f not in VAL_PROMPTS]
         if unknown:
@@ -444,10 +460,21 @@ class EMSegDataset(Dataset):
         variants: list[dict[str, Any]] = []
         for family in self.val_families:
             if family in VAL_MIXED_TYPES:
+                family_circle = circle_aug
+                if family == "circle_annotator":
+                    # An annotator-like circle (always: ``prob`` is a training setting). Its own generator, so no other
+                    # family's draws move; None (too small, empty) keeps the inscribed seed.
+                    disc = annotator_circle(
+                        target_aug,
+                        np.random.default_rng([self.seed, sample_id, VAL_FAMILY_CODES[family], 2]),
+                        prompt_cfg.circle_seed_jitter,
+                    )
+                    if disc is not None:
+                        family_circle = disc
                 prompt = build_prompt(
                     VAL_MIXED_TYPES[family],
                     target_mask=target_aug,
-                    circle_mask=circle_aug,
+                    circle_mask=family_circle,
                     regions=[] if family in NO_NEGATIVE_PROMPTS else regions_aug,
                     cfg=prompt_cfg,
                     rng=np.random.default_rng([self.seed, sample_id, VAL_FAMILY_CODES[family]]),
@@ -649,12 +676,29 @@ class EMSegDataset(Dataset):
         )
         # Negative-context dropout applies to training variants after the first (variant 0 is the production prompt).
         train_dropout = forced is None and self.split == "train"
+        # Annotator-like circle seeds (docs/circle_annotator_spec.md): a share of the training circle seeds, variant 0
+        # included, are replaced by a disc at a random depth and size. Never in validation or a forced prompt.
+        jitter = prompt_cfg.circle_seed_jitter
+        jitter_on = train_dropout and jitter.prob > 0.0
+        depth = None  # the target's distance transform, done once for however many circles are drawn
         variants: list[dict[str, Any]] = []
         for k, kind in enumerate(types):
+            circle_k = circle_aug
+            jittered = False
+            if jitter_on and kind in (PromptType.CIRCLE_SEED, PromptType.ADJACENT_SEED):
+                # Its own generator (the trailing 2), so no other draw moves; prob 0 never gets here and draws nothing.
+                # An adjacent seed that cannot be fitted falls back to a circle, which is then this circle.
+                jrng = np.random.default_rng([self.seed, epoch, int(index), k, 2])
+                if jrng.random() < jitter.prob:
+                    if depth is None:
+                        depth = target_depth(target_aug)
+                    disc = annotator_circle(target_aug, jrng, jitter, depth)
+                    if disc is not None:
+                        circle_k, jittered = disc, True
             prompt = build_prompt(
                 kind,
                 target_mask=target_aug,
-                circle_mask=circle_aug,
+                circle_mask=circle_k,
                 regions=[] if no_negatives else regions_aug,
                 cfg=prompt_cfg,
                 rng=np.random.default_rng([self.seed, epoch, int(index), k]),
@@ -677,6 +721,8 @@ class EMSegDataset(Dataset):
                         None if prompt.input_mask is None else torch.from_numpy(prompt.input_mask.astype(np.uint8))
                     ),
                     "prompt_type": prompt.prompt_type.value,
+                    # Whether the circle this variant was given is an annotator-like one (False for other families).
+                    "circle_jittered": jittered and prompt.prompt_type is PromptType.CIRCLE_SEED,
                 }
             )
         meta = SampleMeta(

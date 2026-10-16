@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
-from sam2_segmentation_trainer.data.dataset import VAL_PROMPTS, EMSegDataset, collate_em
+from sam2_segmentation_trainer.data.dataset import FAMILIES_ONLY_PROMPTS, VAL_PROMPTS, EMSegDataset, collate_em
 from sam2_segmentation_trainer.data.manifest import index_volumes
 from sam2_segmentation_trainer.data.prompts import PromptConfig
 from sam2_segmentation_trainer.data.splits import load_split
@@ -26,6 +26,10 @@ from sam2_segmentation_trainer.metrics import boundary_f1, iou_dice_pr, summariz
 from sam2_segmentation_trainer.overlays import denorm_preview, overlay_panel
 from sam2_segmentation_trainer.paths import data_root, output_root, pretrained_checkpoint
 from sam2_segmentation_trainer.validation import DEFAULT_VAL_PROMPTS, predict_batch
+
+PER_PROMPT_DEFAULTS = tuple(p for p in DEFAULT_VAL_PROMPTS if p not in FAMILIES_ONLY_PROMPTS)
+"""Prompts the one-prompt-at-a-time evaluation scores by default. Families that only the validation suite builds
+(``circle_annotator``) are left out; ``--goal`` scores them."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +51,7 @@ class EvalRequest:
     grid_every: int
     max_grids: int
     num_workers: int
-    prompts: tuple[str, ...] = DEFAULT_VAL_PROMPTS
+    prompts: tuple[str, ...] = PER_PROMPT_DEFAULTS
     noc: bool = False
     noc_max_clicks: int = 20
     noc_target_iou: float = 0.9
@@ -182,6 +186,9 @@ def evaluate(request: EvalRequest) -> dict:
     unknown = [p for p in request.prompts if p not in VAL_PROMPTS]
     if unknown:
         raise ValueError(f"unknown prompt(s) {unknown}; choose from {list(VAL_PROMPTS)}")
+    families_only = [p for p in request.prompts if p in FAMILIES_ONLY_PROMPTS]
+    if families_only:
+        raise ValueError(f"{families_only} are scored only by --goal (the trainer's validation suite)")
     examples = index_volumes(volumes=request.volumes, root=request.data_dir, skip_missing=True)
     split = load_split(request.split_path)
     _train_ex, val_ex = split.partition(examples)
@@ -256,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--prompts",
-        default=",".join(DEFAULT_VAL_PROMPTS),
+        default=",".join(PER_PROMPT_DEFAULTS),
         help=f"Comma-separated validation prompts from {list(VAL_PROMPTS)}",
     )
     parser.add_argument(

@@ -401,18 +401,19 @@ def iou_prediction_loss_per_sample(
     target: torch.Tensor,
     iou_preds: torch.Tensor,
     *,
-    use_l1: bool = False,
     weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-sample IoU-head loss (shape ``[B]``): squared error, or absolute error with ``use_l1`` (SAM 2).
+    """Per-sample IoU-head loss (shape ``[B]``): the absolute error between the predicted IoU and the true one.
+
+    Absolute (L1) error, as in SAM 2's training (``iou_use_l1_loss: true``): it is the only form, there is no switch
+    back to squared error. L1 does not let a few badly mispredicted samples dominate the term the way a square does.
 
     With an edge ``weight`` the target IoU ignores pixels whose weight is below 0.5, matching tolerant validation.
     """
     with torch.no_grad():
         gt_iou = tolerant_iou_target(pred, target, weight)
     iou_head = iou_preds[:, 0] if iou_preds.ndim > 1 else iou_preds
-    error = iou_head.float() - gt_iou
-    return error.abs() if use_l1 else error.pow(2)
+    return (iou_head.float() - gt_iou).abs()
 
 
 def iou_prediction_loss(
@@ -472,7 +473,6 @@ def combined_loss(
     containment_radius: float = 8.0,
     prompt_foreground: torch.Tensor | None = None,
     mask_contain_weight: float = 0.0,
-    iou_use_l1: bool = False,
     edge_weight: torch.Tensor | None = None,
     variant_index: torch.Tensor | None = None,
     num_samples: int | None = None,
@@ -506,7 +506,7 @@ def combined_loss(
     loss_focal_ps = focal_loss_per_sample(pred, target, weight=edge_weight)
     loss_dice_ps = dice_loss(pred, target, edge_weight)
     loss_iou_ps = iou_prediction_loss_per_sample(
-        pred, target, iou_preds, use_l1=iou_use_l1, weight=edge_weight
+        pred, target, iou_preds, weight=edge_weight
     )
     sample_losses = (
         float(focal_weight) * loss_focal_ps
