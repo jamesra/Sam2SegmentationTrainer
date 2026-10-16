@@ -135,8 +135,11 @@ def export_serve_checkpoint(
     ``model_id`` says otherwise, and ``epoch`` is the trainer's epoch index of these weights (read from
     ``best_model.json`` beside a ``best_model.pt`` when omitted).
 
-    ``description`` is the operator's text about the model. When omitted, a description already in the manifest at
-    ``out`` is kept, so re-exporting never erases what someone wrote.
+    ``model_id``, ``display_name`` and ``description`` are each taken from the first source that has one: the
+    argument, ``run_dir/model.json``, then (``description`` only) the manifest already at ``out``, so re-exporting
+    never erases what someone wrote, then a value inferred from the run (the id from the run name, the display name
+    from the id, a description naming the run and its training set). When ``run_dir/model.json`` does not exist it is
+    written with those defaults, for the operator to edit; an existing one is never touched.
 
     Raises:
         ValueError: The model version or the epoch cannot be told. Checked before any weights are loaded.
@@ -156,11 +159,12 @@ def export_serve_checkpoint(
 
     run_dir = Path(finetuned).parent if run_dir is None else Path(run_dir)
     run_name = _run_name(run_dir)
-    resolved_id = model_id or model_id_for_run(run_name)
+    from_file = model_file_info(run_dir)
+    resolved_id = model_id or from_file.get("model_id") or model_id_for_run(run_name)
     if resolved_id is None or not MODEL_ID_RE.match(resolved_id):
         raise ValueError(
             f"cannot tell the model version from run {run_name!r} / model id {model_id!r}: "
-            f"pass --model-id v<VERSION>, for example v4"
+            f"pass --model-id v<VERSION>, for example v4, or set model_id in {run_dir / MODEL_FILE}"
         )
     if epoch is None:
         epoch = best_epoch(Path(finetuned))
@@ -170,23 +174,37 @@ def export_serve_checkpoint(
             "(a best_model.pt export reads best_model.json beside it, which runs started after the naming convention write)"
         )
 
+    training_data = read_data_record(run_dir) or UNKNOWN_DATA
+    sidecar = manifest_path(out)
+    defaults = {
+        "model_id": resolved_id,
+        "display_name": resolved_id,
+        "description": inferred_description(run_name, training_data),
+    }
+    resolved_name = display_name or from_file.get("display_name") or defaults["display_name"]
+    resolved_description = (
+        description
+        if description is not None
+        else from_file.get("description") or kept_description(sidecar) or defaults["description"]
+    )
+
     model = load_finetuned_model(finetuned, base_ckpt, model_cfg, device)
     metadata = serve_metadata(circle_diameter_scale, run_dir)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict(), "prompt_encoding": metadata}, out)
     write_record(sidecar_path(out), metadata)
-    sidecar = manifest_path(out)
+    write_model_file(run_dir, {**defaults, **from_file})
     write_manifest(
         sidecar,
         build_manifest(
             model_id=resolved_id,
             model_version=model_version_name(resolved_id, epoch),
             encoding=metadata,
-            training_data=read_data_record(run_dir) or UNKNOWN_DATA,
+            training_data=training_data,
             run=run_name,
             epoch=epoch,
-            display_name=display_name,
-            description=description if description is not None else kept_description(sidecar),
+            display_name=resolved_name,
+            description=resolved_description,
             base_checkpoint=Path(base_ckpt).name,
         ),
     )
@@ -220,6 +238,61 @@ def kept_description(manifest_file: Path) -> str:
     except (OSError, UnicodeError, ValueError, KeyError, TypeError):
         return ""
     return text if isinstance(text, str) else ""
+
+
+MODEL_FILE = "model.json"
+"""Operator-editable ``model_id``, ``display_name`` and ``description`` in the run folder (see :func:`model_file_info`)."""
+
+_MODEL_FILE_KEYS = ("model_id", "display_name", "description")
+
+
+def model_file_info(run_dir: Path) -> dict[str, str]:
+    """The non-empty text values of ``model_id``, ``display_name`` and ``description`` in ``run_dir/model.json``.
+
+    A missing or unreadable file gives an empty dict; any other key in the file is ignored.
+    """
+    import json
+
+    try:
+        record = json.loads((Path(run_dir) / MODEL_FILE).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(record, dict):
+        return {}
+    return {key: record[key] for key in _MODEL_FILE_KEYS if isinstance(record.get(key), str) and record[key].strip()}
+
+
+def inferred_description(run_name: str, training_data: dict[str, Any]) -> str:
+    """A factual default description from the run name and its data record; the operator is meant to replace it.
+
+    It carries nothing that changes between epochs, so one ``model.json`` stays true for every export of the run.
+    """
+    text = f"Run {run_name}"
+    data_set = training_data.get("set")
+    if data_set and data_set != "unknown":
+        volumes = sorted(training_data.get("volumes") or [])
+        text += f", trained on training set {data_set}" + (f" ({', '.join(volumes)})" if volumes else "")
+    return text + "."
+
+
+def write_model_file(run_dir: Path, info: dict[str, str]) -> Path | None:
+    """Write ``info`` to ``run_dir/model.json`` unless the file exists; return its path when written.
+
+    Nothing is written when ``run_dir`` is not a folder. The file is created exclusively, so two exports finishing
+    together cannot overwrite what the operator has edited.
+    """
+    import json
+
+    path = Path(run_dir) / MODEL_FILE
+    if not Path(run_dir).is_dir():
+        return None
+    try:
+        with open(path, "x", encoding="utf-8") as handle:
+            json.dump({key: info[key] for key in _MODEL_FILE_KEYS}, handle, indent=2)
+            handle.write("\n")
+    except FileExistsError:
+        return None
+    return path
 
 
 def _run_name(run_dir: Path) -> str:
@@ -308,13 +381,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
     parser.add_argument(
-        "--model-id", default=None, help="Model id v<VERSION> (default: from the run name, sam2_em_v4 is v4)"
+        "--model-id", default=None, help="Model id v<VERSION> (default: model_id in the run's model.json, else the run name: sam2_em_v4 is v4)"
     )
-    parser.add_argument("--display-name", default=None, help="Human-readable model name for the manifest")
+    parser.add_argument("--display-name", default=None, help="Human-readable model name for the manifest (default: display_name in model.json, else the model id)")
     parser.add_argument(
         "--description",
         default=None,
-        help="What this model is, for the manifest. Omit to keep the description already in the manifest at --out",
+        help="What this model is, for the manifest. Default: description in the run's model.json, else the one already in the manifest at --out, else one inferred from the run",
     )
     parser.add_argument("--epoch", type=int, default=None, help="Epoch the weights come from, for the model version")
     parser.add_argument(

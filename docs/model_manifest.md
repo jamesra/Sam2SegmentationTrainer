@@ -28,7 +28,7 @@ warning.
 | (top) | `schema_version` | `1` |
 | `model` | `model_id` | The model's version number, `v<VERSION>`: `v4`. Clients send it with requests; the server refuses a mismatch. Not the training data's number. |
 | | `model_version` | One export of that model, `v<VERSION>.<EPOCH>`: `v4.3`, the trainer's epoch index counted from 0. |
-| | `description` | What the model is: what changed, what to use it for. **The operator writes it.** The exporter starts it empty and keeps what is there when it re-exports. The server reports it to clients. |
+| | `description` | What the model is: what changed, what to use it for. **The operator writes it.** Edit it in `<run>/model.json` (below); the exporter infers a first draft and never overwrites your edit. The server reports it to clients. |
 | | `display_name`, `exported_at`, `run`, `epoch`, `base_checkpoint` | Informational. |
 | `training_data` | `set`, `requested`, `fingerprint`, `volumes`, `train_examples`, `val_examples`, `split_seed` | Copied from the run's `training_data.json` (`data_record.py`). **The data version, kept apart from the model version.** `set` is the data folder (`v3`), `fingerprint` hashes the manifest, approved and ignore files. |
 | `code` | `trainer_git_sha`, `prompt_encoding` | What built the export. |

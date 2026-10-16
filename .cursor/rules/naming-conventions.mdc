@@ -46,8 +46,9 @@ leading `v`, so **always say which one you mean**: "set v3", "model v4.3", in ch
 - The manifest's `model.model_version` is `v<VERSION>.<EPOCH>` and `model.model_id` is `v<VERSION>`. The server's
   per-model host name follows the id (`v4.segmentation.codepharm.net`) and clients send `model_id` with requests.
 - The sidecar `<stem>.model.json` (`docs/model_manifest.md`) carries a **`description`** field the operator fills in to
-  say what the model is (what changed, what to use it for). The exporter writes it empty and must never overwrite a
-  description that is already there when it re-exports.
+  say what the model is (what changed, what to use it for). The operator's source is **<run>/model.json** (model_id,
+  display_name, description); the exporter writes it with inferred defaults the first time and never overwrites it, and
+  an export never overwrites a description already in a sidecar. Precedence: argument, model.json, existing sidecar, inferred.
 - The model sidecar records the training set separately (`training_data.set`, a set name as above) and never
   derives one number from the other.
 
@@ -62,7 +63,7 @@ follows the convention (`v3.9`, `v2.8`).
 - Set names: `scripts/WSL/training_data_common.sh` (`version_name_ok`, `version_sort_key`: `v#`, `v#.#`, the old `v1b`,
   numeric order), tested by `tests/test_training_data_versions.py`.
 - Model names and `description`: `model_manifest.py` (validates `v<VERSION>` / `v<VERSION>.<EPOCH>`) and
-  `export_serve.py` (`--model-id`, `--epoch`, `--description`; keeps an existing description; refuses before loading
+  `export_serve.py` (`--model-id`, `--epoch`, `--display-name`, `--description`; reads/writes `<run>/model.json`; refuses before loading
   weights when the version or epoch is unknown). Training writes `best_model.json` (the epoch of `best_model.pt`) so a
   hand export can name it. The Viking server passes `description` on in `ModelInfo`.
 - Set sidecar: Nornir's `training_set.py` (`CheckTrainingSet` first, `WriteTrainingSetInfo` last in `ExportTrainingData`).
