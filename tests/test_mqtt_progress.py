@@ -15,7 +15,9 @@ from sam2_segmentation_trainer.mqtt_progress import (
     _Publishers,
     _load_publishers,
     format_batch_samples,
+    format_high_loss_samples,
     format_ranked_samples,
+    viking_url,
 )
 
 
@@ -161,6 +163,41 @@ class MqttProgressTests(unittest.TestCase):
             "RPC1/b#2, RC2/c#3, RC1/a#1 loss=(4.2000, 1.1000, 0.5000)",
         )
 
+    def test_viking_url_fills_the_template(self) -> None:
+        item = {"volume": "RPC2", "image_key": "k", "location_id": 111513}
+        self.assertEqual(
+            viking_url(item, "viking://open?volumeName={volume}&location={id}"),
+            "viking://open?volumeName=RPC2&location=111513",
+        )
+        with patch.dict("os.environ", {"SAM2_VIKING_URL": "", "GALLERY_VIKING_URL": ""}):
+            self.assertEqual(
+                viking_url(item), "https://connectomes.utah.edu/connectome/RPC2#locationID=111513"
+            )
+        with patch.dict("os.environ", {"SAM2_VIKING_URL": "", "GALLERY_VIKING_URL": "https://v/{volume}/{id}"}):
+            self.assertEqual(viking_url(item), "https://v/RPC2/111513")
+
+    def test_high_loss_samples_keep_only_those_over_the_threshold_one_line_per_location(self) -> None:
+        meta = [
+            {"volume": "RPC2", "image_key": "a", "location_id": 7},
+            {"volume": "RPC2", "image_key": "a", "location_id": 7},
+            {"volume": "RC1", "image_key": "b", "location_id": 8},
+            {"volume": "RC1", "image_key": "c", "location_id": 9},
+        ]
+        text = format_high_loss_samples(meta, [60.0, 258.0, 12.0, 1.0], 10.0, template="U/{volume}/{id}")
+        self.assertEqual(
+            text,
+            "RPC2/a#7 loss=258.0000, 60.0000 U/RPC2/7 | RC1/b#8 loss=12.0000 U/RC1/8",
+        )
+
+    def test_high_loss_samples_name_the_worst_one_when_none_reaches_the_threshold(self) -> None:
+        meta = [
+            {"volume": "RC1", "image_key": "a", "location_id": 1},
+            {"volume": "RC1", "image_key": "b", "location_id": 2},
+        ]
+        text = format_high_loss_samples(meta, [3.0, 5.0], 10.0, template="U/{id}")
+        self.assertEqual(text, "RC1/b#2 loss=5.0000 U/2")
+        self.assertEqual(format_high_loss_samples([], [], 10.0), "(no meta)")
+
     def test_anomaly_monitor_warns_on_slow_and_errors_on_high_loss(self) -> None:
         log_err = Mock()
         progress = TrainingProgress(
@@ -225,9 +262,10 @@ class MqttProgressTests(unittest.TestCase):
         self.assertIn("ERROR high loss", high[0])
         self.assertIn("7.2300", high[0])
         self.assertIn(
-            "samples=RPC1/bad#99, RC1/good#1 loss=(14.0000, 0.4000)",
+            "samples=RPC1/bad#99 loss=14.0000 https://connectomes.utah.edu/connectome/RPC1#locationID=99",
             high[0],
         )
+        self.assertNotIn("RC1/good#1", high[0])
         self.assertTrue(log_err.call_args_list[-1].args[0].startswith("ERROR "))
         self.assertFalse(log_err.call_args_list[-1].args[0].startswith("WARN "))
 

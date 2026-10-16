@@ -18,6 +18,9 @@ from typing import Any
 from sam2_segmentation_trainer.data.meta import SampleMeta, format_sample_label
 
 PIPELINE = "sam2-em-train"
+# Same template the annotation gallery uses (GALLERY_VIKING_URL); {volume} and {id} are filled in.
+DEFAULT_VIKING_URL = "https://connectomes.utah.edu/connectome/{volume}#locationID={id}"
+_VIKING_URL_ENVS = ("SAM2_VIKING_URL", "GALLERY_VIKING_URL")
 _RUN_ID_ENV = "NORNIR_RUN_ID"
 _LOAD_PUBLISHERS = object()
 
@@ -30,6 +33,18 @@ def _sample_label(item: Mapping[str, Any] | SampleMeta) -> str:
         item.get("image_key", "?"),
         item.get("location_id", "?"),
     )
+
+
+def viking_url(item: Mapping[str, Any] | SampleMeta, template: str | None = None) -> str:
+    """Viking link to a sample's location. ``template`` defaults to the environment, then the web viewer."""
+    if template is None:
+        template = next((os.environ[k].strip() for k in _VIKING_URL_ENVS if os.environ.get(k, "").strip()), "")
+    template = template or DEFAULT_VIKING_URL
+    if isinstance(item, SampleMeta):
+        volume, location_id = item.volume, item.location_id
+    else:
+        volume, location_id = item.get("volume", "?"), item.get("location_id", "?")
+    return template.replace("{volume}", str(volume)).replace("{id}", str(location_id))
 
 
 def format_batch_samples(
@@ -71,6 +86,37 @@ def format_ranked_samples(
     return text
 
 
+def format_high_loss_samples(
+    meta: Sequence[Mapping[str, Any]],
+    sample_losses: Sequence[float],
+    threshold: float,
+    *,
+    max_samples: int = 8,
+    template: str | None = None,
+) -> str:
+    """The samples whose own loss reaches ``threshold``, worst first, each with its Viking link.
+
+    A location appears once with the losses of its prompt variants that reach the threshold. When no single
+    sample reaches it (the batch was high on average) the worst one is listed so the message still names a place.
+    """
+    n = min(len(meta), len(sample_losses))
+    scored = sorted(range(n), key=lambda i: float(sample_losses[i]), reverse=True)
+    picked = [i for i in scored if float(sample_losses[i]) >= float(threshold)] or scored[:1]
+    if not picked:
+        return "(no meta)"
+    by_label: dict[str, tuple[int, list[float]]] = {}
+    for i in picked:
+        first, losses = by_label.setdefault(_sample_label(meta[i]), (i, []))
+        losses.append(float(sample_losses[i]))
+    entries = [
+        f"{label} loss={', '.join(f'{x:.4f}' for x in losses)} {viking_url(meta[first], template)}"
+        for label, (first, losses) in by_label.items()
+    ]
+    text = " | ".join(entries[:max_samples])
+    extra = len(entries) - max_samples
+    return f"{text} (+{extra} more)" if extra > 0 else text
+
+
 @dataclass
 class StepAnomalyMonitor:
     """Warn on training steps that are much slower or higher-loss than recent medians.
@@ -107,8 +153,8 @@ class StepAnomalyMonitor:
         """Compare against history, emit MQTT messages, then record this step.
 
         Slow batches are warnings (batch membership only). High-loss batches are
-        errors and list samples sorted worst→best with per-sample scores when
-        ``sample_losses`` is provided.
+        errors and list only the samples whose own loss reaches the threshold, worst
+        first, each with its score and Viking link, when ``sample_losses`` is provided.
 
         Returns the messages that were published (empty when none).
         """
@@ -135,7 +181,7 @@ class StepAnomalyMonitor:
             )
             if float(loss) >= threshold_l:
                 if sample_losses:
-                    ranked = format_ranked_samples(meta, sample_losses)
+                    ranked = format_high_loss_samples(meta, sample_losses, threshold_l)
                 else:
                     ranked = format_batch_samples(meta)
                 msg = (
