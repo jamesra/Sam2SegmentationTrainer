@@ -915,7 +915,7 @@ def test_http_redirects_when_https_flag_set(httpd: tuple[str, int]) -> None:
 
 def test_map_permission_names_read_vs_review() -> None:
     assert map_permission_names(["Read"]) == "read"
-    assert map_permission_names(["Read", "Review"]) == "review"
+    assert map_permission_names(["Read", "Annotate"]) == "review"
     assert map_permission_names(["Admin"]) is None
 
 
@@ -929,11 +929,11 @@ def test_oidc_maps_identity_api_volumes() -> None:
             return {"access_token": "tok"}
         if url.endswith("/connect/userinfo"):
             return {"sub": "u1", "name": "Ada"}
-        if url.endswith("/api/volumes"):
-            return [
-                {"name": "RC2", "permissions": ["Read", "Review"]},
-                {"name": "SKIPME", "permissions": ["Read"]},
-            ]
+        if url.endswith("/Permissions/AccessibleVolumes"):
+            return {
+                "7": {"Id": 7, "Name": "RC2-Pitt", "AnnotationDatabaseName": "RC2", "permissions": ["Read", "Annotate"]},
+                "8": {"Id": 8, "Name": "SKIPME", "AnnotationDatabaseName": None, "permissions": ["Read"]},
+            }
         raise AssertionError(url)
 
     oidc = OidcIdentity(
@@ -1215,3 +1215,106 @@ def test_sparse_shape_bands_start_at_the_top_of_the_grid() -> None:
     assert "range.lo" in offsets
     assert "range.start" in offsets
     assert "span" not in offsets
+
+
+# ---------------------------------------------------------------- bots, login gate, annotation database names
+
+
+def _raw_get(httpd: tuple[str, int], path: str, *, agent: str | None = None) -> tuple[int, dict[str, str], bytes]:
+    connection = HTTPConnection(httpd[0], httpd[1], timeout=5)
+    connection.request("GET", path, headers={"User-Agent": agent} if agent else {})
+    response = connection.getresponse()
+    body = response.read()
+    headers = {key.lower(): value for key, value in response.getheaders()}
+    connection.close()
+    return response.status, headers, body
+
+
+def test_robots_txt_disallows_everything_and_responses_say_noindex(httpd: tuple[str, int]) -> None:
+    status, headers, body = _raw_get(httpd, "/robots.txt")
+    assert status == 200
+    assert body.decode() == "User-agent: *\nDisallow: /\n"
+    assert "noindex" in headers["x-robots-tag"]
+
+
+def test_self_identified_ai_crawlers_get_403(httpd: tuple[str, int]) -> None:
+    for agent in ("Mozilla/5.0 (compatible; GPTBot/1.1)", "ClaudeBot/1.0", "CCBot/2.0"):
+        status, _headers, _body = _raw_get(httpd, "/", agent=agent)
+        assert status == 403, agent
+    status, _headers, _body = _raw_get(httpd, "/", agent="Mozilla/5.0 Firefox/130")
+    assert status == 200
+
+
+def test_oidc_mode_sends_anonymous_visitors_to_login(
+    httpd: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GALLERY_IDENTITY_MODE", "oidc")
+    status, headers, _body = _raw_get(httpd, "/")
+    assert status == 302 and headers["location"] == "/login"
+    status, payload = _request(httpd, "GET", "/api/volumes/RC2/catalog")
+    assert status == 401 and payload["error"] == "login required"
+    status, _headers, _body = _raw_get(httpd, "/health")
+    assert status == 200
+    status, _headers, _body = _raw_get(httpd, "/static/app.css")
+    assert status == 200
+
+
+def test_stub_mode_and_opt_out_keep_the_gallery_open(
+    httpd: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status, _headers, _body = _raw_get(httpd, "/")
+    assert status == 200
+    monkeypatch.setenv("GALLERY_IDENTITY_MODE", "oidc")
+    monkeypatch.setenv("GALLERY_REQUIRE_LOGIN", "0")
+    status, _headers, _body = _raw_get(httpd, "/")
+    assert status == 200
+
+
+def test_logout_clears_the_cookie_and_ends_the_identity_session(
+    httpd: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GALLERY_IDENTITY_MODE", "oidc")
+    monkeypatch.setenv("GALLERY_OIDC_AUTHORITY", "https://identity.example:5001/")
+    status, headers, _body = _raw_get(httpd, "/logout")
+    assert status == 302
+    assert headers["location"] == "https://identity.example:5001/connect/endsession"
+    assert "gallery_session=;" in headers["set-cookie"] and "Max-Age=0" in headers["set-cookie"]
+    monkeypatch.setenv("GALLERY_IDENTITY_MODE", "stub")
+    status, headers, _body = _raw_get(httpd, "/logout")
+    assert headers["location"] == "/"
+
+
+def test_cookies_are_secure_once_the_public_origin_is_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    from server import cookie_attributes
+
+    monkeypatch.delenv("GALLERY_PUBLIC_HTTPS_ORIGIN", raising=False)
+    assert "Secure" not in cookie_attributes()
+    monkeypatch.setenv("GALLERY_PUBLIC_HTTPS_ORIGIN", "https://sem.gallery.codepharm.net")
+    attrs = cookie_attributes(max_age=60)
+    assert "Secure" in attrs and "HttpOnly" in attrs and "Max-Age=60" in attrs
+
+
+def test_annotation_db_name_prefers_the_field_then_the_odata_url_then_the_folder(tmp_path: Path) -> None:
+    from catalog import annotation_db_name, db_name_from_odata
+
+    assert db_name_from_odata("https://websvc.codepharm.net/NeitzNM/OData") == "NeitzNM"
+    assert db_name_from_odata("https://websvc.codepharm.net/NeitzNM/OData/") == "NeitzNM"
+    assert db_name_from_odata("https://websvc.codepharm.net/") == ""
+    crops = tmp_path / "NasalMonkey"
+    crops.mkdir()
+    assert annotation_db_name(crops, "NasalMonkey") == "NasalMonkey"
+    (crops / "source.json").write_text(json.dumps({"odata": "https://h/NeitzNM/OData"}), encoding="utf-8")
+    assert annotation_db_name(crops, "NasalMonkey") == "NeitzNM"
+    (crops / "source.json").write_text(
+        json.dumps({"odata": "https://h/NeitzNM/OData", "annotationDb": "Other"}), encoding="utf-8"
+    )
+    assert annotation_db_name(crops, "NasalMonkey") == "Other"
+
+
+def test_grants_follow_the_annotation_database_name_not_the_folder() -> None:
+    from identity import grants_for_registry
+
+    grants = {"NeitzNM": "review", "RC1": "read"}
+    folders = ["NasalMonkey", "RC1", "InferiorMonkey"]
+    aliases = {"NasalMonkey": "NeitzNM", "InferiorMonkey": "NeitzInferiorMonkey"}
+    assert grants_for_registry(grants, folders, aliases) == {"NasalMonkey": "review", "RC1": "read"}

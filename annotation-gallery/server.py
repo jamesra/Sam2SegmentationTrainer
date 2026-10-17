@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from catalog import (
+    annotation_db_name,
     approve_window,
     build_repair_pack,
     export_volume_review,
@@ -239,6 +240,52 @@ def tag_structure_ids(volume: str, pattern: str, environ: dict[str, str] | None 
     return structure_ids_for_tag_pattern(structures, types, pattern)
 
 
+def require_login(environ: dict[str, str] | None = None) -> bool:
+    """Anonymous visitors are sent to the Identity login. On by default in oidc mode, never in stub mode."""
+    mapping = environ or env_map()
+    if identity_mode(mapping) != "oidc":
+        return False
+    return (mapping.get("GALLERY_REQUIRE_LOGIN") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def public_https_origin(environ: dict[str, str] | None = None) -> str:
+    mapping = environ or env_map()
+    return (mapping.get("GALLERY_PUBLIC_HTTPS_ORIGIN") or "").strip().rstrip("/")
+
+
+def cookie_attributes(environ: dict[str, str] | None = None, max_age: int | None = None) -> str:
+    """Attributes for every cookie we set. Secure once the public origin is HTTPS."""
+    attrs = "Path=/; HttpOnly; SameSite=Lax"
+    if public_https_origin(environ).lower().startswith("https://"):
+        attrs += "; Secure"
+    if max_age is not None:
+        attrs += f"; Max-Age={max_age}"
+    return attrs
+
+
+SESSION_MAX_AGE = 8 * 3600
+
+
+def identity_logout_url(environ: dict[str, str] | None = None) -> str:
+    """Where /logout sends the browser after the gallery cookie is cleared.
+
+    In oidc mode that is Identity Server's end-session page, so the single sign-on session ends too; otherwise
+    the next visit would sign straight back in. Without an id_token_hint Identity asks the user to confirm.
+    """
+    mapping = environ or env_map()
+    if identity_mode(mapping) != "oidc":
+        return "/"
+    authority = (mapping.get("GALLERY_OIDC_AUTHORITY") or "https://identity.codepharm.net:5001").rstrip("/")
+    return f"{authority}/connect/endsession"
+
+# Reachable without a session: health probe, the login round trip, robots.txt and the static shell assets.
+_PUBLIC_PATHS = {"/health", "/login", "/callback", "/logout", "/robots.txt", "/api/config"}
+
+
+def is_public_path(path: str) -> bool:
+    return path in _PUBLIC_PATHS or path.startswith("/static/")
+
+
 def session_secret(environ: dict[str, str] | None = None) -> bytes:
     mapping = environ or env_map()
     text = mapping.get("GALLERY_SESSION_SECRET") or "dev-only-not-secret"
@@ -256,6 +303,17 @@ def list_registry_names(registry: Path) -> list[str]:
         if child.is_dir() or child.is_symlink():
             names.append(child.name)
     return names
+
+
+def registry_aliases(registry: Path) -> dict[str, str]:
+    """Registry folder -> annotation database name (what Identity grants are named after)."""
+    aliases: dict[str, str] = {}
+    for name in list_registry_names(registry):
+        try:
+            aliases[name] = annotation_db_name(crops_dir(registry, name), name)
+        except (ValueError, FileNotFoundError, OSError):
+            aliases[name] = name
+    return aliases
 
 
 def volume_root(registry: Path, name: str) -> Path:
@@ -409,10 +467,49 @@ def https_redirect_location(
     return f"https://{hostname}:{https_port}{path}"
 
 
+# Crawlers and AI agents that identify themselves; they get 403 on everything but /robots.txt.
+AI_BOT_MARKERS = (
+    "gptbot", "chatgpt-user", "oai-searchbot", "claudebot", "claude-web", "claude-user", "claude-searchbot",
+    "anthropic-ai", "ccbot", "google-extended", "googleother", "perplexitybot", "perplexity-user",
+    "bytespider", "amazonbot", "applebot-extended", "cohere-ai", "meta-externalagent", "facebookbot",
+    "diffbot", "omgili", "imagesiftbot", "timpibot", "youbot", "ai2bot", "duckassistbot",
+    "mistralai-user",
+)
+
+ROBOTS_TXT = "User-agent: *\nDisallow: /\n"
+
+
+def is_ai_bot(user_agent: str) -> bool:
+    lowered = (user_agent or "").lower()
+    return any(marker in lowered for marker in AI_BOT_MARKERS)
+
+
 class GalleryHandler(BaseHTTPRequestHandler):
     """HTTP API + static SPA. Does not spawn nornir-build."""
 
     server_version = "AnnotationGallery/1.0"
+
+    def end_headers(self) -> None:
+        # Keep every response out of search indexes and AI training sets.
+        self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive, noimageindex, noai, noimageai")
+        super().end_headers()
+
+    def _refuse_bots(self, path: str) -> bool:
+        """Serve robots.txt; answer 403 to self-identified AI crawlers."""
+        if path == "/robots.txt":
+            body = ROBOTS_TXT.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        if is_ai_bot(self.headers.get("User-Agent") or ""):
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+        return False
 
     def log_message(self, format: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
@@ -442,8 +539,24 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.end_headers()
         return True
 
+    def _require_session(self, path: str) -> bool:
+        """True when the request was answered because it has no login. Pages go to /login, the API gets 401."""
+        if not require_login() or is_public_path(path):
+            return False
+        if self._principal().subject != "anonymous":
+            return False
+        if path.startswith("/api/"):
+            self._send_json({"error": "login required"}, status=401)
+        else:
+            self._redirect("/login")
+        return True
+
     def do_GET(self) -> None:
+        if self._refuse_bots(unquote(urlparse(self.path).path)):
+            return
         if self._maybe_redirect_https():
+            return
+        if self._require_session(unquote(urlparse(self.path).path)):
             return
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
@@ -473,7 +586,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._handle_callback(query)
             return
         if path == "/logout":
-            self._clear_session()
+            self._clear_session(identity_logout_url())
             return
         if path == "/api/training-sets":
             self._send_json({"sets": list_training_sets(), "default": "current"})
@@ -542,6 +655,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self._maybe_redirect_https():
+            return
+        if self._require_session(unquote(urlparse(self.path).path)):
             return
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
@@ -694,7 +809,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         url = oidc.login_url(redirect_uri, state)
         self.send_response(302)
         self.send_header("Location", url)
-        self.send_header("Set-Cookie", f"gallery_oidc_state={state}; Path=/; HttpOnly; SameSite=Lax")
+        self.send_header("Set-Cookie", f"gallery_oidc_state={state}; {cookie_attributes(max_age=600)}")
         self.end_headers()
 
     def _handle_callback(self, query: dict[str, list[str]]) -> None:
@@ -708,7 +823,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         oidc = OidcIdentity(env_map())
         redirect_uri = os.environ.get("GALLERY_OIDC_REDIRECT_URI") or self._callback_uri()
         try:
-            principal = oidc.complete_login(code, redirect_uri, list_registry_names(registry_dir()))
+            registry = registry_dir()
+            principal = oidc.complete_login(
+                code, redirect_uri, list_registry_names(registry), registry_aliases(registry)
+            )
         except PermissionError as exc:
             self._send_json({"error": str(exc)}, status=401)
             return
@@ -717,7 +835,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.send_header(
             "Set-Cookie",
-            f"{SESSION_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax",
+            f"{SESSION_COOKIE}={cookie}; {cookie_attributes(max_age=SESSION_MAX_AGE)}",
         )
         self.end_headers()
 
@@ -1156,6 +1274,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
         return None
 
     def _callback_uri(self) -> str:
+        origin = public_https_origin()
+        if origin:
+            return f"{origin}/callback"
         host = self.headers.get("Host") or "127.0.0.1:8443"
         return f"http://{host}/callback"
 
@@ -1205,10 +1326,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.end_headers()
 
-    def _clear_session(self) -> None:
+    def _clear_session(self, location: str = "/") -> None:
         self.send_response(302)
-        self.send_header("Location", "/")
-        self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; Max-Age=0")
+        self.send_header("Location", location)
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; {cookie_attributes(max_age=0)}")
         self.end_headers()
 
 

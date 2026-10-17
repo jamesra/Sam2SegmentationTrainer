@@ -1,7 +1,12 @@
 # SAM2 trainer cursor-dev: sam2-trainer:dev, repo at /workspace, NAS at /storage4 (path B CIFS).
 #
 # Copy docker/example.cursor-dev.run.env to docker/.env (or hardlink D:\Docker\Run\sam2-dev\.env)
-# so ${NORNIR_NET_MOUNTS_DIR_HOST} and ${SAM2_OUTPUT_HOST} substitute.
+# so ${NORNIR_NET_MOUNTS_DIR_HOST} etc. substitute. That shared file holds only what TEM and SEM have
+# in common. The rest is per modality and comes from a second env file, TEM.env or SEM.env
+# (templates: docker/example.TEM.env, docker/example.SEM.env): SAM2_MODALITY, SAM2_LOCAL_DATA_HOST,
+# SAM2_OUTPUT_HOST and SAM2_CHECKPOINT_ROOT have no defaults here, so a launch without one fails.
+# Pass both: --env-file docker/.env --env-file <D:\Docker\Run\sam2-dev\TEM.env or SEM.env>.
+# docker/run-cursor-dev.ps1 -Modality TEM|SEM and docker/docker-build.ps1 -Modality do this for you.
 #
 # Path B (required for training data): also pass
 #   -f $NORNIR_DOCKER_USER_ROOT/Run/sam2-dev/compose.net-mounts.override.yaml
@@ -10,9 +15,42 @@
 #
 # From repository root:
 #   docker compose -f docker/compose.cursor-dev.yaml build cursor-dev
-#   docker/run-cursor-dev.ps1
+#   docker/run-cursor-dev.ps1 -Modality TEM   (or SEM)
 
 name: sam2-trainer
+
+x-gallery: &gallery
+  build:
+    context: ..
+    dockerfile: annotation-gallery/Dockerfile
+  image: nornir-annotation-gallery:latest
+  restart: unless-stopped
+  user: "${SAM2_DATA_UID:-1000}:${SAM2_DATA_GID:-1000}"
+
+x-gallery-env: &gallery-env
+  GALLERY_HOST: "0.0.0.0"
+  GALLERY_HTTP_PORT: "80"
+  GALLERY_VOLUME_DIR: ${SAM2_DATA_ROOT:-/data-local/current}
+  # oidc: visitors must sign in with Identity Server; Read on the annotation database to view, Write to review.
+  GALLERY_IDENTITY_MODE: "${GALLERY_IDENTITY_MODE:-oidc}"
+  GALLERY_REQUIRE_LOGIN: "${GALLERY_REQUIRE_LOGIN:-1}"
+  GALLERY_STUB_ROLE: "${GALLERY_STUB_ROLE:-review}"
+  GALLERY_STUB_GRANTS: "${GALLERY_STUB_GRANTS:-}"
+  GALLERY_SESSION_SECRET: "${GALLERY_SESSION_SECRET:?set GALLERY_SESSION_SECRET (a long random string) in the shared .env}"
+  GALLERY_VIKING_URL: "${GALLERY_VIKING_URL:-viking://open?volumeName={volume}&location={id}}"
+  GALLERY_ODATA_TEMPLATE: "${GALLERY_ODATA_TEMPLATE:-https://websvc.codepharm.net/{volume}/OData}"
+  NORNIR_BUILDMANAGER_DIR: /opt/nornir-buildmanager
+  GALLERY_OIDC_AUTHORITY: "${GALLERY_OIDC_AUTHORITY:-https://identity.codepharm.net:5001}"
+  GALLERY_IDENTITY_API: "${GALLERY_IDENTITY_API:-https://identity.codepharm.net:6001}"
+  GALLERY_READ_PERMISSION: "${GALLERY_READ_PERMISSION:-Read}"
+  GALLERY_REVIEW_PERMISSION: "${GALLERY_REVIEW_PERMISSION:-Annotate}"
+
+x-nornir-buildmanager: &nornir-buildmanager
+  type: bind
+  source: ${NORNIR_BUILDMANAGER_HOST:-../../nornir/nornir-buildmanager}
+  target: /opt/nornir-buildmanager
+  read_only: true
+
 
 services:
   cursor-dev:
@@ -39,10 +77,12 @@ services:
       - /usr/local/bin/cursor-dev-entry.sh
       - bash
     environment:
+      # TEM or SEM, from the modality env file; the trainer tools and docker-build.ps1 read it.
+      SAM2_MODALITY: ${SAM2_MODALITY:?set SAM2_MODALITY via TEM.env or SEM.env (pass --env-file <Modality>.env)}
       SAM2_DATA_ROOT: ${SAM2_DATA_ROOT:-/data-local/current}
       SAM2_OUTPUT_ROOT: /outputs
       # Run checkpoints + TB events on CIFS (not the Windows /outputs bind).
-      SAM2_CHECKPOINT_ROOT: ${SAM2_CHECKPOINT_ROOT:-/storage4/Sam2Trainer}
+      SAM2_CHECKPOINT_ROOT: ${SAM2_CHECKPOINT_ROOT:?set SAM2_CHECKPOINT_ROOT via TEM.env or SEM.env}
       SAM2_CHECKPOINT_URL: ${SAM2_CHECKPOINT_URL:-https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt}
       # In-container TensorBoard port (compose publishes host 8060:6006).
       SAM2_TENSORBOARD_PORT: "6006"
@@ -59,10 +99,10 @@ services:
         source: ${SAM2_WORKSPACE_HOST:-..}
         target: /workspace
       - type: bind
-        source: ${SAM2_LOCAL_DATA_HOST}
+        source: ${SAM2_LOCAL_DATA_HOST:?set SAM2_LOCAL_DATA_HOST via TEM.env or SEM.env}
         target: /data-local
       - type: bind
-        source: ${SAM2_OUTPUT_HOST:-D:/Docker/mounted-configs/sam2-trainer}
+        source: ${SAM2_OUTPUT_HOST:?set SAM2_OUTPUT_HOST via TEM.env or SEM.env}
         target: /outputs
       - type: bind
         source: ./cursor-dev-entry.sh
@@ -82,65 +122,68 @@ services:
         target: /opt/nornir-shared
         read_only: true
 
-  annotation-gallery:
-    build:
-      context: ..
-      dockerfile: annotation-gallery/Dockerfile
-    image: nornir-annotation-gallery:latest
-    restart: unless-stopped
-    user: "${SAM2_DATA_UID:-1000}:${SAM2_DATA_GID:-1000}"
-    cap_add:
-      - NET_BIND_SERVICE
+  # Two galleries from one image: TEM and SEM mirrors side by side, independent of which modality the trainer runs.
+  # Both listen on plain HTTP on the compose network only; gallery-router terminates TLS for
+  # tem. / sem.gallery.codepharm.net. Published HTTP ports (debugging): TEM 8081, SEM 8082.
+  annotation-gallery-tem:
+    <<: *gallery
     environment:
-      GALLERY_HOST: "0.0.0.0"
-      GALLERY_HTTP_PORT: "80"
-      GALLERY_HTTPS_PORT: "443"
-      GALLERY_VOLUME_DIR: ${SAM2_DATA_ROOT:-/data-local/current}
-      GALLERY_IDENTITY_MODE: "${GALLERY_IDENTITY_MODE:-stub}"
-      GALLERY_STUB_ROLE: "${GALLERY_STUB_ROLE:-review}"
-      GALLERY_STUB_GRANTS: "${GALLERY_STUB_GRANTS:-}"
-      GALLERY_SESSION_SECRET: "${GALLERY_SESSION_SECRET:-dev-only-not-secret}"
-      GALLERY_VIKING_URL: "${GALLERY_VIKING_URL:-viking://open?volumeName={volume}&location={id}}"
-      GALLERY_ODATA_TEMPLATE: "${GALLERY_ODATA_TEMPLATE:-https://websvc.codepharm.net/{volume}/OData}"
-      NORNIR_BUILDMANAGER_DIR: /opt/nornir-buildmanager
-      GALLERY_OIDC_AUTHORITY: "${GALLERY_OIDC_AUTHORITY:-https://identity.codepharm.net:5001}"
-      GALLERY_IDENTITY_API: "${GALLERY_IDENTITY_API:-https://identity.codepharm.net:6001}"
-      GALLERY_OIDC_CLIENT_ID: "${GALLERY_OIDC_CLIENT_ID:-}"
-      GALLERY_OIDC_CLIENT_SECRET: "${GALLERY_OIDC_CLIENT_SECRET:-}"
-      GALLERY_OIDC_REDIRECT_URI: "${GALLERY_OIDC_REDIRECT_URI:-https://127.0.0.1:8443/callback}"
-      GALLERY_READ_PERMISSION: "${GALLERY_READ_PERMISSION:-Read}"
-      GALLERY_REVIEW_PERMISSION: "${GALLERY_REVIEW_PERMISSION:-Review}"
-      # Local: PEMs dropped in SAM2_CERTS_HOST (/certs). Production: GALLERY_SSL_*
-      # point into the gallery-letsencrypt volume the certbot renewer fills.
-      SSL_CERT_PATH: "${GALLERY_SSL_CERT_PATH:-/certs/fullchain.pem}"
-      SSL_KEY_PATH: "${GALLERY_SSL_KEY_PATH:-/certs/privkey.pem}"
-      GALLERY_PUBLIC_HTTPS_ORIGIN: "${GALLERY_PUBLIC_HTTPS_ORIGIN:-}"
-      GALLERY_HTTP_PUBLIC_PORT: "${GALLERY_HTTP_PUBLIC_PORT:-80}"
-      GALLERY_HTTPS_PUBLIC_PORT: "${GALLERY_HTTPS_PUBLIC_PORT:-443}"
+      <<: *gallery-env
+      SAM2_MODALITY: TEM
+      GALLERY_PUBLIC_HTTPS_ORIGIN: "https://tem.gallery.codepharm.net"
+      GALLERY_OIDC_REDIRECT_URI: "https://tem.gallery.codepharm.net/callback"
+      GALLERY_OIDC_CLIENT_ID: "${GALLERY_TEM_OIDC_CLIENT_ID:-}"
+      GALLERY_OIDC_CLIENT_SECRET: "${GALLERY_TEM_OIDC_CLIENT_SECRET:-}"
     ports:
-      # Prod: GALLERY_HTTP_PUBLISH=80:80  GALLERY_HTTPS_PUBLISH=443:443
-      - "${GALLERY_HTTP_PUBLISH:-8080:80}"
-      - "${GALLERY_HTTPS_PUBLISH:-127.0.0.1:8443:443}"
+      - "${GALLERY_TEM_HTTP_PUBLISH:-8081:80}"
     volumes:
       - type: bind
-        source: ${SAM2_LOCAL_DATA_HOST}
+        source: ${SAM2_LOCAL_DATA_HOST_TEM:?set SAM2_LOCAL_DATA_HOST_TEM in the shared .env (the TEM mirror)}
         target: /data-local
-      # Directory, not the PEM files: a missing cert must not stop HTTP.
-      # Drop fullchain.pem and privkey.pem here (SSL_CERT_PATH / SSL_KEY_PATH).
+      - *nornir-buildmanager
+
+  annotation-gallery-sem:
+    <<: *gallery
+    environment:
+      <<: *gallery-env
+      SAM2_MODALITY: SEM
+      GALLERY_PUBLIC_HTTPS_ORIGIN: "https://sem.gallery.codepharm.net"
+      GALLERY_OIDC_REDIRECT_URI: "https://sem.gallery.codepharm.net/callback"
+      GALLERY_OIDC_CLIENT_ID: "${GALLERY_SEM_OIDC_CLIENT_ID:-}"
+      GALLERY_OIDC_CLIENT_SECRET: "${GALLERY_SEM_OIDC_CLIENT_SECRET:-}"
+    ports:
+      - "${GALLERY_SEM_HTTP_PUBLISH:-8082:80}"
+    volumes:
       - type: bind
-        source: ${SAM2_CERTS_HOST:-D:/Docker/mounted-configs/sam2-trainer}
-        target: /certs
+        source: ${SAM2_LOCAL_DATA_HOST_SEM:?set SAM2_LOCAL_DATA_HOST_SEM in the shared .env (the SEM mirror)}
+        target: /data-local
+      - *nornir-buildmanager
+
+  # TLS front door and the gallery.codepharm.net redirect. Config: gallery-router/gallery.conf. The active
+  # modality file is written by run-cursor-dev.ps1 / docker-build.ps1. Host 8080 -> :80 (plain HTTP, redirects),
+  # host 8442 -> :443 (the reverse proxy's stream passes SNI for all three names here).
+  gallery-router:
+    container_name: gallery-router
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - annotation-gallery-tem
+      - annotation-gallery-sem
+    ports:
+      - "${GALLERY_ROUTER_HTTP_PUBLISH:-8080:80}"
+      - "${GALLERY_ROUTER_HTTPS_PUBLISH:-8442:443}"
+    volumes:
+      - type: bind
+        source: ./gallery-router/gallery.conf
+        target: /etc/nginx/conf.d/default.conf
         read_only: true
-      # Filled by annotation-gallery-certbot-renewer (empty until it enrolls).
+      - type: bind
+        source: ${SAM2_GALLERY_ROUTER_DIR:-D:/Docker/mounted-configs/sam2-trainer/gallery-router}
+        target: /etc/nginx/active
+        read_only: true
       - type: volume
         source: gallery-letsencrypt
         target: /etc/letsencrypt
-        read_only: true
-      # Rasterizer for one-location mask refresh. Missing mount returns an error
-      # and does not change mask files. The gallery image does not install Nornir.
-      - type: bind
-        source: ${NORNIR_BUILDMANAGER_HOST:-../../nornir/nornir-buildmanager}
-        target: /opt/nornir-buildmanager
         read_only: true
 
   # Shared Servers/certbot image (VikingServers repo) with the gallery's own
@@ -158,10 +201,13 @@ services:
     restart: unless-stopped
     environment:
       LETSENCRYPT_PRIMARY_DOMAIN: "${LETSENCRYPT_PRIMARY_DOMAIN:-gallery.codepharm.net}"
+      # One certificate for all three names; gallery-router terminates TLS. An existing lineage is not widened
+      # by this setting alone: it needs the one-time certbot --expand (README, "Gallery hostnames").
+      LETSENCRYPT_ADDITIONAL_DOMAINS: "${LETSENCRYPT_ADDITIONAL_DOMAINS:-tem.gallery.codepharm.net,sem.gallery.codepharm.net}"
       LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:-}"
       CERTBOT_STAGING: "${CERTBOT_STAGING:-false}"
       CERTBOT_AUTH_METHOD: "${CERTBOT_AUTH_METHOD:-dns-cloudflare}"
-      CERTBOT_RESTART_CONTAINER: annotation-gallery
+      CERTBOT_RESTART_CONTAINER: gallery-router
       CF_DNS_API_CREDENTIALS_FILE: /run/secrets/cloudflare.ini
       CF_DNS_PROPAGATION_SECONDS: "${CF_DNS_PROPAGATION_SECONDS:-60}"
     volumes:

@@ -760,6 +760,28 @@ def load_source_document(crops: str | os.PathLike[str]) -> dict[str, Any]:
     }
 
 
+def annotation_db_name(crops: str | os.PathLike[str], fallback: str = "") -> str:
+    """Annotation database (Identity volume) a dataset was exported from.
+
+    Reads ``annotationDb`` from source.json; older exports only have the OData URL
+    (``.../<db>/OData``), so that segment is the second choice. ``fallback`` (the
+    folder name) is last.
+    """
+    source = load_source_document(crops)
+    named = str(source.get("annotationDb") or "").strip()
+    if named:
+        return named
+    return db_name_from_odata(str(source.get("odata") or "")) or fallback
+
+
+def db_name_from_odata(url: str) -> str:
+    """``https://host/<db>/OData`` -> ``<db>``; empty when the URL has no such segment."""
+    parts = [part for part in url.strip().rstrip("/").split("/") if part]
+    if len(parts) >= 2 and parts[-1].lower() == "odata":
+        return parts[-2]
+    return ""
+
+
 def save_source_settings(
     crops: str | os.PathLike[str],
     *,

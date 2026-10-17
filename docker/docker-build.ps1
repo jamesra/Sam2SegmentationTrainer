@@ -15,9 +15,19 @@
 
   Invoke from D:\Docker\Builds\sam2-trainer so machine-local build.env files stay out of git.
 
-  After a successful tag, recreate a running Compose cursor-dev (Dev Container)
-  so it uses the new image ID. docker build alone leaves the old container in place.
-  One-off compose run sessions are not replaced; the next run-cursor-dev.ps1 uses the new image.
+  After a successful tag, bring the Compose cursor-dev to the chosen modality (and start both galleries and gallery-router)
+  on the new image: started when not running, recreated when needed. docker build alone leaves the
+  old container in place. One-off compose run sessions are not replaced; the next
+  run-cursor-dev.ps1 uses the new image.
+
+.PARAMETER Modality
+  TEM or SEM (first argument: build.ps1 SEM). Required unless -SkipRecreate. The image is the same
+  for both; the modality picks which env file is layered over docker/.env for the containers that
+  are started or recreated (<Modality>.env: data mirror, output folder, checkpoint root).
+  After the build, cursor-dev and the annotation gallery are brought to that modality on the new
+  image: started if not running, recreated if the image or the modality differs, left alone if
+  already right. If a cursor-dev of the other modality is running it asks
+  whether to replace it (Yes recreates it as the requested modality, No leaves it and exits).
 
 .PARAMETER NoCache
   Pass --no-cache to docker build.
@@ -25,18 +35,17 @@
 .PARAMETER SkipRecreate
   Build and tag only; do not replace a running cursor-dev container.
 
-.PARAMETER RecreateOnly
-  Skip docker build; recreate a running cursor-dev onto the current sam2-trainer:dev tag.
-
 .PARAMETER ExtraArgs
   Additional docker build arguments appended after the merged --build-arg list.
 #>
 param(
+    [Parameter(Position = 0)]
+    [ValidateSet('TEM', 'SEM')]
+    [string]$Modality,
+
     [switch]$NoCache,
 
     [switch]$SkipRecreate,
-
-    [switch]$RecreateOnly,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
@@ -44,9 +53,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($RecreateOnly -and $SkipRecreate) {
-    Write-Error 'Use either -RecreateOnly or -SkipRecreate, not both.'
+if (-not $SkipRecreate -and [string]::IsNullOrWhiteSpace($Modality)) {
+    [Console]::Error.WriteLine('error: pass the modality as the first argument: rebuild-and-start.ps1 TEM or SEM (or -SkipRecreate to only build).')
+    exit 1
 }
+
+. (Join-Path $PSScriptRoot 'sam2-modality.ps1')
 
 function Read-DotEnvFile {
     param([Parameter(Mandatory)][string]$Path)
@@ -108,14 +120,30 @@ function Invoke-Sam2CursorDevRecreate {
         [Parameter(Mandatory)][string]$DockerExe,
         [Parameter(Mandatory)][string]$ImageTag,
         [Parameter(Mandatory)][string]$DockerDir,
-        [Parameter(Mandatory)][string]$RepoRoot
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Modality,
+        [Parameter(Mandatory)][string]$ModalityEnv
     )
-    $ids = Get-Sam2RunningCursorDevIds -DockerExe $DockerExe
-    if ($ids.Count -eq 0) {
-        Write-Host "No running cursor-dev to replace. Start or Reopen in Container to use $ImageTag."
-        return 0
+    $modalityEnv = $ModalityEnv
+    $sharedEnv = Join-Path $DockerDir '.env'
+    $userRoot = $env:NORNIR_DOCKER_USER_ROOT
+    if ([string]::IsNullOrWhiteSpace($userRoot)) { $userRoot = 'D:\Docker' }
+    $newImageId = ([string](& $DockerExe image inspect $ImageTag --format '{{.Id}}' 2>$null)).Trim()
+
+    # Compose arguments from the repo files, as Reopen in Container would use them.
+    $defaultArgs = @('compose', '-p', 'sam2-trainer', '--project-directory', $DockerDir,
+        '-f', (Join-Path $DockerDir 'compose.cursor-dev.yaml'))
+    foreach ($rel in @('Run\sam2-dev\compose.net-mounts.override.yaml', 'Run\nornir-dev\compose.net-mounts.override.yaml')) {
+        $override = Join-Path $userRoot $rel
+        if (Test-Path -LiteralPath $override) { $defaultArgs += @('-f', $override); break }
     }
-    $recreated = $false
+    if (Test-Path -LiteralPath $sharedEnv) { $defaultArgs += @('--env-file', $sharedEnv) }
+    $defaultArgs += @('--env-file', $modalityEnv)
+
+    # ---- cursor-dev ----
+    $ids = Get-Sam2RunningCursorDevIds -DockerExe $DockerExe
+    $handled = $false
+    $cursorChanged = $false
     $seen = @{}
     foreach ($id in $ids) {
         $raw = & $DockerExe inspect $id --format '{{json .Config.Labels}}'
@@ -134,13 +162,29 @@ function Invoke-Sam2CursorDevRecreate {
         $key = "$project|$service|$files|$workdir"
         if ($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
+        $handled = $true
+
+        # Needed when the image changed or the modality differs. A container without
+        # SAM2_MODALITY predates this scheme and counts as TEM.
+        $containerImage = ([string](& $DockerExe inspect $id --format '{{.Image}}' 2>$null)).Trim()
+        $containerModality = 'TEM'
+        foreach ($l in @(& $DockerExe inspect $id --format '{{range .Config.Env}}{{println .}}{{end}}' 2>$null)) {
+            if ($l -like 'SAM2_MODALITY=*') { $containerModality = $l.Substring('SAM2_MODALITY='.Length).Trim() }
+        }
+        $reasons = @()
+        if ($containerModality -ne $Modality) { $reasons += "modality $containerModality -> $Modality" }
+        if ($containerImage -ne $newImageId) { $reasons += 'new image' }
+        if ($reasons.Count -eq 0) {
+            Write-Host "$service is already $Modality on the current image; leaving it running."
+            continue
+        }
 
         $composeArgs = @('compose', '-p', $project)
         if (-not [string]::IsNullOrWhiteSpace($workdir)) {
             $composeArgs += @('--project-directory', $workdir)
         }
         else {
-            $composeArgs += @('--project-directory', $RepoRoot)
+            $composeArgs += @('--project-directory', $DockerDir)
         }
         if (-not [string]::IsNullOrWhiteSpace($files)) {
             foreach ($f in ($files -split ',')) {
@@ -149,34 +193,40 @@ function Invoke-Sam2CursorDevRecreate {
             }
         }
         else {
-            $composeArgs += @('-f', (Join-Path $DockerDir 'compose.cursor-dev.yaml'))
-            $envFile = Join-Path $DockerDir '.env'
-            if (Test-Path -LiteralPath $envFile) {
-                $composeArgs += @('--env-file', $envFile)
-            }
-            $userRoot = $env:NORNIR_DOCKER_USER_ROOT
-            if ([string]::IsNullOrWhiteSpace($userRoot)) { $userRoot = 'D:\Docker' }
-            foreach ($rel in @(
-                    'Run\sam2-dev\compose.net-mounts.override.yaml',
-                    'Run\nornir-dev\compose.net-mounts.override.yaml'
-                )) {
-                $override = Join-Path $userRoot $rel
-                if (Test-Path -LiteralPath $override) {
-                    $composeArgs += @('-f', $override)
-                    break
-                }
-            }
+            $composeArgs = $defaultArgs[0..($defaultArgs.IndexOf('--env-file') - 1)]
         }
+        # Always pass the shared env and the modality env: compose does not load them for a
+        # project when -f comes from the container labels.
+        if (Test-Path -LiteralPath $sharedEnv) {
+            $composeArgs += @('--env-file', $sharedEnv)
+        }
+        $composeArgs += @('--env-file', $modalityEnv)
         $composeArgs += @('up', '-d', '--force-recreate', '--no-build', '--no-deps', $service)
-        Write-Host "Recreating $service (project $project) onto $ImageTag"
+        Write-Host "Recreating $service (project $project, $Modality; $($reasons -join ', ')) onto $ImageTag"
         Write-Host "$DockerExe $($composeArgs -join ' ')"
         & $DockerExe @composeArgs
         if ($LASTEXITCODE -ne 0) { return [int]$LASTEXITCODE }
-        $recreated = $true
+        $cursorChanged = $true
     }
-    if ($recreated) {
-        Write-Host "Replaced running cursor-dev with $ImageTag. If Cursor is attached, wait for reconnect or Reopen in Container."
+    if (-not $handled) {
+        $upArgs = $defaultArgs + @('up', '-d', '--no-build', '--no-deps', 'cursor-dev')
+        Write-Host "No running cursor-dev; starting it ($Modality) on $ImageTag"
+        Write-Host "$DockerExe $($upArgs -join ' ')"
+        & $DockerExe @upArgs
+        if ($LASTEXITCODE -ne 0) { return [int]$LASTEXITCODE }
+        $cursorChanged = $true
     }
+    if ($cursorChanged) {
+        Write-Host "cursor-dev is up as $Modality on $ImageTag. If Cursor is attached, wait for reconnect or Reopen in Container."
+    }
+
+    # ---- galleries: TEM and SEM run side by side; only the gallery.codepharm.net redirect follows the modality ----
+    $galleryArgs = $defaultArgs + @('up', '-d', '--no-build', '--no-deps', 'annotation-gallery-tem', 'annotation-gallery-sem', 'gallery-router')
+    Write-Host "Starting the TEM and SEM galleries and gallery-router (gallery.codepharm.net -> $Modality)"
+    Write-Host "$DockerExe $($galleryArgs -join ' ')"
+    & $DockerExe @galleryArgs
+    if ($LASTEXITCODE -ne 0) { return [int]$LASTEXITCODE }
+    Set-Sam2ActiveGalleryModality -DockerExe $DockerExe -Modality $Modality -EnvFile $sharedEnv
     return 0
 }
 
@@ -242,24 +292,37 @@ if (-not $dockerCmd) {
         Select-Object -First 1
 }
 
-if (-not $RecreateOnly) {
-    Write-Host "Building ${ImageTag} (context $RepoRoot, env from $BuildEnvRoot)"
-    Write-Host "$($dockerCmd.Source) $($buildArgs -join ' ')"
-    $buildExit = 1
-    Push-Location -LiteralPath $RepoRoot
+# Pre-flight before the (long) build: the modality's data mirror must exist, and the other modality's
+# trainer, if running, must be confirmed for replacement. A missing mirror or a "No" costs no build.
+$ModalityEnv = $null
+if (-not $SkipRecreate) {
     try {
-        & $dockerCmd.Source @buildArgs
-        $buildExit = [int]$LASTEXITCODE
+        Confirm-Sam2ReplaceOtherModality -DockerExe $dockerCmd.Source -Modality $Modality
+        $ModalityEnv = Initialize-Sam2Modality -Modality $Modality -DockerDir $DockerDir
     }
-    finally {
-        Pop-Location
+    catch {
+        # One line, no PowerShell stack trace: these are instructions, not crashes.
+        [Console]::Error.WriteLine("error: $($_.Exception.Message)")
+        exit 1
     }
-    if ($buildExit -ne 0) {
-        exit $buildExit
-    }
+}
+
+Write-Host "Building ${ImageTag} (context $RepoRoot, env from $BuildEnvRoot)"
+Write-Host "$($dockerCmd.Source) $($buildArgs -join ' ')"
+$buildExit = 1
+Push-Location -LiteralPath $RepoRoot
+try {
+    & $dockerCmd.Source @buildArgs
+    $buildExit = [int]$LASTEXITCODE
+}
+finally {
+    Pop-Location
+}
+if ($buildExit -ne 0) {
+    exit $buildExit
 }
 if ($SkipRecreate) {
     Write-Host "SkipRecreate: $ImageTag tagged; a running cursor-dev still uses the previous image ID."
     exit 0
 }
-exit (Invoke-Sam2CursorDevRecreate -DockerExe $dockerCmd.Source -ImageTag $ImageTag -DockerDir $DockerDir -RepoRoot $RepoRoot)
+exit (Invoke-Sam2CursorDevRecreate -DockerExe $dockerCmd.Source -ImageTag $ImageTag -DockerDir $DockerDir -RepoRoot $RepoRoot -Modality $Modality -ModalityEnv $ModalityEnv)

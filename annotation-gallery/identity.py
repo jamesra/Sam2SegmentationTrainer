@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -31,7 +32,7 @@ def map_permission_names(
     names: list[str],
     *,
     read_name: str = "Read",
-    review_name: str = "Review",
+    review_name: str = "Annotate",
 ) -> str | None:
     """Map Identity permission names to gallery Read vs Review."""
     lowered = {str(item).strip().lower() for item in names if item}
@@ -63,6 +64,20 @@ def intersect_grants(grants: dict[str, str], registry_names: list[str]) -> dict[
     """Keep Identity names that exist as registry children. Drop unknown volumes."""
     allowed = set(registry_names)
     return {name: role for name, role in grants.items() if name in allowed}
+
+
+def grants_for_registry(
+    grants: dict[str, str],
+    registry_names: list[str],
+    aliases: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Grants keyed by registry folder: a folder takes the grant of its annotation database name."""
+    out: dict[str, str] = {}
+    for folder in registry_names:
+        role = grants.get((aliases or {}).get(folder) or folder)
+        if role:
+            out[folder] = role
+    return out
 
 
 class StubIdentity:
@@ -126,13 +141,15 @@ class OidcIdentity:
         self.api = (environ.get("GALLERY_IDENTITY_API") or DEFAULT_IDENTITY_API).rstrip("/")
         self.client_id = environ.get("GALLERY_OIDC_CLIENT_ID") or ""
         self.client_secret = environ.get("GALLERY_OIDC_CLIENT_SECRET") or ""
-        self.scope = environ.get("GALLERY_OIDC_SCOPE") or "openid profile"
+        # Viking.Annotation is the Permissions API's scope: without it the API treats the token as inactive (401).
+        self.scope = environ.get("GALLERY_OIDC_SCOPE") or "openid profile Viking.Annotation"
         self.authorize_path = environ.get("GALLERY_OIDC_AUTHORIZE_PATH") or "/connect/authorize"
         self.token_path = environ.get("GALLERY_OIDC_TOKEN_PATH") or "/connect/token"
         self.userinfo_path = environ.get("GALLERY_OIDC_USERINFO_PATH") or "/connect/userinfo"
-        self.volumes_path = environ.get("GALLERY_IDENTITY_VOLUMES_PATH") or "/api/volumes"
+        # IdentityApi Permissions controller: {id: {Name, AnnotationDatabaseName, permissions: [...]}} for the caller.
+        self.volumes_path = environ.get("GALLERY_IDENTITY_VOLUMES_PATH") or "/Permissions/AccessibleVolumes"
         self.read_name = environ.get("GALLERY_READ_PERMISSION") or "Read"
-        self.review_name = environ.get("GALLERY_REVIEW_PERMISSION") or "Review"
+        self.review_name = environ.get("GALLERY_REVIEW_PERMISSION") or "Annotate"
         self._http = http_json or default_http_json
 
     def login_url(self, redirect_uri: str, state: str) -> str:
@@ -153,6 +170,7 @@ class OidcIdentity:
         code: str,
         redirect_uri: str,
         registry_names: list[str],
+        aliases: dict[str, str] | None = None,
     ) -> Principal:
         """Exchange the authorization code and load per-volume Read/Review grants."""
         token_payload = self._http(
@@ -179,11 +197,21 @@ class OidcIdentity:
         )
         subject = str(info.get("sub") or info.get("name") or "oidc-user")
         display = str(info.get("name") or info.get("preferred_username") or subject)
-        grants = self.volume_grants(access_token, registry_names)
+        grants = self.volume_grants(access_token, registry_names, aliases)
         return Principal(subject=subject, display_name=display, grants=grants)
 
-    def volume_grants(self, access_token: str, registry_names: list[str]) -> dict[str, str]:
-        """IdentityApi volume list ∩ registry names, mapped to Read vs Review."""
+    def volume_grants(
+        self,
+        access_token: str,
+        registry_names: list[str],
+        aliases: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """IdentityApi volume list ∩ registry names, mapped to Read vs Review.
+
+        ``aliases`` maps a registry folder name to the annotation database name Identity knows
+        it by (SEM folders are not named after their database); a folder missing from it
+        is matched by its own name.
+        """
         url = urljoin(self.api + "/", self.volumes_path.lstrip("/"))
         payload = self._http(
             url,
@@ -192,9 +220,11 @@ class OidcIdentity:
         )
         grants: dict[str, str] = {}
         for item in _as_volume_items(payload):
-            name = str(item.get("name") or item.get("Name") or "")
-            if not name:
-                continue
+            # The annotation database name is what the gallery matches on; the resource name is accepted too.
+            labels = [
+                str(item.get(key) or "")
+                for key in ("AnnotationDatabaseName", "annotationDatabaseName", "name", "Name")
+            ]
             names = item.get("permissions") or item.get("Permissions") or []
             if isinstance(names, str):
                 names = [names]
@@ -203,9 +233,21 @@ class OidcIdentity:
                 read_name=self.read_name,
                 review_name=self.review_name,
             )
-            if role:
-                grants[name] = role
-        return intersect_grants(grants, registry_names)
+            print(
+                f"identity grant: names={[l for l in labels if l]} permissions={[str(n) for n in names]} -> {role}",
+                file=sys.stderr,
+            )
+            if not role:
+                continue
+            for label in labels:
+                if label and grants.get(label) != PERMISSION_REVIEW:
+                    grants[label] = role
+        result = grants_for_registry(grants, registry_names, aliases)
+        print(
+            f"identity grants: {len(grants)} named by Identity, registry {registry_names}, aliases {aliases} -> {result}",
+            file=sys.stderr,
+        )
+        return result
 
 
 def default_http_json(
@@ -221,8 +263,14 @@ def default_http_json(
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
-    except (HTTPError, URLError) as exc:
-        raise PermissionError(f"Identity request failed: {exc}") from exc
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        except OSError:
+            detail = ""
+        raise PermissionError(f"Identity request failed: {exc} {url} {detail}".strip()) from exc
+    except URLError as exc:
+        raise PermissionError(f"Identity request failed: {exc} {url}") from exc
     if not raw:
         return {}
     return json.loads(raw.decode("utf-8"))
@@ -236,4 +284,6 @@ def _as_volume_items(payload: Any) -> list[dict[str, Any]]:
             nested = payload.get(key)
             if isinstance(nested, list):
                 return [item for item in nested if isinstance(item, dict)]
+        # IdentityApi answers {resourceId: {...}}.
+        return [item for item in payload.values() if isinstance(item, dict)]
     return []

@@ -30,10 +30,12 @@ Edit `D:\Docker\Run\sam2-dev\.env` if your net-mount paths differ. Defaults matc
 
 ```powershell
 Set-Location D:\Docker\Builds\sam2-trainer
-./build.ps1
+./rebuild-and-start.ps1 SEM      # or TEM
 ```
 
-A successful build retags `sam2-trainer:dev` and **recreates** a running Compose `cursor-dev` (the Dev Container) onto that new image ID. `docker build` alone would leave the old container running. Use `./build.ps1 -SkipRecreate` to tag only, or `./build.ps1 -RecreateOnly` to replace the running container without rebuilding. If Cursor is attached, wait for reconnect or **Reopen in Container**.
+The first argument is the modality (`TEM` or `SEM`, required unless `-SkipRecreate`). It rebuilds `sam2-trainer:dev`, then brings `cursor-dev` to that modality on the new image and starts both galleries and `gallery-router`. `cursor-dev` is started if not running and recreated only when needed (new image, or a different modality), so a rebuild that changes nothing does not interrupt a training run. If the other modality is running it asks whether to replace it. `docker build` alone would leave the old container running.
+
+Options: `-SkipRecreate` tags only, `-NoCache`. If Cursor is attached, wait for reconnect or **Reopen in Container**. The wrapper is machine-local and calls `docker/docker-build.ps1`.
 
 Optional `--build-arg` files in that folder (Nornir names; the `example.*` template is not merged):
 
@@ -47,13 +49,26 @@ Copy-Item D:\src\git\Sam2Trainer\docker\example.sam2-trainer-dev.build.env `
 
 ## Run / Dev Container
 
-Open **this folder** (not a multi-root workspace) and **Reopen in Container**. Compose loads `docker/compose.cursor-dev.yaml` plus `D:\Docker\Run\sam2-dev\compose.net-mounts.override.yaml`.
+The same container serves TEM and SEM data, one at a time (they share the ports). What differs is in `TEM.env` / `SEM.env` next to the shared `.env` in `D:\Docker\Run\sam2-dev\` (templates: `docker/example.TEM.env`, `docker/example.SEM.env`):
 
-CLI:
+| Key | TEM | SEM |
+| --- | --- | --- |
+| `SAM2_LOCAL_DATA_HOST` (mounted at `/data-local`) | `\wsl.localhost\Ubuntu\home\jamesan\sam2-training` | `...\sam2-training-sem` |
+| `SAM2_OUTPUT_HOST` (`/outputs`) | `D:/Docker/mounted-configs/sam2-trainer` | `...-sem` |
+| `SAM2_CHECKPOINT_ROOT` | `/storage4/Sam2Trainer` | `/storage4/Sam2Trainer/SEM` |
+
+Both scripts require `-Modality TEM|SEM` and pass `--env-file docker/.env --env-file <Modality>.env` to Compose. If a trainer of the other modality is running they say so and ask whether to replace it (a non-interactive session stops instead). Compose itself has no defaults for these keys, so a launch without a modality env file fails with a message.
 
 ```powershell
-& D:\src\git\Sam2Trainer\docker\run-cursor-dev.ps1
+# Mirror the data first (WSL): scripts/WSL/sync_training_data.sh   or   sem-sync_training_data.sh v1
+& D:\src\git\Sam2Trainer\docker\run-cursor-dev.ps1 -Modality SEM
+# Rebuild the image and recreate a running cursor-dev onto it:
+& D:\Docker\Builds\sam2-trainer\rebuild-and-start.ps1 SEM      # or -SkipRecreate to only build
+# The gallery shares /data-local; after switching modality recreate it (the script prints the command):
+docker compose --env-file docker\.env --env-file D:\Docker\Run\sam2-dev\SEM.env -f docker\compose.cursor-dev.yaml up -d annotation-gallery-tem annotation-gallery-sem gallery-router
 ```
+
+**Dev Container ("Reopen in Container").** Cursor starts Compose with `docker/.env` only, so it cannot pick a modality; the Compose file then stops with the "set SAM2_MODALITY via TEM.env or SEM.env" error. Start the container with `run-cursor-dev.ps1 -Modality ...` (or Compose with both `--env-file`s) and use **Attach to Running Container**. `COMPOSE_ENV_FILES` would do it, but Compose only reads it from the process environment (not from `.env`), and setting it globally would also change the default `.env` of every other Compose project on the machine.
 
 ## Paths inside the container
 
@@ -61,7 +76,7 @@ CLI:
 | --- | --- | --- |
 | `SAM2_DATA_ROOT` | `/data-local/current` (symlink to a version; fallback `/storage4`) | Local NVMe or NAS volumes |
 | `SAM2_OUTPUT_ROOT` | `/outputs` | Splits, pretrained download, TB pid/log |
-| `SAM2_CHECKPOINT_ROOT` | `/storage4/Sam2Trainer` | Run dir: `last.pt`, `best_model.pt`, epoch snaps, TB events (CIFS) |
+| `SAM2_CHECKPOINT_ROOT` | `/storage4/Sam2Trainer` (SEM: `/storage4/Sam2Trainer/SEM`) | Run dir: `last.pt`, `best_model.pt`, epoch snaps, TB events (CIFS) |
 | workspace | `/workspace` | This git checkout (editable install) |
 | SAM2 source | `/opt/sam2` | Pinned `facebookresearch/sam2` |
 | TensorBoard | host `8060` → container `6006` | Auto-started; reads `$SAM2_CHECKPOINT_ROOT/runs` |
@@ -84,7 +99,7 @@ This is **not** Pascal VOC (`JPEGImages` / `Annotations` / `ImageSets`). Do not 
 
 ## Local version mirrors
 
-On the WSL host, `~/sam2-training` is mounted at `/data-local`. Source trees live under `/mnt/d/TrainingData/<ver>` (`v1`, `v1b`, `v2`, …). Sync from that host, not inside the container:
+On the WSL host, `~/sam2-training` (TEM) or `~/sam2-training-sem` (SEM, via the `sem-` scripts) is mounted at `/data-local`, whichever `-Modality` you launch with. Source trees live under `/mnt/d/TrainingData/<ver>` (`v1`, `v1b`, `v2`, …). Sync from that host, not inside the container:
 
 ```bash
 # Mirror the highest source version and point current at it.
@@ -98,12 +113,14 @@ scripts/WSL/sync_training_data.sh -n -noselect v2
 # Mirror a new version and carry the review lists and location_scores over from v2.
 scripts/WSL/sync_training_data.sh -clone-from v2 v3
 # Mirror from the NAS instead of D: (CIFS mount of //192.168.0.199/Data at /mnt/y; setup in scripts/WSL/wsl-training.README).
-TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData scripts/WSL/sync_training_data.sh -noselect v2
+TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData scripts/WSL/sync_training_data.sh -noselect v2   # reads .../TEM; use sem-sync_training_data.sh for SEM
 # Only retarget current (no copy). No arg picks the highest local version.
 scripts/WSL/select_training_data.sh v2
 ```
 
 `current` is a relative symlink (`v2`). Restart training after it changes.
+
+The mirror copies only what training and the gallery read: `images/`, `masks/`, the manifest, catalog and JSON files, and `overlays/thumb` and `overlays/parts`. `_work/` and the full-size overlay renders are skipped (tens of GB per volume). It runs one rsync per volume and folder in parallel; `-j N` sets the job count (default: CPUs, at most 8). The NAS `version-sync` skips the same folders.
 
 A mirror keeps each volume's `approved.json`, `ignore.json`, and `ignored/` (rejected masks are moved back to `ignored/` after the copy) and the `location_scores` table in `annotation_crops.sqlite` (saved before the copy and merged back after). A new version starts without them, so build it with `-clone-from <older version>`: it hardlinks the older version (unchanged files take no extra disk space), copies the catalog and review files for real, and rsyncs only the changes. `-seed-from` carries the review state over without cloning.
 
@@ -230,10 +247,11 @@ sam2-em-train -benchmark model.activation_checkpointing=true model.activation_ch
 # /data-local/current tree. Trash moves a mask from masks/ to ignored/.
 # A running sam2-em-train rebuilds its inventory at the next epoch when
 # ignore.json is newer than the last read, or when a listed tile is missing.
-# HTTP http://127.0.0.1:8080
-# HTTPS https://127.0.0.1:8443 when SSL_CERT_PATH and SSL_KEY_PATH exist.
+# TEM gallery http://127.0.0.1:8081, SEM gallery http://127.0.0.1:8082 (plain HTTP, debugging; sign-in needs the HTTPS names).
+# Public: https://tem.gallery.codepharm.net, https://sem.gallery.codepharm.net; https://gallery.codepharm.net redirects to
+# the modality the trainer runs. See "Gallery hostnames, certificate and access" below.
 # Reopen in Container starts it. From the CLI:
-#   docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml up -d annotation-gallery
+#   docker compose --env-file docker/.env -f docker/compose.cursor-dev.yaml up -d annotation-gallery-tem annotation-gallery-sem gallery-router
 
 # Live progress is also published to the Nornir build dashboard when its Mosquitto
 # broker is up (nornir-docker/start-dashboard.ps1). The container uses
@@ -307,3 +325,24 @@ findmnt -no FSTYPE,SOURCE /storage4
 ls /storage4 | head
 pip show sam2-segmentation-trainer
 ```
+
+## Gallery hostnames, certificate and access
+
+- `tem.gallery.codepharm.net` and `sem.gallery.codepharm.net` are two gallery containers (`annotation-gallery-tem`, `-sem`) on the
+  compose network. `gallery-router` (nginx, `docker/gallery-router/gallery.conf`) terminates TLS for both and for
+  `gallery.codepharm.net`, which 302-redirects to the modality the trainer runs. `run-cursor-dev.ps1` / `docker-build.ps1`
+  write that choice (`active.conf` in `SAM2_GALLERY_ROUTER_DIR`) and reload the router. Ports: router HTTP 8080 / HTTPS 8442,
+  TEM gallery 8081, SEM gallery 8082. The reverse proxy's stream map sends all three names to 8442; plain HTTP for the tem. and sem.
+  names is a redirect in the proxy's `custom/http.conf`.
+- One certificate (lineage `gallery.codepharm.net`, SANs for all three names) from `annotation-gallery-certbot-renewer`, which restarts
+  `gallery-router` after a renewal. The renewer only requests extra names for a new lineage. To widen an existing one, run once:
+  `docker exec annotation-gallery-certbot-renewer certbot certonly --non-interactive --agree-tos --dns-cloudflare --dns-cloudflare-credentials /tmp/cloudflare.ini --cert-name gallery.codepharm.net -d gallery.codepharm.net -d tem.gallery.codepharm.net -d sem.gallery.codepharm.net --expand --email <address>`.
+- Sign-in: `GALLERY_IDENTITY_MODE=oidc` (default). Anonymous visitors are sent to Identity Server. Register one OIDC client per host
+  (redirect `https://<tem|sem>.gallery.codepharm.net/callback`) and set `GALLERY_TEM_OIDC_CLIENT_ID/_SECRET` and
+  `GALLERY_SEM_OIDC_CLIENT_ID/_SECRET` in the shared `.env`. Read permission on a volume's annotation database lets a user view
+  it; the permission named by `GALLERY_REVIEW_PERMISSION` (default `Annotate`) allows refresh, accept, reject and the other writes.
+- Grants are matched by annotation database name (`annotationDb` in `source.json`; else the OData URL's `<db>`; else the folder name),
+  because SEM folders are not named after their database. `scripts/NAS/backfill-annotation-db [--write]` adds the field to
+  existing datasets without a re-export. The exporter should write it from now on.
+- AI crawlers: `robots.txt` disallows everything, every response carries `X-Robots-Tag: noindex, noai`, and known AI user agents
+  get 403 (in the gallery and in the router). The login is what actually keeps scrapers out.

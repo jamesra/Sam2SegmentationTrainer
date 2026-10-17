@@ -50,6 +50,7 @@
 
   const els = {
     who: document.getElementById("who"),
+    logout: document.getElementById("logout"),
     trainingSet: document.getElementById("training-set"),
     volume: document.getElementById("volume"),
     type: document.getElementById("type"),
@@ -3063,6 +3064,7 @@
     state.me = await getJson(withSet("/api/me"));
     const volumes = state.me.volumes || [];
     els.who.textContent = `${state.me.displayName} (${state.config.identityMode})`;
+    els.logout.hidden = state.config.identityMode !== "oidc";
     els.volume.innerHTML = volumes
       .map((item) => `<option value="${item.name}">${item.name} · ${item.permission}</option>`)
       .join("");

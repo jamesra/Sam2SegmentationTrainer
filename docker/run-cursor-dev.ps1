@@ -11,10 +11,20 @@
   substitution of NORNIR_NET_MOUNTS_DIR_HOST and NORNIR_NET_CREDS_DIR_HOST. Those dirs
   must exist (reuse Nornir's nornir-dev net-mounts; do not copy .cred files into git).
 
+.PARAMETER Modality
+  Required. TEM or SEM. Layers <Modality>.env (D:\Docker\Run\sam2-dev\<Modality>.env, else
+  docker\<Modality>.env) over docker/.env: data mirror, output folder and checkpoint root for
+  that modality. If a trainer of the other modality is running (shared ports) it asks whether to
+  replace it: Yes stops that container first, No leaves it and exits.
+
 .PARAMETER RemainingArgs
   Passed to the container after the service name (for example an alternate command).
 #>
 param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('TEM', 'SEM')]
+    [string]$Modality,
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RemainingArgs
 )
@@ -26,23 +36,7 @@ $RepoRoot = Split-Path -Parent $DockerDir
 $envFile = Join-Path $DockerDir '.env'
 $exampleRel = 'docker/example.cursor-dev.run.env'
 
-function Get-DotEnvValue {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Key
-    )
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return $null
-    }
-    $prefix = "$Key="
-    foreach ($line in Get-Content -LiteralPath $Path) {
-        $trim = $line.Trim()
-        if ($trim.StartsWith($prefix)) {
-            return $trim.Substring($prefix.Length).Trim()
-        }
-    }
-    return $null
-}
+. (Join-Path $PSScriptRoot 'sam2-modality.ps1')
 
 if (-not (Test-Path -LiteralPath $envFile)) {
     Write-Error @"
@@ -52,8 +46,8 @@ Missing $envFile (Compose substitution). Do:
 "@
 }
 
-$mountsDir = Get-DotEnvValue -Path $envFile -Key 'NORNIR_NET_MOUNTS_DIR_HOST'
-$credsDir = Get-DotEnvValue -Path $envFile -Key 'NORNIR_NET_CREDS_DIR_HOST'
+$mountsDir = Get-Sam2DotEnvValue -Path $envFile -Key 'NORNIR_NET_MOUNTS_DIR_HOST'
+$credsDir = Get-Sam2DotEnvValue -Path $envFile -Key 'NORNIR_NET_CREDS_DIR_HOST'
 if ([string]::IsNullOrWhiteSpace($mountsDir) -or [string]::IsNullOrWhiteSpace($credsDir)) {
     Write-Error "docker/.env must set NORNIR_NET_MOUNTS_DIR_HOST and NORNIR_NET_CREDS_DIR_HOST (see $exampleRel)."
 }
@@ -64,11 +58,7 @@ if (-not (Test-Path -LiteralPath $credsDir)) {
     Write-Error "NORNIR_NET_CREDS_DIR_HOST does not exist: $credsDir"
 }
 
-$outputHost = Get-DotEnvValue -Path $envFile -Key 'SAM2_OUTPUT_HOST'
-if ([string]::IsNullOrWhiteSpace($outputHost)) {
-    $outputHost = 'D:/Docker/mounted-configs/sam2-trainer'
-}
-New-Item -ItemType Directory -Force -Path $outputHost | Out-Null
+$modalityEnv = Initialize-Sam2Modality -Modality $Modality -DockerDir $DockerDir
 
 $composeFile = Join-Path $DockerDir 'compose.cursor-dev.yaml'
 $composeFiles = @('-f', $composeFile)
@@ -99,11 +89,17 @@ Copy docker\example.compose.net-mounts.override.yaml to D:\Docker\Run\sam2-dev\c
 
 Set-Location -LiteralPath $RepoRoot
 
-$runArgs = @('compose') + $composeFiles + @('--env-file', $envFile, 'run', '--rm', 'cursor-dev')
+$dockerCmd = Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($dockerCmd) {
+    Confirm-Sam2ReplaceOtherModality -DockerExe $dockerCmd.Source -Modality $Modality -StopOnConfirm
+}
+
+$runArgs = @('compose') + $composeFiles + @('--env-file', $envFile, '--env-file', $modalityEnv, 'run', '--rm', 'cursor-dev')
 foreach ($a in $RemainingArgs) {
     $runArgs += $a
 }
 
 Write-Host "docker $($runArgs -join ' ')"
+Set-Sam2ActiveGalleryModality -DockerExe $dockerCmd.Source -Modality $Modality -EnvFile $envFile
 & docker @runArgs
 exit $LASTEXITCODE
