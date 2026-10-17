@@ -71,10 +71,18 @@ def grants_for_registry(
     registry_names: list[str],
     aliases: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Grants keyed by registry folder: a folder takes the grant of its annotation database name."""
+    """Grants keyed by registry folder: a folder takes the grant of its annotation database name.
+
+    Names are compared case-insensitively: Identity calls the context ``cped`` and the dataset folder is ``CPED``.
+    """
+    by_lower: dict[str, str] = {}
+    for name, role in grants.items():
+        key = name.lower()
+        if by_lower.get(key) != PERMISSION_REVIEW:
+            by_lower[key] = role
     out: dict[str, str] = {}
     for folder in registry_names:
-        role = grants.get((aliases or {}).get(folder) or folder)
+        role = by_lower.get(((aliases or {}).get(folder) or folder).lower())
         if role:
             out[folder] = role
     return out

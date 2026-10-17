@@ -1318,3 +1318,10 @@ def test_grants_follow_the_annotation_database_name_not_the_folder() -> None:
     folders = ["NasalMonkey", "RC1", "InferiorMonkey"]
     aliases = {"NasalMonkey": "NeitzNM", "InferiorMonkey": "NeitzInferiorMonkey"}
     assert grants_for_registry(grants, folders, aliases) == {"NasalMonkey": "review", "RC1": "read"}
+
+
+def test_grants_match_database_names_regardless_of_case() -> None:
+    from identity import grants_for_registry
+
+    assert grants_for_registry({"cped": "read"}, ["CPED"], {"CPED": "CPED"}) == {"CPED": "read"}
+    assert grants_for_registry({"Cped": "read", "cped": "review"}, ["CPED"]) == {"CPED": "review"}
