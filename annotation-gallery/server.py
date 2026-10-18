@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import hmac
 import json
@@ -267,6 +268,42 @@ def cookie_attributes(environ: dict[str, str] | None = None, max_age: int | None
 
 
 SESSION_MAX_AGE = 8 * 3600
+
+# The catalog of a big volume is tens of MB of JSON (CPED: 52k rows, 27 MB, ~4.5 s to build). It is rebuilt only when
+# the database or the review files change, and sent gzipped to browsers that accept it.
+_CATALOG_CACHE: dict[str, tuple[tuple, bytes, bytes]] = {}
+_CATALOG_LOCK = threading.Lock()
+
+
+def catalog_stamp(crops: Path) -> tuple:
+    """Changes whenever something the catalog shows changes (rows, review state, rejected masks)."""
+    parts = []
+    for name in ("annotation_crops.sqlite", "annotation_crops.sqlite-wal", "ignore.json", "approved.json", "ignored"):
+        try:
+            info = (Path(crops) / name).stat()
+            parts.append((name, info.st_mtime_ns, info.st_size))
+        except OSError:
+            parts.append((name, 0, 0))
+    return tuple(parts)
+
+
+def catalog_body(crops: Path, volume: str, permission: str, crop_size: int) -> tuple[bytes, bytes]:
+    """(json, gzip) of the whole catalog answer, cached until the volume's stamp changes."""
+    key = f"{crops}|{volume}|{permission}|{crop_size}"
+    stamp = catalog_stamp(crops)
+    with _CATALOG_LOCK:
+        cached = _CATALOG_CACHE.get(key)
+        if cached and cached[0] == stamp:
+            return cached[1], cached[2]
+    body = json.dumps(
+        {"volume": volume, "permission": permission, "cropSize": crop_size, "rows": list_catalog_rows(crops)}
+    ).encode("utf-8")
+    packed = gzip.compress(body, compresslevel=5)
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE[key] = (stamp, body, packed)
+    return body, packed
+
+
 TOKEN_COOKIE = "gallery_sid"
 
 # Identity access tokens by random session id, in memory only: a restart means the next Viking link asks the
@@ -1248,13 +1285,18 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (ValueError, FileNotFoundError):
             self._send_json({"error": "not found"}, status=404)
             return
-        rows = list_catalog_rows(crops)
-        self._send_json({
-            "volume": volume,
-            "permission": principal.grants[volume],
-            "cropSize": read_crop_size(crops) or 1024,
-            "rows": rows,
-        })
+        body_json, body_gzip = catalog_body(crops, volume, principal.grants[volume], read_crop_size(crops) or 1024)
+        wants_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+        body = body_gzip if wants_gzip else body_json
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if wants_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_tags(self, volume: str, pattern: str) -> None:
         principal = self._principal()

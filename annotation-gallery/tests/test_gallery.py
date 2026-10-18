@@ -1373,6 +1373,25 @@ def test_viking_link_endpoint_needs_a_token_and_a_granted_volume(
     assert status == 404
 
 
+def test_catalog_is_cached_until_the_database_changes_and_can_be_gzipped(
+    httpd: tuple[str, int], registry: Path
+) -> None:
+    import gzip as gzip_module
+
+    connection = HTTPConnection(httpd[0], httpd[1], timeout=5)
+    connection.request("GET", "/api/volumes/RC2/catalog", headers={"Authorization": "Bearer read"})
+    plain = connection.getresponse()
+    plain_body = plain.read()
+    assert plain.status == 200 and plain.getheader("Content-Encoding") is None
+    connection.request("GET", "/api/volumes/RC2/catalog", headers={"Authorization": "Bearer read", "Accept-Encoding": "gzip"})
+    packed = connection.getresponse()
+    packed_body = packed.read()
+    connection.close()
+    assert packed.getheader("Content-Encoding") == "gzip"
+    assert json.loads(gzip_module.decompress(packed_body)) == json.loads(plain_body)
+    assert json.loads(plain_body)["rows"], "the seeded location is listed"
+
+
 def test_grants_match_database_names_regardless_of_case() -> None:
     from identity import grants_for_registry
 

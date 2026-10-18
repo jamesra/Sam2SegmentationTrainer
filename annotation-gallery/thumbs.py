@@ -31,7 +31,8 @@ THUMB_SIZES = frozenset({512, 384, 256})
 JPEG_QUALITY = 90
 IMAGE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
 _CROP_SUFFIXES = (".png", ".jpg", ".jpeg")
-_ENCODE_WORKERS = 8
+# Few enough that the HTTP threads (catalog, on-demand thumbnails) keep a share of the CPU while a backfill runs.
+_ENCODE_WORKERS = 4
 _WATCH_INTERVAL_S = 5.0
 _WATCH_FOLDERS = ("images", "masks", "ignored")
 
