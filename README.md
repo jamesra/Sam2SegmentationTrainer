@@ -281,7 +281,7 @@ sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/
 # the manifest carries it as training_data, separate from the model's own version. v2 and v3 predate the exporter and
 # need hand-written manifests (examples in docs/model_manifest_examples/, checked with
 # `python -m sam2_segmentation_trainer.model_manifest check <file>`).
-# The command below exports best_model.pt by hand. Name the file for the model: v<VERSION>.<EPOCH>.pt, here v1.6.pt
+# The command below exports best_model.pt by hand. Name the file for the model: v<VERSION>.<EPOCH>.pt, here v1.6.pt (a label may lead it: sem-v1.6.pt)
 # for run sam2_em_v1 and epoch 6 (VERSION comes from the run name, EPOCH from best_model.json that training writes
 # beside best_model.pt; for an older run pass --epoch N, and --model-id v<N> when the run name has no _vN).
 # --description "..." sets the operator's description; leave it out to keep the one already in the manifest.

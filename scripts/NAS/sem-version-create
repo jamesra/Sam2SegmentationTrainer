@@ -1,0 +1,99 @@
+#!/bin/sh
+# sem-version-create [-n] [-j N] [-p PATTERN] [<version>] [VOLUME_NAME ...]
+#
+# Create a SEM training version in SAM2TrainingData/SEM (the TEM versions are in
+# SAM2TrainingData/TEM) from the live exports in Volumes/<VOL>/AnnotationCrops.
+# Source volumes are the folders directly inside Volumes whose name contains "Neitz"
+# (no recursion, case-sensitive; -p changes the pattern). Naming VOLUME_NAME(s) uses those instead.
+# <version> defaults to v1 and is a new set folder: this refuses if it already exists
+# (a published set is immutable; use version-bump/version-sync to revise one).
+# Volumes without Volumes/<VOL>/AnnotationCrops are skipped with a note.
+# Run ON the Synology. The copy is done by version-sync (checksum rsync, parallel per subfolder).
+#
+#   -n   dry run (creates nothing; lists the volumes and what version-sync would write)
+#   -j N parallel rsync jobs, passed to version-sync (default: number of CPUs)
+#   -p   glob matched against folder names in Volumes (default: *Neitz*)
+#
+# Env: DATA_ROOT (default /volume1/Data), SEM_TRAIN_ROOT (default $DATA_ROOT/SAM2TrainingData/SEM)
+# See training.README.
+
+set -eu
+
+DATA_ROOT="${DATA_ROOT:-/volume1/Data}"
+SEM_TRAIN_ROOT="${SEM_TRAIN_ROOT:-$DATA_ROOT/SAM2TrainingData/SEM}"
+DRY=0
+JOBS=""
+PATTERN="*Neitz*"
+
+usage() { sed '/^#/!q' "$0" | sed 1d | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+
+while getopts "nj:p:h" opt; do
+    case "$opt" in
+        n) DRY=1 ;;
+        j) JOBS=$OPTARG ;;
+        p) PATTERN=$OPTARG ;;
+        h) usage 0 ;;
+        *) usage 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+VERSION=v1
+if [ $# -ge 1 ]; then VERSION=$1; shift; fi
+case "$VERSION" in
+    v[0-9]*) ;;
+    *) echo "error: version should look like v1, v2, ... (got '$VERSION')" >&2; exit 1 ;;
+esac
+case "$JOBS" in *[!0-9]*) echo "error: -j needs a positive integer" >&2; exit 1 ;; esac
+
+# version-sync lives next to this script (or on PATH once installed to ~/bin).
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$HERE/version-sync" ]; then SYNC="$HERE/version-sync"
+elif command -v version-sync >/dev/null 2>&1; then SYNC=$(command -v version-sync)
+else echo "error: version-sync not found (expected next to $0 or on PATH)" >&2; exit 1; fi
+
+VOLROOT="$DATA_ROOT/Volumes"
+[ -d "$VOLROOT" ] || { echo "error: not found: $VOLROOT" >&2; exit 1; }
+
+if [ $# -eq 0 ]; then
+    # Direct children of Volumes only. An unmatched glob stays literal, so test each hit.
+    for p in "$VOLROOT"/$PATTERN; do
+        [ -d "$p" ] && set -- "$@" "$(basename "$p")"
+    done
+    [ $# -gt 0 ] || { echo "error: no folders matching '$PATTERN' in $VOLROOT" >&2; exit 1; }
+fi
+
+# Keep only volumes that have crops; the rest are reported, not fatal.
+GOOD=""
+for VOL in "$@"; do
+    if [ -d "$VOLROOT/$VOL/AnnotationCrops" ]; then
+        GOOD="$GOOD $VOL"
+        echo "  use   $VOL"
+    else
+        echo "  skip  $VOL (no $VOLROOT/$VOL/AnnotationCrops - run ExportTrainingData first)" >&2
+    fi
+done
+[ -n "$GOOD" ] || { echo "error: none of the volumes has an AnnotationCrops folder; nothing to do" >&2; exit 1; }
+
+SET="$SEM_TRAIN_ROOT/$VERSION"
+[ ! -e "$SET" ] || { echo "error: already exists: $SET (a published set is immutable; pick a new version)" >&2; exit 1; }
+echo "$VOLROOT/<VOL>/AnnotationCrops -> $SET/<VOL>"
+
+if [ "$DRY" -eq 1 ]; then
+    echo "(dry run) would create $SET"
+    # version-sync -n needs the set folder, so preview against an empty temp root.
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    mkdir -p "$TMP/$VERSION"
+    # shellcheck disable=SC2086
+    TRAIN_ROOT=$TMP DATA_ROOT=$DATA_ROOT sh "$SYNC" -n ${JOBS:+-j "$JOBS"} "$VERSION" $GOOD
+    exit $?
+fi
+
+mkdir -p "$SET"
+# shellcheck disable=SC2086
+if ! TRAIN_ROOT=$SEM_TRAIN_ROOT DATA_ROOT=$DATA_ROOT sh "$SYNC" ${JOBS:+-j "$JOBS"} "$VERSION" $GOOD; then
+    echo "error: version-sync reported problems; $SET may be incomplete (remove it and rerun)" >&2
+    exit 1
+fi
+echo "done: $SET"

@@ -1,0 +1,5 @@
+#!/bin/sh
+# sem-version-sync: version-sync on the SEM training sets (SAM2TrainingData/SEM).
+# Same arguments as version-sync. Keep it next to version-sync (or install both to ~/bin).
+HERE=$(cd "$(dirname "$0")" && pwd)
+MODALITY=SEM exec sh "$HERE/version-sync" "$@"

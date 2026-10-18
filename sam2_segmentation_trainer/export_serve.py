@@ -130,8 +130,9 @@ def export_serve_checkpoint(
     diameter scale and the circle-annotation trust fractions for the server to apply.
 
     A model manifest (``<out stem>.model.json``, see ``model_manifest.py``) is written beside the file too: the model
-    id, its version, the run's training-data record and the encoding. The model is named ``v<VERSION>.<EPOCH>``
-    (``.cursor/rules/naming-conventions.mdc``): ``v<VERSION>`` comes from the run name (``sam2_em_v4`` is ``v4``) unless
+    id, its version, the run's training-data record and the encoding. The model is named ``v<VERSION>.<EPOCH>``, and
+    the file name may lead with labels joined by ``-`` (``sem-v1.5.pt``); a file name that ends in a different
+    version is refused (``.cursor/rules/naming-conventions.mdc``): ``v<VERSION>`` comes from the run name (``sam2_em_v4`` is ``v4``) unless
     ``model_id`` says otherwise, and ``epoch`` is the trainer's epoch index of these weights (read from
     ``best_model.json`` beside a ``best_model.pt`` when omitted).
 
@@ -139,7 +140,8 @@ def export_serve_checkpoint(
     ``out`` is kept, so re-exporting never erases what someone wrote.
 
     Raises:
-        ValueError: The model version or the epoch cannot be told. Checked before any weights are loaded.
+        ValueError: The model version or the epoch cannot be told, or ``out`` is named for another model version.
+            Checked before any weights are loaded.
     """
     import torch
 
@@ -151,6 +153,7 @@ def export_serve_checkpoint(
         manifest_path,
         model_id_for_run,
         model_version_name,
+        stem_mismatch,
         write_manifest,
     )
 
@@ -169,6 +172,10 @@ def export_serve_checkpoint(
             "the epoch these weights come from is not known: pass --epoch "
             "(a best_model.pt export reads best_model.json beside it, which runs started after the naming convention write)"
         )
+    # A file named for a model must be named for this one: v1.6.pt or sem-v1.6.pt for epoch 6, not epoch 5.
+    mismatch = stem_mismatch(Path(out).stem, model_version_name(resolved_id, epoch))
+    if mismatch:
+        raise ValueError(mismatch)
 
     model = load_finetuned_model(finetuned, base_ckpt, model_cfg, device)
     metadata = serve_metadata(circle_diameter_scale, run_dir)

@@ -12,8 +12,12 @@ annotation gallery containers (~/sam2-training is bind-mounted at /data-local).
                               images/, masks/, approved.json, ignore.json, ignored/
     current -> v3           relative symlink; the containers read /data-local/current
 
-Source of truth: Y:\SAM2TrainingData\<version>\<VOL> (the NAS, built with
-version-bump / version-sync). WSL copies are plain ext4 (no reflinks), so every
+Source of truth: Y:\SAM2TrainingData\TEM\<version>\<VOL> (the NAS, built with
+version-bump / version-sync). SEM data is separate: Y:\SAM2TrainingData\SEM\<version>\<VOL>
+(sem-version-*), mirrored to ~/sam2-training-sem with sem-sync_training_data.sh and
+sem-select_training_data.sh (same arguments; set SAM2_TRAINING_DEST_SEM to move it). SEM never
+touches ~/sam2-training or its `current` link. The container mounts one or the other, chosen by
+`run-cursor-dev.ps1 -Modality TEM|SEM` (see TEM.env / SEM.env; README "Run / Dev Container"). WSL copies are plain ext4 (no reflinks), so every
 version costs its full size.
 
 Version names
@@ -24,6 +28,16 @@ tweaked v2 made with the same creation rules; new creation rules mean a new numb
 is the old style: still accepted, do not create new ones. current is a pointer, not
 a version. Models have their own numbers (v<VERSION>.<EPOCH>); see
 .cursor/rules/naming-conventions.mdc.
+
+What is copied
+--------------
+Only what training and the annotation gallery read: images/, masks/, manifest.jsonl, the catalog
+and the *.json files, plus overlays/thumb and overlays/parts (the gallery serves those). Left out:
+_work/ (the exporter's cache), the full-size overlay renders directly under overlays/ (tens of GB,
+viewing only), and overlays/cardmask (rebuilt on demand). The list is SYNC_NEVER_COPY /
+SYNC_OVERLAY_KEEP in training_data_common.sh. Folders already present in an older mirror are
+left alone, not deleted; remove them by hand to reclaim the space. A folder deleted from the
+source is no longer removed from the mirror.
 
 Review state that must survive a mirror
 ---------------------------------------
@@ -48,12 +62,12 @@ One-time setup
 
   # Test by hand first (read-only: the mirror only reads)
   sudo mount -t cifs //192.168.0.199/Data /mnt/y -o credentials=/root/.storage4.cred,uid=$(id -u),gid=$(id -g),vers=3.1.1,ro,rsize=8388608,wsize=8388608,cache=loose,actimeo=20,nostrictsync,nobrl,noperm,mfsymlinks,iocharset=utf8
-  ls /mnt/y/SAM2TrainingData
+  ls /mnt/y/SAM2TrainingData/TEM
 
   # Then make it survive restarts (WSL runs `mount -a` at startup)
   sudo umount /mnt/y
   echo '//192.168.0.199/Data /mnt/y cifs credentials=/root/.storage4.cred,uid=1000,gid=1000,vers=3.1.1,ro,rsize=8388608,wsize=8388608,cache=loose,actimeo=20,nostrictsync,nobrl,noperm,mfsymlinks,iocharset=utf8,_netdev,nofail 0 0' | sudo tee -a /etc/fstab
-  sudo mount -a && ls /mnt/y/SAM2TrainingData
+  sudo mount -a && ls /mnt/y/SAM2TrainingData/TEM
 
   Notes: uid/gid 1000 must match `id -u` / `id -g`. Add multichannel,max_channels=4 for
   faster large copies. actimeo=20 means NAS-side changes can take ~20 s to show up, so
@@ -70,12 +84,14 @@ One-time setup
   mkdir -p ~/bin
   ln -sf "$PWD/scripts/WSL/sync_training_data.sh" ~/bin/sync_training_data.sh
   ln -sf "$PWD/scripts/WSL/select_training_data.sh" ~/bin/select_training_data.sh
+  ln -sf "$PWD/scripts/WSL/sem-sync_training_data.sh" ~/bin/sem-sync_training_data.sh
+  ln -sf "$PWD/scripts/WSL/sem-select_training_data.sh" ~/bin/sem-select_training_data.sh
   rm -f ~/bin/training_data_common.sh          # a stale copy from before, if any
   # If the checkout is not at /mnt/d/src/git/Sam2Trainer, say where it is:
   export SAM2_TRAINER_REPO=/mnt/d/src/git/Sam2Trainer
 
   # Put these in ~/.bashrc to skip typing them
-  export TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData
+  export TRAINING_DATA_SRC=/mnt/y/SAM2TrainingData   # the scripts add /TEM or /SEM themselves
   export SAM2_TRAINING_DEST=$HOME/sam2-training
 
 Run these in the WSL Ubuntu shell, not inside a container.
@@ -108,6 +124,7 @@ Refresh an EXISTING version (example: v3 was re-exported on the NAS)
 Flags
 -----
   -n               dry run: layout check, seeding, and rsync changes are listed
+  -j N             parallel rsync jobs, one per volume and folder (default: CPUs, at most 8)
   -clone-from vX   build the new version as a hardlink clone of vX, then rsync only the
                    changes (unchanged files share disk space). The catalog and review
                    files are real copies. Implies -seed-from. The new version must not exist.

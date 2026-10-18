@@ -195,6 +195,24 @@ class ExportServeTests(unittest.TestCase):
                 )
             load.assert_not_called()
 
+    def test_a_file_named_for_another_version_is_refused_and_a_labelled_name_is_written_whole(self) -> None:
+        with TemporaryDirectory() as tmp, mock.patch(
+            "sam2_segmentation_trainer.export_serve.load_finetuned_model", return_value=nn.Linear(2, 2)
+        ) as load:
+            run = Path(tmp) / "sam2_em_v1"
+            with self.assertRaisesRegex(ValueError, "says v1.4 but the model version is v1.5"):
+                export_serve_checkpoint(
+                    finetuned=run / "best_model.pt", base_ckpt=Path("b.pt"), out=Path(tmp) / "sem-v1.4.pt", epoch=5,
+                )
+            load.assert_not_called()
+            out = export_serve_checkpoint(
+                finetuned=run / "best_model.pt", base_ckpt=Path("b.pt"), out=Path(tmp) / "sem-v1.5.pt", epoch=5,
+            )
+            manifest = json.loads((Path(tmp) / "sem-v1.5.model.json").read_text(encoding="utf-8"))
+            self.assertTrue((Path(tmp) / "sem-v1.5.prompt_encoding.json").is_file())
+        self.assertEqual(out.name, "sem-v1.5.pt")
+        self.assertEqual((manifest["model"]["model_id"], manifest["model"]["model_version"]), ("v1", "v1.5"))
+
     def test_the_command_line_reports_a_naming_problem_as_a_usage_error(self) -> None:
         with TemporaryDirectory() as tmp, mock.patch(
             "sam2_segmentation_trainer.paths.pretrained_checkpoint", return_value=Path("b.pt")

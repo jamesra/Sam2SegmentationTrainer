@@ -1,4 +1,7 @@
 {
+  // Compose needs a modality env file (TEM.env / SEM.env, layered over docker/.env) that Reopen in
+  // Container cannot supply, so this stops with "set SAM2_MODALITY via TEM.env or SEM.env".
+  // Start the container with docker/run-cursor-dev.ps1 -Modality TEM|SEM and Attach to Running Container.
   "name": "SAM2 trainer (cursor-dev + net mounts)",
   "dockerComposeFile": [
     "../docker/compose.cursor-dev.yaml",

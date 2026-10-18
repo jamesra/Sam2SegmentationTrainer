@@ -15,6 +15,8 @@ from sam2_segmentation_trainer.model_manifest import (
     manifest_path,
     model_id_for_run,
     model_version_name,
+    stem_mismatch,
+    stem_model_version,
     validate_manifest,
     write_manifest,
 )
@@ -103,6 +105,31 @@ class ModelManifestTests(unittest.TestCase):
         self.assertEqual((v2["model"]["model_id"], v2["model"]["model_version"]), ("v2", "v2.8"))
         for example in (v2, v3):
             self.assertIn("description", example["model"])
+
+    def test_a_file_stem_may_lead_with_labels_joined_by_a_dash(self) -> None:
+        for stem, version in (
+            ("v1.5", "v1.5"), ("sem-v1.5", "v1.5"), ("tem-gpu_a-v4.3", "v4.3"), ("SEM-v12.10", "v12.10"),
+        ):
+            self.assertEqual(stem_model_version(stem), version, stem)
+        # Not model names: left alone, because existing names stay as they are.
+        for stem in ("serve_epoch5", "sam2_em_v3_epoch_9", "sem-v1", "sem_v1.5", "-v1.5", "sem--v1.5x", "v1.5-sem", ""):
+            self.assertIsNone(stem_model_version(stem), stem)
+            self.assertIsNone(stem_mismatch(stem, "v9.9"), stem)
+        self.assertIsNone(stem_mismatch("sem-v1.5", "v1.5"))
+        self.assertIn("v1.4", stem_mismatch("sem-v1.4", "v1.5"))
+        self.assertEqual(manifest_path(Path("/m/sem-v1.5.pt")), Path("/m/sem-v1.5.model.json"))
+
+    def test_the_check_command_flags_a_file_name_for_another_version(self) -> None:
+        manifest = _manifest()  # model_version v4.3
+        with TemporaryDirectory() as tmp:
+            labelled = write_manifest(Path(tmp) / "sem-v4.3.model.json", manifest)
+            legacy = write_manifest(Path(tmp) / "serve_epoch3.model.json", manifest)
+            wrong = write_manifest(Path(tmp) / "sem-v4.2.model.json", manifest)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["check", str(labelled), str(legacy)]), 0)
+                self.assertEqual(main(["check", str(wrong)]), 1)
+        self.assertIn("says v4.2 but the model version is v4.3", out.getvalue())
 
     def test_the_check_command_reports_each_file(self) -> None:
         with TemporaryDirectory() as tmp:

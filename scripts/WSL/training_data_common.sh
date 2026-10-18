@@ -21,6 +21,40 @@ version_sort_key() {
   printf '%05d.%05d%s\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[3]:-0}))" "${letter}"
 }
 
+# Modality of the data: TEM (default) or SEM. They keep separate version numbers, sources and
+# local copies. $1 = the value of MODALITY.
+check_modality() {
+  case "$1" in
+    TEM|SEM) ;;
+    *) echo "MODALITY must be TEM or SEM (got '$1')" >&2; return 1 ;;
+  esac
+}
+
+# Print the NAS source tree: $1 = TRAINING_DATA_SRC, $2 = modality. The NAS keeps
+# SAM2TrainingData/TEM/<ver> and SAM2TrainingData/SEM/<ver>. TEM falls back to $1 itself
+# for the old layout (SAM2TrainingData/<ver>, or a local /mnt/d/TrainingData).
+resolve_training_src() {
+  local base="$1" modality="$2"
+  if [[ -d "$base/$modality" ]]; then
+    echo "$base/$modality"
+  elif [[ "$modality" == TEM ]]; then
+    echo "$base"
+  else
+    echo "no $modality folder under $base" >&2
+    return 1
+  fi
+}
+
+# Print the local mirror: TEM uses SAM2_TRAINING_DEST (default ~/sam2-training, the folder the
+# containers mount); SEM uses SAM2_TRAINING_DEST_SEM (default ~/sam2-training-sem), never the
+# TEM one, so a SEM version cannot land next to TEM versions or under their `current` link.
+resolve_training_dest() {
+  case "$1" in
+    SEM) echo "${SAM2_TRAINING_DEST_SEM:-${HOME}/sam2-training-sem}" ;;
+    *) echo "${SAM2_TRAINING_DEST:-${HOME}/sam2-training}" ;;
+  esac
+}
+
 # Print the highest matching version directory name under $1.
 highest_version_dir() {
   local root="$1"
@@ -55,6 +89,19 @@ volume_layout() {
   fi
 }
 
+# Folders in the root of a version that are not volumes and are never mirrored: _review (review
+# artifacts) and _work_cache (the exporter's cache). Every loop over a version's volumes skips them.
+SYNC_ROOT_NEVER_COPY=(_review _work_cache)
+
+# True when $1, a folder name in the root of a version, is not a volume.
+is_version_root_extra() {
+  local name="$1" n
+  for n in "${SYNC_ROOT_NEVER_COPY[@]}"; do
+    [[ "$name" == "$n" ]] && return 0
+  done
+  return 1
+}
+
 # Fail when a volume is flat on one side and nested on the other. rsync --delete
 # would otherwise replace the destination's layout with the source's.
 check_layouts_match() {
@@ -62,6 +109,7 @@ check_layouts_match() {
   shopt -s nullglob
   for path in "$src"/*/; do
     vol="$(basename "$path")"
+    is_version_root_extra "$vol" && continue
     [[ -d "$dest/$vol" ]] || continue
     sl="$(volume_layout "$src/$vol")"
     dl="$(volume_layout "$dest/$vol")"
@@ -93,6 +141,7 @@ seed_review_lists() {
   shopt -s nullglob
   for path in "$src"/*/; do
     vol="$(basename "$path")"
+    is_version_root_extra "$vol" && continue
     sc="$(volume_crops_dir "$seed/$vol")"
     [[ -n "$sc" ]] || continue
     if [[ "$(volume_layout "$src/$vol")" == nested ]]; then
@@ -327,4 +376,93 @@ link_current() {
   fi
   ln -sfn "$ver" "$dest/current"
   echo "current -> ${ver} (${dest}/current)"
+}
+
+# ---- parallel mirror of a version tree --------------------------------------------------------------
+# What training and the annotation gallery read from a volume's crops folder:
+#   training: images/ masks/ ignored/ manifest.jsonl annotation_crops.sqlite and the *.json files
+#   gallery:  the same, plus overlays/thumb/{512,384,256}/*.jpg and overlays/parts/<id>.json.
+#             overlays/cardmask is rebuilt on demand and is not copied.
+# Never copied: _work/ (the exporter's cache), _review/, ignored/ and approved.json / ignore.json
+# (review state kept on this machine), and everything else under overlays/ (full-size renders, viewing only).
+# In the root of a version, _review/ and _work_cache/ are not volumes and are skipped (SYNC_ROOT_NEVER_COPY).
+SYNC_NEVER_COPY=(_work _review ignored)
+SYNC_OVERLAY_KEEP=(thumb parts)
+
+# Print one NUL-terminated task per unit of work: "<kind>\t<rel>\t<src>\t<dest>".
+#   files: the loose files directly in a volume's crops folder (no subfolders)
+#   dir:   one subfolder (images, masks, overlays/thumb, ...)
+list_mirror_tasks() {
+  local src="$1" dest="$2" vol_path vol rel s d sub name skip n k
+  shopt -s nullglob
+  for vol_path in "$src"/*/; do
+    vol="$(basename "$vol_path")"
+    is_version_root_extra "$vol" && continue
+    case "$(volume_layout "$src/$vol")" in
+      nested) rel="$vol/AnnotationCrops" ;;
+      *) rel="$vol" ;;
+    esac
+    s="$src/$rel"
+    d="$dest/$rel"
+    printf 'files\t%s\t%s\t%s\0' "$rel" "$s" "$d"
+    for sub in "$s"/*/ "$s"/.[!.]*/; do
+      [[ -d "$sub" ]] || continue
+      name="$(basename "$sub")"
+      skip=0
+      for n in "${SYNC_NEVER_COPY[@]}"; do [[ "$name" == "$n" ]] && skip=1; done
+      [[ "$skip" -eq 0 ]] || continue
+      if [[ "$name" == overlays ]]; then
+        for k in "${SYNC_OVERLAY_KEEP[@]}"; do
+          [[ -d "$s/overlays/$k" ]] && printf 'dir\t%s\t%s\t%s\0' "$rel/overlays/$k" "$s/overlays/$k" "$d/overlays/$k"
+        done
+        continue
+      fi
+      printf 'dir\t%s\t%s\t%s\0' "$rel/$name" "$s/$name" "$d/$name"
+    done
+  done
+  shopt -u nullglob
+}
+
+# Run one task (argument: "<kind>\t<rel>\t<src>\t<dest>"). MIRROR_DRY=1 lists changes only.
+_mirror_one() {
+  local kind rel s d args out n
+  IFS=$'\t' read -r kind rel s d <<<"$1"
+  args=(-a --delete --exclude Thumbs.db --exclude .DS_Store)
+  if [[ "${MIRROR_DRY:-0}" == 1 ]]; then
+    args+=(-n --itemize-changes)
+  else
+    args+=(--info=stats2)
+    mkdir -p "$d"
+  fi
+  # Loose files only: subfolders are their own tasks. The review lists are never overwritten.
+  [[ "$kind" == files ]] && args+=(--exclude '/*/' --exclude '/approved.json' --exclude '/ignore.json')
+  if ! out="$(rsync "${args[@]}" "$s/" "$d/" 2>&1)"; then
+    printf 'FAILED %s:\n%s\n' "$rel" "$out" >&2
+    return 1
+  fi
+  if [[ "${MIRROR_DRY:-0}" == 1 ]]; then
+    out="$(grep -E '^(>|<|c|\*)' <<<"$out" | sed "s|^|[${rel}] |" || true)"
+    [[ -z "$out" ]] || printf '%s\n' "$out"
+  else
+    n="$(awk -F': ' '/Number of regular files transferred/ {gsub(",", "", $2); print $2}' <<<"$out")"
+    printf 'synced %s: %s file(s) copied\n' "$rel" "${n:-0}"
+  fi
+}
+export -f _mirror_one
+
+# mirror_volumes_parallel <src> <dest> <dry 0|1> <jobs>
+# One rsync per volume and folder, up to <jobs> at a time (CIFS is latency bound, so this scales).
+# Folders deleted from the source are no longer removed from the destination.
+mirror_volumes_parallel() {
+  local src="$1" dest="$2" dry="$3" jobs="$4" count rc=0
+  count="$(list_mirror_tasks "$src" "$dest" | tr -cd '\0' | wc -c)"
+  if [[ "$count" -eq 0 ]]; then
+    echo "nothing to mirror under ${src}" >&2
+    return 1
+  fi
+  [[ "$jobs" -le "$count" ]] || jobs="$count"
+  echo "${count} task(s), ${jobs} parallel job(s)$([[ "$dry" -eq 1 ]] && echo ' (dry run)')"
+  export MIRROR_DRY="$dry"
+  list_mirror_tasks "$src" "$dest" | xargs -0 -P "$jobs" -I{} bash -c '_mirror_one "$1"' _ {} || rc=$?
+  return "$rc"
 }

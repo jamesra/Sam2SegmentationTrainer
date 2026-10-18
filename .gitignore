@@ -1,6 +1,8 @@
 # Machine-local Compose / build env (bridge copies of D:\Docker\Run\...)
 .env
 docker/.env
+docker/TEM.env
+docker/SEM.env
 build.env
 .build.*.env
 

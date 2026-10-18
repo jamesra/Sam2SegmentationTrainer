@@ -9,20 +9,24 @@
 # No version: link current to the highest version directory already under the dest.
 #
 # Env:
-#   SAM2_TRAINING_DEST=$HOME/sam2-training
+#   MODALITY=TEM                            TEM (default) or SEM; sem-select_training_data.sh sets SEM
+#   SAM2_TRAINING_DEST=$HOME/sam2-training  TEM mirror
+#   SAM2_TRAINING_DEST_SEM=$HOME/sam2-training-sem   SEM mirror
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=training_data_common.sh
 source "${SCRIPT_DIR}/training_data_common.sh"
 
-SAM2_TRAINING_DEST="${SAM2_TRAINING_DEST:-${HOME}/sam2-training}"
+MODALITY="${MODALITY:-TEM}"
+check_modality "$MODALITY" || exit 2
+SAM2_TRAINING_DEST="$(resolve_training_dest "$MODALITY")"
 
 ver=""
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
-      sed -n '2,14p' "$0"
+      sed -n '2,/^set -euo/p' "$0" | sed '$d'
       exit 0
       ;;
     -*)

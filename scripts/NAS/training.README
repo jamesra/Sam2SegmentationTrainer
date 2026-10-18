@@ -4,7 +4,14 @@ SAM2 training data versioning (Synology, BTRFS)
 Layout (all on the same BTRFS volume, /volume1/Data):
 
   /volume1/Data/Volumes/<VOLUME_NAME>/AnnotationCrops     live export (source)
-  /volume1/Data/SAM2TrainingData/<vN>/<VOLUME_NAME>       frozen training versions
+  /volume1/Data/SAM2TrainingData/TEM/<vN>/<VOLUME_NAME>   frozen TEM training versions
+  /volume1/Data/SAM2TrainingData/SEM/<vN>/<VOLUME_NAME>   frozen SEM training versions
+  /volume1/Data/SAM2TrainingData/{circle_review,carry_forward,...}   shared review artifacts
+
+TEM and SEM versions are numbered independently. version-bump, version-sync and
+version-flatten work on TEM. The sem- wrappers (sem-version-bump, sem-version-sync,
+sem-version-flatten) take the same arguments and work on SEM. Until SAM2TrainingData/TEM
+exists, the plain scripts fall back to the old flat SAM2TrainingData/<vN>.
 
 Each version is a copy-on-write (reflink) copy of the previous one with only the changed
 files rewritten. Unchanged files share disk blocks with older versions, so a new version
@@ -14,13 +21,14 @@ Scripts (run ON the NAS, over ssh)
 ----------------------------------
 
   version-bump <v-previous> <v-next>
-      Reflink-clones SAM2TrainingData/<v-previous> to SAM2TrainingData/<v-next>.
+      Reflink-clones SAM2TrainingData/TEM/<v-previous> to .../TEM/<v-next>.
       Refuses if <v-next> exists unless -f, which deletes <v-next> and re-clones it
       (anything only in <v-next> is lost). -n for dry run.
 
   version-sync [-n] [-d] [-j N] <version> [VOLUME_NAME ...]
-      rsync from Volumes/<VOL>/AnnotationCrops into SAM2TrainingData/<version>/<VOL>,
-      writing only files whose bytes differ (checksum, not timestamp). Default is all
+      rsync from Volumes/<VOL>/AnnotationCrops into SAM2TrainingData/TEM/<version>/<VOL>,
+      writing only files whose bytes differ (checksum, not timestamp). _work/ and the full-size
+      overlay renders are not copied (overlays/thumb and overlays/parts are, for the gallery). Default is all
       volumes already in <version>. Work is split into one rsync job per top-level subfolder of each volume, run in parallel (-j N sets the job count; default is the number of CPUs; -j 1 is sequential). -n lists changes only. -d deletes files from <version>
       that were removed from the source (otherwise they are kept).
       A volume not present in <v-previous> can be added by naming it explicitly.
@@ -29,6 +37,11 @@ Scripts (run ON the NAS, over ssh)
       For volumes stored as <version>/<VOL>/AnnotationCrops/<stuff>: moves <stuff> up into
       <VOL>/ and removes AnnotationCrops. Renames only (keeps shared blocks). Skips a
       volume on name collisions. version-sync refuses to run on such a volume.
+
+  sem-version-create [-n] [-j N] [-p PATTERN] [<version>] [VOLUME_NAME ...]
+      Creates a new SEM version (default v1) under SAM2TrainingData/SEM from every folder
+      directly in Volumes whose name contains "Neitz" (no recursion), using sem-version-sync
+      for the copy. Skips volumes with no AnnotationCrops; refuses if the version exists.
 
 Typical workflow
 ----------------
@@ -43,7 +56,7 @@ Install
 -------
 
   mkdir -p ~/bin
-  cp version-bump version-sync version-flatten ~/bin/ && chmod +x ~/bin/version-*
+  cp version-* sem-version-* ~/bin/ && chmod +x ~/bin/version-* ~/bin/sem-version-*
   echo 'export PATH="$HOME/bin:$PATH"' >> ~/.profile && . ~/.profile
 
 DSM notes: ~/.profile needs the user home service enabled (Control Panel > User & Group >
@@ -55,14 +68,14 @@ Checking space
 --------------
 
   df -h /volume1                                  # Used should barely move after version-bump
-  btrfs filesystem du -s /volume1/Data/SAM2TrainingData/v3/<VOL>
+  btrfs filesystem du -s /volume1/Data/SAM2TrainingData/TEM/v3/<VOL>
       Exclusive = bytes unique to v3 (about the size of the changed files)
       Set shared = bytes shared with other versions/the source
 
 Caveats
 -------
 
-- Paths are case-sensitive on the NAS (SAM2TrainingData). Windows/SMB hides this; make
+- Paths are case-sensitive on the NAS (SAM2TrainingData, TEM, SEM). Windows/SMB hides this; make
   sure the real folder name matches.
 - version-sync -c reads every file that exists in both places with the same size, so it
   is disk-bound on large volumes. Files with different sizes are detected without hashing.

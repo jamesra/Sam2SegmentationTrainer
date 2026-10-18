@@ -11,12 +11,18 @@
 #
 #   -n   dry run (print the moves)
 #
-# Env: TRAIN_ROOT (default /volume1/Data/SAM2TrainingData)
+# Env: TRAIN_ROOT (default /volume1/Data/SAM2TrainingData/TEM), MODALITY (TEM|SEM; sem-* sets SEM)
 # See training.README.
 
 set -eu
 
-TRAIN_ROOT="${TRAIN_ROOT:-/volume1/Data/SAM2TrainingData}"
+DATA_ROOT="${DATA_ROOT:-/volume1/Data}"
+MODALITY="${MODALITY:-TEM}"      # TEM or SEM; the sem-version-* wrappers set SEM
+if [ -z "${TRAIN_ROOT:-}" ]; then
+    TRAIN_ROOT="$DATA_ROOT/SAM2TrainingData"
+    # TEM keeps working on the old flat layout until SAM2TrainingData/TEM exists.
+    if [ "$MODALITY" != TEM ] || [ -d "$TRAIN_ROOT/TEM" ]; then TRAIN_ROOT="$TRAIN_ROOT/$MODALITY"; fi
+fi
 DRY=0
 
 usage() { sed '/^#/!q' "$0" | sed 1d | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }

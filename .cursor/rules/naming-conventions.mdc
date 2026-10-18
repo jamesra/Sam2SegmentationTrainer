@@ -13,7 +13,7 @@ leading `v`, so **always say which one you mean**: "set v3", "model v4.3", in ch
 | Thing | Name | Examples | Sidecar |
 |-------|------|----------|---------|
 | Training set | `v<SET>` or `v<SET>.<REVISION>` | `v2`, `v2.1` | `training_set.json` in the set's folder |
-| Model | `v<VERSION>.<EPOCH>` | `v4.3` | `<stem>.model.json` beside the weights |
+| Model | `v<VERSION>.<EPOCH>`, file stem may lead with `label-` | `v4.3`, `sem-v1.5` | `<stem>.model.json` beside the weights |
 
 ## Training sets: `v#` / `v#.#`
 
@@ -25,7 +25,7 @@ leading `v`, so **always say which one you mean**: "set v3", "model v4.3", in ch
 - The `current` symlink is a pointer, not a version. Anything that records a set stores the resolved folder name
   (`data_record.py` already does: `set` is the realpath's basename, `requested` is `current`).
 - Every set is generated with a sidecar, **`training_set.json`, in each volume's folder** (for example
-  `Y:\Sam2TrainingData\v2.1\RC1\training_set.json`). Nornir's `ExportTrainingData` writes it into its `-Output` folder
+  `Y:\SAM2TrainingData\TEM\v2.1\RC1\training_set.json`). Nornir's `ExportTrainingData` writes it into its `-Output` folder
   (`-SetVersion v2.1`, optional `-ParentSet`, `-SetDescription`), and `version-sync` copies the folder, so it travels with
   the volume's data. Fields: `schema_version`, `set_version` (equals the set's folder name), `parent` (`v2` for `v2.1`,
   null for a new set), `created_at`, `updated_at`, `generator` (tool and version), `creation_rules` (the exporter
@@ -41,10 +41,16 @@ leading `v`, so **always say which one you mean**: "set v3", "model v4.3", in ch
 - `VERSION` is the model's own counter (the `4` in run `sam2_em_v4`). `EPOCH` is the trainer's epoch index as printed in
   the log and used in `checkpoint_epoch<N>.pt` and `serve_epoch<N>.pt`; it starts at 0, so `v4.0` is the model after
   the first epoch. State the base when it matters.
-- The weights file stem is the model name: `v4.3.pt` with `v4.3.model.json` beside it. A dot in the stem is fine
-  (`model_manifest.manifest_path` appends `.model.json` to `Path.stem`).
-- The manifest's `model.model_version` is `v<VERSION>.<EPOCH>` and `model.model_id` is `v<VERSION>`. The server's
-  per-model host name follows the id (`v4.segmentation.codepharm.net`) and clients send `model_id` with requests.
+- The weights file stem ends with the model name: `v4.3.pt` with `v4.3.model.json` beside it. A dot in the stem is
+  fine (`model_manifest.manifest_path` appends `.model.json` to `Path.stem`).
+- The stem may lead with labels joined to the name by `-`, for example `sem-v1.5.pt` (modality) or `tem-gpu-v4.3.pt`:
+  `[<label>-]...v<VERSION>.<EPOCH>`, labels made of letters, digits and `_`. The labels are for people sorting files;
+  the sidecars follow the whole stem (`sem-v1.5.model.json`, `sem-v1.5.prompt_encoding.json`), and the model name
+  inside them stays unlabelled. A stem that ends in a different version than the model's (`sem-v1.4.pt` holding epoch
+  5) is an error: the exporter refuses it and `model_manifest check` reports it.
+- The manifest's `model.model_version` is `v<VERSION>.<EPOCH>` and `model.model_id` is `v<VERSION>`; neither takes a
+  label. The server's per-model host name follows the id (`v4.segmentation.codepharm.net`) and clients send
+  `model_id` with requests.
 - The sidecar `<stem>.model.json` (`docs/model_manifest.md`) carries a **`description`** field the operator fills in to
   say what the model is (what changed, what to use it for). The exporter writes it empty and must never overwrite a
   description that is already there when it re-exports.
@@ -61,9 +67,10 @@ follows the convention (`v3.9`, `v2.8`).
 
 - Set names: `scripts/WSL/training_data_common.sh` (`version_name_ok`, `version_sort_key`: `v#`, `v#.#`, the old `v1b`,
   numeric order), tested by `tests/test_training_data_versions.py`.
-- Model names and `description`: `model_manifest.py` (validates `v<VERSION>` / `v<VERSION>.<EPOCH>`) and
+- Model names and `description`: `model_manifest.py` (validates `v<VERSION>` / `v<VERSION>.<EPOCH>`; `MODEL_STEM_RE`,
+  `stem_model_version`, `stem_mismatch` for the optional `label-` prefix on file stems) and
   `export_serve.py` (`--model-id`, `--epoch`, `--description`; keeps an existing description; refuses before loading
-  weights when the version or epoch is unknown). Training writes `best_model.json` (the epoch of `best_model.pt`) so a
+  weights when the version or epoch is unknown, or when `--out` is named for another version). Training writes `best_model.json` (the epoch of `best_model.pt`) so a
   hand export can name it. The Viking server passes `description` on in `ModelInfo`.
 - Set sidecar: Nornir's `training_set.py` (`CheckTrainingSet` first, `WriteTrainingSetInfo` last in `ExportTrainingData`).
 

@@ -55,6 +55,6 @@ warning.
 - `model_manifest_examples/sam2_em_v3.model.json`: tiled, legacy encoding, no roles, no model id required.
 - `model_manifest_examples/sam2_em_v2.model.json`: whole screen, points only.
 
-Fill in `description`, `training_data.set` and the file name (`v3.9.pt` with `v3.9.model.json`) to match your files before
+Fill in `description`, `training_data.set` and the file name (`v3.9.pt` with `v3.9.model.json`, or `sem-v3.9.pt` with `sem-v3.9.model.json`: the stem may lead with labels joined by `-`) to match your files before
 copying them next to the weights. The check also rejects a `model_id` that is not `v<VERSION>` or a `model_version` that
-is not `v<VERSION>.<EPOCH>`.
+is not `v<VERSION>.<EPOCH>` (neither takes a label), and a file name that ends in a different version than `model_version`.

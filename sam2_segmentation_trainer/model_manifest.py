@@ -47,6 +47,9 @@ MODEL_KEYS = (
 )
 MODEL_ID_RE = re.compile(r"^v\d+$")
 MODEL_VERSION_RE = re.compile(r"^v\d+\.\d+$")
+MODEL_STEM_RE = re.compile(r"^(?:[A-Za-z0-9_]+-)*(v\d+\.\d+)$")
+"""A weights file stem: ``v<VERSION>.<EPOCH>``, optionally led by labels joined with ``-`` (``sem-v1.5``). The labels
+are for people sorting files; the manifest's ``model_id`` and ``model_version`` never carry them."""
 _RUN_NUMBER_RE = re.compile(r"_v(\d+)$")
 CLIENT_CONTRACT_KEYS = (
     "contract_version",
@@ -72,6 +75,24 @@ def model_id_for_run(run_name: str) -> str | None:
 def model_version_name(model_id: str, epoch: int) -> str:
     """``v<VERSION>.<EPOCH>``: the model id and the trainer's epoch index (the one in the log, from 0)."""
     return f"{model_id}.{int(epoch)}"
+
+
+def stem_model_version(stem: str) -> str | None:
+    """The ``v<VERSION>.<EPOCH>`` a weights stem ends with (``sem-v1.5`` gives ``v1.5``); None for any other stem."""
+    match = MODEL_STEM_RE.match(stem)
+    return match.group(1) if match else None
+
+
+def stem_mismatch(stem: str, model_version: str) -> str | None:
+    """A description of the problem when ``stem`` names a model version other than ``model_version``, else None.
+
+    A stem that does not follow the convention at all (``serve_epoch5``, ``sam2_em_v3_epoch_9``) is not a mismatch:
+    existing names stay as they are.
+    """
+    named = stem_model_version(stem)
+    if named is None or named == model_version:
+        return None
+    return f"the file name {stem!r} says {named} but the model version is {model_version}"
 
 
 def manifest_path(weights: Path) -> Path:
@@ -226,7 +247,13 @@ def main(argv: list[str] | None = None) -> int:
     bad = 0
     for path in args.file:
         try:
-            problems = validate_manifest(json.loads(path.read_text(encoding="utf-8")))
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            problems = validate_manifest(manifest)
+            version = manifest.get("model", {}).get("model_version") if isinstance(manifest, dict) else None
+            if isinstance(version, str):
+                mismatch = stem_mismatch(path.name.removesuffix(MANIFEST_SUFFIX), version)
+                if mismatch:
+                    problems.append(mismatch)
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             problems = [f"cannot read: {exc}"]
         print(f"{path}: {'ok' if not problems else 'INVALID'}")

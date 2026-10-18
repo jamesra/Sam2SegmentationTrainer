@@ -1,0 +1,5 @@
+#!/bin/sh
+# sem-version-bump: version-bump on the SEM training sets (SAM2TrainingData/SEM).
+# Same arguments as version-bump. Keep it next to version-bump (or install both to ~/bin).
+HERE=$(cd "$(dirname "$0")" && pwd)
+MODALITY=SEM exec sh "$HERE/version-bump" "$@"

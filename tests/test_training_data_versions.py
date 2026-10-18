@@ -78,5 +78,44 @@ class VersionNameTests(unittest.TestCase):
         self.assertLess(keys["v2.10"], keys["v3"])
 
 
+@unittest.skipUnless(_available(), "bash cannot source scripts/WSL/training_data_common.sh here")
+class MirrorTaskTests(unittest.TestCase):
+    def tasks(self, src: Path, dest: Path) -> list[str]:
+        result = _bash(f"list_mirror_tasks '{src.as_posix()}' '{dest.as_posix()}' | tr '\\0' '\\n'")
+        assert result is not None
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line.split("\t")[1] for line in result.stdout.splitlines() if line]
+
+    def test_version_root_cache_and_review_folders_are_not_mirrored(self) -> None:
+        with TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src" / "v1"
+            for folder in ("RC1/images", "RC1/_work", "_work_cache/RC1/images", "_review/notes"):
+                (src / folder).mkdir(parents=True)
+            (src / "RC1" / "manifest.jsonl").write_text("{}\n")
+            (src / "_work_cache" / "manifest.jsonl").write_text("{}\n")  # looks like a volume, is not one
+
+            rels = self.tasks(src, Path(tmp) / "dest" / "v1")
+
+            self.assertIn("RC1/images", rels)
+            self.assertNotIn("RC1/_work", rels)
+            self.assertFalse([r for r in rels if r.startswith(("_work_cache", "_review"))], rels)
+
+    def test_a_cache_folder_does_not_fail_the_layout_check(self) -> None:
+        with TemporaryDirectory() as tmp:
+            src, dest = Path(tmp) / "src", Path(tmp) / "dest"
+            (src / "RC1").mkdir(parents=True)
+            (src / "RC1" / "manifest.jsonl").write_text("{}\n")
+            (dest / "RC1" / "AnnotationCrops").mkdir(parents=True)  # nested on one side: a real mismatch
+            (src / "_work_cache").mkdir()
+            (src / "_work_cache" / "manifest.jsonl").write_text("{}\n")
+            (dest / "_work_cache" / "AnnotationCrops").mkdir(parents=True)
+
+            result = _bash(f"check_layouts_match '{src.as_posix()}' '{dest.as_posix()}'")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("RC1", result.stderr)
+            self.assertNotIn("_work_cache", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,10 +5,14 @@
 # not mounted there. ~/sam2-training is bind-mounted at /data-local.
 #
 # Usage:
-#   scripts/WSL/sync_training_data.sh [-n] [-noselect] [-force-layout] [-seed-from vX] [v1|v1b|v2|...]
+#   scripts/WSL/sync_training_data.sh [-n] [-j N] [-noselect] [-force-layout] [-seed-from vX] [v1|v1b|v2|...]
 #
 # No version: sync the highest source version directory.
 # Default: after a successful mirror, point ~/sam2-training/current at that version.
+# -j N: parallel rsync jobs, one per volume and folder (default: CPUs, at most 8; -j 1 = one at a time).
+# Only what training and the gallery read is copied: _work/ and the full-size overlay renders are
+# left out (overlays/thumb and overlays/parts are kept). See SYNC_NEVER_COPY in training_data_common.sh.
+# The _review/ and _work_cache/ folders in the root of a version are not volumes and are not copied.
 # -n: dry run. Report the layout check, seeding, and rsync changes; change nothing.
 # -noselect: mirror only; leave current unchanged.
 # -force-layout: mirror even when a volume is flat on one side and nested
@@ -29,8 +33,13 @@
 # Env:
 #   TRAINING_DATA_SRC=/mnt/d/TrainingData   (e.g. /mnt/y/SAM2TrainingData with the NAS
 #                                            share CIFS-mounted at /mnt/y; see
-#                                            scripts/WSL/wsl-training.README)
-#   SAM2_TRAINING_DEST=$HOME/sam2-training
+#                                            scripts/WSL/wsl-training.README).
+#                                            Versions are read from $TRAINING_DATA_SRC/$MODALITY
+#                                            when that folder exists; TEM falls back to the
+#                                            old layout with the versions directly in it.
+#   MODALITY=TEM                            TEM (default) or SEM. sem-sync_training_data.sh sets SEM.
+#   SAM2_TRAINING_DEST=$HOME/sam2-training  TEM mirror (the one the containers mount)
+#   SAM2_TRAINING_DEST_SEM=$HOME/sam2-training-sem   SEM mirror
 #
 # One-time move of a flat layout (RC1, RC2, RPC1, RPC2 next to version dirs):
 #   mkdir -p ~/sam2-training/v1
@@ -48,10 +57,14 @@ source "${SCRIPT_DIR}/training_data_common.sh"
 # Fail before any clone or copy when the repo (needed for location_scores) cannot be found.
 find_trainer_repo >/dev/null || exit 1
 
-TRAINING_DATA_SRC="${TRAINING_DATA_SRC:-/mnt/d/TrainingData}"
-SAM2_TRAINING_DEST="${SAM2_TRAINING_DEST:-${HOME}/sam2-training}"
+MODALITY="${MODALITY:-TEM}"
+check_modality "$MODALITY" || exit 2
+TRAINING_DATA_SRC="$(resolve_training_src "${TRAINING_DATA_SRC:-/mnt/d/TrainingData}" "$MODALITY")" || exit 1
+SAM2_TRAINING_DEST="$(resolve_training_dest "$MODALITY")"
+echo "${MODALITY}: ${TRAINING_DATA_SRC} -> ${SAM2_TRAINING_DEST}"
 
 dry=0
+jobs=""
 noselect=0
 force_layout=0
 seed_from=""
@@ -62,6 +75,14 @@ while [[ $# -gt 0 ]]; do
   shift
   case "$arg" in
     -n) dry=1 ;;
+    -j)
+      if [[ $# -eq 0 || ! "$1" =~ ^[1-9][0-9]*$ ]]; then
+        echo "-j needs a positive number" >&2
+        exit 2
+      fi
+      jobs="$1"
+      shift
+      ;;
     -noselect) noselect=1 ;;
     -force-layout) force_layout=1 ;;
     -seed-from)
@@ -181,18 +202,11 @@ fi
 rsync_dest="$dest"
 # A dry run with -clone-from has no clone yet, so compare against the version it would clone.
 [[ "$dry" -eq 1 && -n "$clone_from" ]] && rsync_dest="$layout_ref"
-rsync_args=(-a --delete --info=stats2)
-[[ "$dry" -eq 0 ]] || rsync_args+=(-n --itemize-changes)
-rsync "${rsync_args[@]}" \
-  --exclude Thumbs.db --exclude .DS_Store \
-  --exclude '/*/approved.json' \
-  --exclude '/*/ignore.json' \
-  --exclude '/*/ignored/***' \
-  --exclude '**/AnnotationCrops/approved.json' \
-  --exclude '**/AnnotationCrops/ignore.json' \
-  --exclude '**/AnnotationCrops/ignored/***' \
-  --exclude '_review/***' \
-  "${src}/" "${rsync_dest}/"
+if [[ -z "$jobs" ]]; then
+  jobs="$(nproc 2>/dev/null || echo 4)"
+  [[ "$jobs" -le 8 ]] || jobs=8
+fi
+mirror_volumes_parallel "$src" "$rsync_dest" "$dry" "$jobs"
 
 if [[ "$dry" -eq 1 ]]; then
   echo "dry run complete: nothing changed"

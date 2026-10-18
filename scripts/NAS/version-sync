@@ -10,18 +10,26 @@
 #
 # Work is split into one rsync job per top-level subfolder of each volume's AnnotationCrops
 # (plus one job per volume for files directly in AnnotationCrops), run in parallel.
+# Only what training and the annotation gallery read is copied: _work/ and the full-size overlay renders
+# are left out; overlays/thumb and overlays/parts are kept (the gallery serves those).
 #
 #   -n   dry run (list what would change)
 #   -d   also delete files in <version> that no longer exist in the source
 #   -j N number of parallel rsync jobs (default: number of CPUs; -j 1 = sequential)
 #
-# Env: DATA_ROOT (default /volume1/Data)
+# Env: DATA_ROOT (default /volume1/Data), TRAIN_ROOT (default $DATA_ROOT/SAM2TrainingData/TEM),
+#      MODALITY (TEM|SEM; the sem-version-sync wrapper sets SEM)
 # See training.README.
 
 set -eu
 
 DATA_ROOT="${DATA_ROOT:-/volume1/Data}"
-TRAIN_ROOT="${TRAIN_ROOT:-$DATA_ROOT/SAM2TrainingData}"
+MODALITY="${MODALITY:-TEM}"      # TEM or SEM; the sem-version-* wrappers set SEM
+if [ -z "${TRAIN_ROOT:-}" ]; then
+    TRAIN_ROOT="$DATA_ROOT/SAM2TrainingData"
+    # TEM keeps working on the old flat layout until SAM2TrainingData/TEM exists.
+    if [ "$MODALITY" != TEM ] || [ -d "$TRAIN_ROOT/TEM" ]; then TRAIN_ROOT="$TRAIN_ROOT/$MODALITY"; fi
+fi
 
 # rsync flags: -r recurse, -t keep mtimes, -c decide by checksum (not size+mtime).
 # No --inplace: rsync writes a temp file and renames, so shared blocks are never rewritten.
@@ -128,6 +136,14 @@ for VOL in "$@"; do
     fi
     printf '%s\t\0' "$VOL" >> "$TASKS"                       # top-level files
     list_dirs "$SRC" | while IFS= read -r sub; do
+        case "$sub" in
+            _work) continue ;;                                   # exporter cache
+            overlays)                                            # keep only what the gallery serves
+                for k in thumb parts; do
+                    [ -d "$SRC/overlays/$k" ] && printf '%s\toverlays/%s\0' "$VOL" "$k" >> "$TASKS"
+                done
+                continue ;;
+        esac
         printf '%s\t%s\0' "$VOL" "$sub" >> "$TASKS"
     done
     # Subfolders in the version that no longer exist in the source.
