@@ -222,7 +222,7 @@ def test_training_sets_defaults_to_current_outside_a_version_tree(httpd: tuple[s
 def test_read_lists_volume_and_catalog(httpd: tuple[str, int]) -> None:
     status, me = _request(httpd, "GET", "/api/me", bearer="read")
     assert status == 200
-    assert me["volumes"] == [{"name": "RC2", "permission": "read"}]
+    assert me["volumes"] == [{"name": "RC2", "permission": "read", "identityName": "RC2"}]
     status, catalog = _request(httpd, "GET", "/api/volumes/RC2/catalog", bearer="read")
     assert status == 200
     assert catalog["rows"][0]["location_id"] == 42
@@ -1225,7 +1225,9 @@ def _raw_get(httpd: tuple[str, int], path: str, *, agent: str | None = None) -> 
     connection.request("GET", path, headers={"User-Agent": agent} if agent else {})
     response = connection.getresponse()
     body = response.read()
-    headers = {key.lower(): value for key, value in response.getheaders()}
+    headers: dict[str, str] = {}
+    for key, value in response.getheaders():
+        headers[key.lower()] = f"{headers[key.lower()]}, {value}" if key.lower() in headers else value
     connection.close()
     return response.status, headers, body
 
@@ -1318,6 +1320,57 @@ def test_grants_follow_the_annotation_database_name_not_the_folder() -> None:
     folders = ["NasalMonkey", "RC1", "InferiorMonkey"]
     aliases = {"NasalMonkey": "NeitzNM", "InferiorMonkey": "NeitzInferiorMonkey"}
     assert grants_for_registry(grants, folders, aliases) == {"NasalMonkey": "review", "RC1": "read"}
+
+
+def test_viking_link_appends_the_location_to_the_launch_code_url() -> None:
+    from server import viking_link
+
+    calls: list[tuple] = []
+
+    def http_json(url, **kwargs):
+        calls.append((url, kwargs))
+        return {"code": "abc", "expires_in": 300, "viking_url": "viking://open?code=abc&volumeName=NM"}
+
+    url = viking_link("https://identity.example:6001/", "tok", "NM", "12345", http_json)
+    assert url == "viking://open?code=abc&volumeName=NM&location=12345"
+    assert calls[0][0] == "https://identity.example:6001/api/viking/launch-code"
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer tok"
+    assert json.loads(calls[0][1]["body"]) == {"volume_name": "NM"}
+
+
+def test_viking_link_falls_back_to_the_plain_link_when_identity_refuses_the_volume() -> None:
+    from identity import IdentityHttpError
+    from server import viking_link
+
+    def refuse(url, **kwargs):
+        raise IdentityHttpError(403, "forbidden")
+
+    assert viking_link("https://i", "tok", "NM", "7", refuse) == "viking://open?volumeName=NM&location=7"
+
+    def expired(url, **kwargs):
+        raise IdentityHttpError(401, "unauthorized")
+
+    with pytest.raises(IdentityHttpError):
+        viking_link("https://i", "tok", "NM", "7", expired)
+
+
+def test_tokens_are_kept_server_side_and_expire() -> None:
+    from server import forget_token, recall_token, remember_token
+
+    sid = remember_token("secret-token", 3600)
+    assert recall_token(sid) == "secret-token" and "secret-token" not in sid
+    forget_token(sid)
+    assert recall_token(sid) == ""
+    assert recall_token(None) == "" and recall_token("nope") == ""
+
+
+def test_viking_link_endpoint_needs_a_token_and_a_granted_volume(
+    httpd: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status, payload = _request(httpd, "POST", "/api/volumes/RC2/viking-link", body=b'{"location": 5}', bearer="review")
+    assert status == 401 and payload["login"] == "/login"
+    status, _payload = _request(httpd, "POST", "/api/volumes/NOPE/viking-link", body=b'{"location": 5}', bearer="review")
+    assert status == 404
 
 
 def test_grants_match_database_names_regardless_of_case() -> None:

@@ -793,9 +793,63 @@
       template = "viking://open?volumeName={volume}&location={id}";
     }
     return template
-      .replaceAll("{volume}", encodeURIComponent(state.volume))
+      .replaceAll("{volume}", encodeURIComponent(identityNameOf(state.volume)))
       .replaceAll("{id}", encodeURIComponent(String(row.location_id)));
   }
+
+  // The name Identity (and so Viking) knows the volume by: NM for the NasalMonkey folder.
+  function identityNameOf(volume) {
+    const item = (state.me?.volumes || []).find((entry) => entry.name === volume);
+    return item?.identityName || volume;
+  }
+
+  // A click on a location link asks the gallery for a viking:// link with a one-use launch code, so Viking opens
+  // signed in (or an already open Viking for the same volume jumps to the location). The plain href is the fallback.
+  async function openInViking(link) {
+    const match = /[?&]location=([^&]+)/.exec(link.getAttribute("href") || "");
+    if (!match || !state.volume) {
+      return false;
+    }
+    const location = decodeURIComponent(match[1]);
+    try {
+      const response = await fetch(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/viking-link`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ location }),
+      });
+      if (response.status === 401) {
+        window.location.href = "/login";
+        return true;
+      }
+      if (!response.ok) {
+        return false;
+      }
+      const payload = await response.json();
+      if (payload.url) {
+        window.location.href = payload.url;
+        return true;
+      }
+    } catch (error) {
+      console.warn("Viking launch code failed; using the plain link", error);
+    }
+    return false;
+  }
+
+  document.addEventListener("click", (event) => {
+    const link = event.target instanceof Element ? event.target.closest("a.viking-link") : null;
+    if (!link || event.ctrlKey || event.metaKey || event.shiftKey || event.button !== 0) {
+      return;
+    }
+    if (state.config.identityMode !== "oidc") {
+      return;
+    }
+    event.preventDefault();
+    openInViking(link).then((handled) => {
+      if (!handled) {
+        window.location.href = link.getAttribute("href");
+      }
+    });
+  });
 
   // "250" is one radius, "100-500" a range, "100-" and "-500" are open ended. Anything else is `invalid`, which
   // matches nothing (and says so), instead of being ignored and leaving every card on screen.

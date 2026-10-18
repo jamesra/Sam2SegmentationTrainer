@@ -26,6 +26,9 @@ class Principal:
     subject: str
     display_name: str
     grants: dict[str, str]
+    # Bearer token for this user's Identity calls (launch codes). Kept server-side only, never in the cookie.
+    access_token: str = ""
+    token_expires_in: int = 0
 
 
 def map_permission_names(
@@ -206,7 +209,13 @@ class OidcIdentity:
         subject = str(info.get("sub") or info.get("name") or "oidc-user")
         display = str(info.get("name") or info.get("preferred_username") or subject)
         grants = self.volume_grants(access_token, registry_names, aliases)
-        return Principal(subject=subject, display_name=display, grants=grants)
+        return Principal(
+            subject=subject,
+            display_name=display,
+            grants=grants,
+            access_token=access_token,
+            token_expires_in=int(token_payload.get("expires_in") or 0),
+        )
 
     def volume_grants(
         self,
@@ -258,6 +267,14 @@ class OidcIdentity:
         return result
 
 
+class IdentityHttpError(PermissionError):
+    """An Identity request answered with an HTTP error status."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 def default_http_json(
     url: str,
     *,
@@ -276,7 +293,7 @@ def default_http_json(
             detail = exc.read().decode("utf-8", "replace")[:200]
         except OSError:
             detail = ""
-        raise PermissionError(f"Identity request failed: {exc} {url} {detail}".strip()) from exc
+        raise IdentityHttpError(exc.code, f"Identity request failed: {exc} {url} {detail}".strip()) from exc
     except URLError as exc:
         raise PermissionError(f"Identity request failed: {exc} {url}") from exc
     if not raw:

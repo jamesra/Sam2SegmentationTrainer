@@ -12,9 +12,10 @@ import secrets
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -45,9 +46,11 @@ from catalog import (
 from identity import (
     PERMISSION_READ,
     PERMISSION_REVIEW,
+    IdentityHttpError,
     OidcIdentity,
     Principal,
     StubIdentity,
+    default_http_json,
     intersect_grants,
 )
 from refresh import (
@@ -264,6 +267,75 @@ def cookie_attributes(environ: dict[str, str] | None = None, max_age: int | None
 
 
 SESSION_MAX_AGE = 8 * 3600
+TOKEN_COOKIE = "gallery_sid"
+
+# Identity access tokens by random session id, in memory only: a restart means the next Viking link asks the
+# user to sign in again. The cookie carries the id, never the token.
+_TOKENS: dict[str, tuple[str, float]] = {}
+_TOKENS_LOCK = threading.Lock()
+
+
+def remember_token(token: str, expires_in: int) -> str:
+    """Store an access token and return the session id that finds it."""
+    sid = secrets.token_urlsafe(24)
+    lifetime = min(max(expires_in, 60), SESSION_MAX_AGE) if expires_in else SESSION_MAX_AGE
+    now = time.monotonic()
+    with _TOKENS_LOCK:
+        for key in [key for key, (_token, expiry) in _TOKENS.items() if expiry <= now]:
+            del _TOKENS[key]
+        _TOKENS[sid] = (token, now + lifetime - 30)
+    return sid
+
+
+def recall_token(sid: str | None) -> str:
+    """The access token for a session id, or '' when unknown or expired."""
+    if not sid:
+        return ""
+    with _TOKENS_LOCK:
+        found = _TOKENS.get(sid)
+        if found is None:
+            return ""
+        token, expiry = found
+        if expiry <= time.monotonic():
+            del _TOKENS[sid]
+            return ""
+        return token
+
+
+def forget_token(sid: str | None) -> None:
+    if sid:
+        with _TOKENS_LOCK:
+            _TOKENS.pop(sid, None)
+
+
+def viking_link(
+    api_base: str,
+    token: str,
+    identity_name: str,
+    location: str,
+    http_json: Callable[..., Any] = default_http_json,
+) -> str:
+    """viking:// link that opens (or jumps) Viking on a location, signed in as the token's user.
+
+    Asks Identity for a one-use launch code. When Identity refuses the volume (403) the plain link is returned:
+    Viking then signs in by itself. A 401 is raised as IdentityHttpError so the caller can send the user to sign in.
+    """
+    plain = "viking://open?volumeName=" + quote(identity_name, safe="") + "&location=" + quote(location, safe="")
+    try:
+        payload = http_json(
+            api_base.rstrip("/") + "/api/viking/launch-code",
+            method="POST",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            body=json.dumps({"volume_name": identity_name}).encode("utf-8"),
+        )
+    except IdentityHttpError as exc:
+        if exc.status in {403, 404}:
+            return plain
+        raise
+    url = str((payload or {}).get("viking_url") or "")
+    if not url.lower().startswith("viking://"):
+        return plain
+    return url + "&location=" + quote(location, safe="")
 
 
 def identity_logout_url(environ: dict[str, str] | None = None) -> str:
@@ -586,6 +658,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._handle_callback(query)
             return
         if path == "/logout":
+            forget_token(self._cookie(TOKEN_COOKIE))
             self._clear_session(identity_logout_url())
             return
         if path == "/api/training-sets":
@@ -596,12 +669,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/me":
             principal = self._principal()
+            try:
+                aliases = registry_aliases(self._registry())
+            except (ValueError, FileNotFoundError):
+                aliases = {}
             self._send_json(
                 {
                     "subject": principal.subject,
                     "displayName": principal.display_name,
                     "volumes": [
-                        {"name": name, "permission": role}
+                        {"name": name, "permission": role, "identityName": aliases.get(name, name)}
                         for name, role in sorted(principal.grants.items())
                     ],
                 }
@@ -662,6 +739,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         if path == "/api/review-lists":
             self._handle_training_review_import()
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/viking-link", path)
+        if match:
+            self._handle_viking_link(match.group(1))
             return
         match = re.fullmatch(r"/api/volumes/([^/]+)/ignore-list", path)
         if match:
@@ -799,6 +880,41 @@ class GalleryHandler(BaseHTTPRequestHandler):
             drop_card_masks(crops, location_image_keys(crops, location_ids))
         self._send_json({"ok": True, "action": action, "count": count})
 
+    def _handle_viking_link(self, volume: str) -> None:
+        """POST {"location": id}: a viking:// link carrying a one-use launch code for the signed-in user."""
+        principal = self._principal()
+        if volume not in principal.grants:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            body = self._read_json()
+        except (json.JSONDecodeError, ValueError):
+            self._send_json({"error": "invalid JSON"}, status=400)
+            return
+        location = str(body.get("location") or "").strip()
+        if not location:
+            self._send_json({"error": "location required"}, status=400)
+            return
+        try:
+            identity_name = registry_aliases(self._registry()).get(volume, volume)
+        except (ValueError, FileNotFoundError):
+            identity_name = volume
+        token = recall_token(self._cookie(TOKEN_COOKIE))
+        if not token:
+            self._send_json({"error": "login required", "login": "/login"}, status=401)
+            return
+        api = os.environ.get("GALLERY_IDENTITY_API") or "https://identity.codepharm.net:6001"
+        try:
+            url = viking_link(api, token, identity_name, location)
+        except IdentityHttpError as exc:
+            status = 401 if exc.status == 401 else 502
+            self._send_json({"error": "launch code failed", "login": "/login"}, status=status)
+            return
+        except PermissionError:
+            self._send_json({"error": "identity unavailable"}, status=502)
+            return
+        self._send_json({"url": url})
+
     def _handle_login(self) -> None:
         if identity_mode() != "oidc":
             self._redirect("/")
@@ -831,7 +947,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=401)
             return
         cookie = encode_session(principal, session_secret())
+        sid = remember_token(principal.access_token, principal.token_expires_in) if principal.access_token else ""
         self.send_response(302)
+        if sid:
+            self.send_header("Set-Cookie", f"{TOKEN_COOKIE}={sid}; {cookie_attributes(max_age=SESSION_MAX_AGE)}")
         self.send_header("Location", "/")
         self.send_header(
             "Set-Cookie",
@@ -1330,6 +1449,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.send_response(302)
         self.send_header("Location", location)
         self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; {cookie_attributes(max_age=0)}")
+        self.send_header("Set-Cookie", f"{TOKEN_COOKIE}=; {cookie_attributes(max_age=0)}")
         self.end_headers()
 
 
