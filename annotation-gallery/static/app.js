@@ -3141,8 +3141,26 @@
     }
   });
 
+  // A quick training-set change starts a second loadVolumes while the first /api/me is still in flight; only the
+  // newest call may rebuild the volume list, so the dropdown and state.volume never come from the older set.
+  // Every training-set change starts a call, so being the newest is the whole check.
+  const volumesLatest = makeLatest();
+
   async function loadVolumes() {
-    state.me = await getJson(withSet("/api/me"));
+    const isLatest = volumesLatest(() => true);
+    let me;
+    try {
+      me = await getJson(withSet("/api/me"));
+    } catch (error) {
+      if (!isLatest()) {
+        return;
+      }
+      throw error;
+    }
+    if (!isLatest()) {
+      return;
+    }
+    state.me = me;
     const volumes = state.me.volumes || [];
     els.who.textContent = `${state.me.displayName} (${state.config.identityMode})`;
     els.logout.hidden = state.config.identityMode !== "oidc";
@@ -3169,6 +3187,9 @@
       return;
     }
     await loadSettings();
+    if (!isLatest()) {
+      return;
+    }
     await loadCatalog(true);
   }
 
@@ -3176,13 +3197,31 @@
     document.body.classList.toggle("can-refresh", Boolean(state.settings && state.settings.odata));
   }
 
+  // Switching volumes quickly leaves the older volume's settings request in flight; its answer must not replace
+  // state.settings, which saveSettings and the refresh buttons read for the volume now selected.
+  const settingsLatest = makeLatest();
+
   async function loadSettings() {
-    if (!state.volume) {
+    const { volume, trainingSet } = state;
+    const isLatest = settingsLatest(() => state.volume === volume && state.trainingSet === trainingSet);
+    if (!volume) {
       state.settings = null;
       applyRefreshVisibility();
       return;
     }
-    state.settings = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/settings`));
+    let settings;
+    try {
+      settings = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/settings`));
+    } catch (error) {
+      if (!isLatest()) {
+        return;
+      }
+      throw error;
+    }
+    if (!isLatest()) {
+      return;
+    }
+    state.settings = settings;
     applyRefreshVisibility();
   }
 
@@ -3198,14 +3237,32 @@
     dialog.hidden = false;
   }
 
+  // The dialog stays open until the response arrives, so Save can be clicked twice. Every POST is still sent (a
+  // dropped response is never a dropped save); only the newest one's answer updates state.settings and closes the dialog.
+  const saveLatest = makeLatest();
+
   async function saveSettings() {
     const endpoint = document.getElementById("settings-odata").value.trim();
     const exporter = document.getElementById("settings-exporter").value;
-    state.settings = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/settings`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ odata: endpoint, exporter }),
-    });
+    const { volume, trainingSet } = state;
+    const isLatest = saveLatest(() => state.volume === volume && state.trainingSet === trainingSet);
+    let saved;
+    try {
+      saved = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/settings`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ odata: endpoint, exporter }),
+      });
+    } catch (error) {
+      if (!isLatest()) {
+        return;
+      }
+      throw error;
+    }
+    if (!isLatest()) {
+      return;
+    }
+    state.settings = saved;
     applyRefreshVisibility();
     document.getElementById("settings-dialog").hidden = true;
     els.status.textContent = state.settings.odata
