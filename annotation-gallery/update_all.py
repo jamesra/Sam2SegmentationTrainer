@@ -23,6 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import takewhile
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import quote, urljoin, urlparse
@@ -448,6 +449,11 @@ class UpdateJob:
         with self._lock:
             self.circles += 1
 
+    def _rows(self, url: str) -> Iterator[tuple[dict[str, Any], Iterator[dict[str, Any]]]]:
+        """Yield each OData page of ``url`` with an iterator over its rows that stops once the job is cancelled."""
+        for document in iter_pages(url, self.deps.get_json):
+            yield document, takewhile(lambda _row: not self._cancel.is_set(), _entities(document))
+
     def _walk_rows(self) -> None:
         state = load_state(self.crops)
         before = parse_odata_datetime(state.get("watermark")) or initial_watermark(self.crops)
@@ -531,19 +537,15 @@ class UpdateJob:
                     break
                 batch = previous_skips[start:start + RETRY_BATCH]
                 clause = " or ".join(f"ID eq {item}" for item in batch)
-                for document in iter_pages(
-                    locations_url(self.odata, clause, self.page_size), self.deps.get_json
-                ):
-                    for entity in _entities(document):
-                        if self._cancel.is_set():
-                            break
+                for _document, rows in self._rows(locations_url(self.odata, clause, self.page_size)):
+                    for entity in rows:
                         handle(entity, retry=True)
                     flush_page()
 
         # Everything OData changed since the watermark: one tick per page.
         self._set(phase="updating")
         url = locations_url(self.odata, f"LastModified ge {odata_literal(before)}", self.page_size)
-        for document in iter_pages(url, self.deps.get_json):
+        for document, rows in self._rows(url):
             if self._cancel.is_set():
                 break
             if self.pages == 0:
@@ -552,16 +554,13 @@ class UpdateJob:
                 except (TypeError, ValueError):
                     total = len(_entities(document))
                 self._set(pages=max(1, math.ceil(total / max(1, self.page_size))))
-            for entity in _entities(document):
-                if self._cancel.is_set():
-                    break
+            for entity in rows:
                 with self._lock:
                     self.entities_seen += 1
                 handle(entity, retry=False)
             flush_page()
             with self._lock:
                 self.page += 1
-        flush_page()
 
         clean = not self._cancel.is_set() and self.failed == 0
         # Retried ids that came back skipped or failed are in skipped_now; ones OData no longer returns are dropped.
