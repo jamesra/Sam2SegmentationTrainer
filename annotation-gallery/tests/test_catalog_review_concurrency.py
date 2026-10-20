@@ -227,22 +227,29 @@ approval_lists = st.lists(
 
 @settings(max_examples=40, deadline=None)
 @given(keys=approval_lists, data=st.data())
-def test_torn_approved_list_reads_as_empty(keys, data):
-    """Any strict prefix of a saved approved.json reads as no approvals, and the catalog still lists."""
+def test_damaged_approved_list_is_never_overwritten(keys, data):
+    """A damaged approved.json (any strict prefix of a saved one) fails loudly and every mutator leaves it as is.
+
+    Treating it as empty would let the next click replace every earlier approval with one window.
+    """
     with tempfile.TemporaryDirectory() as folder:
         crops = Path(folder)
         catalog.save_approved(crops, keys)
         text = catalog.approved_path(crops).read_text(encoding="utf-8")
         cut = data.draw(st.integers(min_value=0, max_value=len(text) - 1), label="cut")
         catalog.approved_path(crops).write_text(text[:cut], encoding="utf-8")
-        connection = catalog.connect(crops)
-        try:
-            connection.execute(
-                "INSERT INTO locations (location_id, z, image_key) VALUES (?, 1, ?)", [keys[0][0], keys[0][1] or "K"]
-            )
-            connection.commit()
-        finally:
-            connection.close()
+        damaged = catalog.approved_path(crops).read_bytes()
+        location_id, image_key = keys[0]
 
-        assert catalog.load_approved(crops) == set()
-        assert [row["approved"] for row in catalog.list_catalog_rows(crops)] == [0]
+        with pytest.raises(json.JSONDecodeError):
+            catalog.load_approved(crops)
+        for mutate in (
+            lambda: catalog.approve_window(crops, location_id, image_key or "K"),
+            lambda: catalog.unapprove_window(crops, location_id, image_key or "K"),
+            lambda: catalog.review_locations(crops, [location_id], "ignore"),
+            lambda: catalog.import_review_lists(crops, [], [(location_id, "K")], replace=False),
+        ):
+            with pytest.raises(json.JSONDecodeError):
+                mutate()
+            assert catalog.approved_path(crops).read_bytes() == damaged
+        assert sorted(path.name for path in crops.iterdir()) == ["approved.json"]

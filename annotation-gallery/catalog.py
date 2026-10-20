@@ -147,16 +147,12 @@ def _approval_key(location_id: int, image_key: str | None) -> tuple[int, str]:
 def load_approved(crops: str | os.PathLike[str]) -> set[tuple[int, str]]:
     """Load approved windows from `approved.json`. The masks stay in the dataset.
 
-    Unreadable JSON is an empty set, as for `ignore.json`, so one bad file does not break the catalog.
+    Unreadable JSON raises, so a mutator never replaces a damaged list with the one window it was adding.
     """
     path = approved_path(crops)
     if not path.is_file():
         return set()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        print(f"annotation-gallery: unreadable approved list {path}", flush=True)
-        return set()
+    payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         return set()
     keys: set[tuple[int, str]] = set()
