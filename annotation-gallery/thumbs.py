@@ -410,8 +410,3 @@ def start_thumbnail_watch(registry: Path, interval_s: float = _WATCH_INTERVAL_S)
         daemon=True,
     )
     thread.start()
-
-
-def start_thumbnail_backfill(registry: Path) -> None:
-    """Schedule one thumbnail pass. Prefer :func:`start_thumbnail_watch` at startup."""
-    request_backfill(registry)

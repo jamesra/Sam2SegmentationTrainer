@@ -459,11 +459,6 @@ def _any_window_ignored(crops: str | os.PathLike[str], location_id: int) -> bool
     return row is not None
 
 
-def import_ignore_ids(crops: str | os.PathLike[str], ids: Iterable[int]) -> dict[str, int]:
-    """Merge rejected ids into ignore.json and move any masks that are present."""
-    return import_review_lists(crops, ids, [], replace=False)
-
-
 @_review_locked
 def import_review_lists(
     crops: str | os.PathLike[str],
@@ -645,12 +640,6 @@ def parse_training_review(payload: Any) -> list[tuple[str, list[int], list[tuple
         rejected, approved, _replace = parse_review_import(payload)
         return [(str(payload["volume"]), rejected, approved)]
     raise ValueError("review file must name a volume or a volumes list")
-
-
-def parse_ignore_ids(payload: Any) -> list[int]:
-    """Accept a JSON array or an object with ``locationIds`` or ``rejected``."""
-    rejected, _approved, _replace = parse_review_import(payload)
-    return rejected
 
 
 def parse_review_import(payload: Any) -> tuple[list[int], list[tuple[int, str]], bool]:
