@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 GALLERY_ROOT = Path(__file__).resolve().parents[1]
 if str(GALLERY_ROOT) not in sys.path:
@@ -221,6 +225,107 @@ def test_cancel_stops_without_advancing(tmp_path: Path) -> None:
         odata.close()
     assert result["cancelled"] and result["phase"] == "cancelled"
     assert load_state(crops)["watermark"] == "2026-01-01T00:00:00.000000Z"
+
+
+def _stub_odata(entities: list[dict]):
+    """A ``get_json`` that answers ``ID eq`` retry batches from *entities* and every other query with no rows.
+
+    No rows for the watermark query is the case that matters: a skipped id is older than the watermark, so only
+    ``skipped_ids`` brings it back.
+    """
+    by_id = {entity["ID"]: entity for entity in entities}
+
+    def get_json(url: str) -> dict:
+        filter_text = parse_qs(urlparse(url).query)["$filter"][0]
+        rows = []
+        if "ID eq" in filter_text:
+            wanted = {int(part.split("eq")[1]) for part in filter_text.split(" or ")}
+            rows = [by_id[item] for item in sorted(wanted) if item in by_id]
+        return {"value": rows, "@odata.count": len(rows)}
+
+    return get_json
+
+
+def _outcome_deps(entities: list[dict], outcomes: dict[int, str]) -> Dependencies:
+    """Dependencies whose ``add`` adds, skips or raises per id: ``ok``, ``skip`` or ``raise``."""
+
+    def add(crops, entity, index):
+        outcome = outcomes.get(entity["ID"], "ok")
+        if outcome == "raise":
+            raise OSError("share went away")
+        if outcome == "skip":
+            return None, "tile image missing for part of it"
+        record = types.SimpleNamespace(
+            id=entity["ID"], z=17, parent_id=9, structure_label="new", type_id=3, type_name="Cell", radius=None
+        )
+        return {"record": record, "windows": [{"image_key": KEY_A, "area": 100}]}, None
+
+    return Dependencies(
+        get_json=_stub_odata(entities),
+        refresh=lambda crops, entity, exporter: [KEY_A],
+        add=add,
+        drop_stale=lambda crops, keys: None,
+        tile_index=lambda crops: None,
+    )
+
+
+_runs = iter(range(1_000_000))
+
+
+def _run_stubbed(crops: Path, deps: Dependencies) -> dict:
+    job, started = start_job(f"retry-{next(_runs)}", crops, "http://odata.invalid", "tiled", page_size=10, deps=deps)
+    assert started
+    job.join(20)
+    return job.snapshot()
+
+
+WATERMARK = "2026-01-01T00:00:00.000000Z"
+
+
+def test_a_retry_that_raises_keeps_the_id_for_the_next_run(tmp_path: Path) -> None:
+    crops = _crops(tmp_path, ids=(1,))
+    save_state(crops, {"watermark": WATERMARK, "skipped_ids": [4]})
+    entities = [_entity(4, "2025-12-01T00:00:00Z")]  # older than the watermark: only the retry asks for it
+    result = _run_stubbed(crops, _outcome_deps(entities, {4: "raise"}))
+    assert result["failed"] == 1 and result["phase"] == "failed"
+    state = load_state(crops)
+    assert state["skipped_ids"] == [4]
+    assert state["watermark"] == WATERMARK
+
+    result = _run_stubbed(crops, _outcome_deps(entities, {4: "ok"}))
+    assert result["added"] == 1 and result["phase"] == "done"
+    assert load_state(crops)["skipped_ids"] == []
+
+
+def test_a_new_row_that_raises_is_not_added_to_skipped_ids(tmp_path: Path) -> None:
+    crops = _crops(tmp_path, ids=(1,))
+    save_state(crops, {"watermark": WATERMARK})
+    entity = _entity(5, "2026-02-01T00:00:00Z")
+    by_watermark = _outcome_deps([entity], {5: "raise"})
+    by_watermark.get_json = lambda url: {"value": [entity], "@odata.count": 1}
+    result = _run_stubbed(crops, by_watermark)
+    assert result["failed"] == 1
+    state = load_state(crops)
+    assert state["skipped_ids"] == []          # the held watermark brings it back instead
+    assert state["watermark"] == WATERMARK
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    pending=st.sets(st.integers(10, 30), min_size=1, max_size=8),
+    runs=st.lists(st.dictionaries(st.integers(10, 30), st.sampled_from(["ok", "skip", "raise"])), min_size=1,
+                  max_size=4),
+)
+def test_a_skipped_id_stays_pending_until_it_is_added(pending: set[int], runs: list[dict[int, str]]) -> None:
+    entities = [_entity(item, "2025-12-01T00:00:00Z") for item in range(10, 31)]
+    with tempfile.TemporaryDirectory() as folder:
+        crops = _crops(Path(folder), ids=(1,))
+        save_state(crops, {"watermark": WATERMARK, "skipped_ids": sorted(pending)})
+        expected = set(pending)
+        for outcomes in runs:
+            _run_stubbed(crops, _outcome_deps(entities, outcomes))
+            expected = {item for item in expected if outcomes.get(item, "ok") != "ok"}
+            assert load_state(crops)["skipped_ids"] == sorted(expected)
 
 
 def test_covers_box() -> None:

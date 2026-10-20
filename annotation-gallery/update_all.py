@@ -510,6 +510,9 @@ class UpdateJob:
             except Exception as exc:  # noqa: BLE001 - one bad row must not stop the run
                 message = f"{location_id}: {exc}"
                 self._log(f"error {message}")
+                if retry:
+                    # Usually older than the watermark, so only skipped_ids brings it back.
+                    skipped_now.add(location_id)
                 with self._lock:
                     self.failed += 1
                     if len(self.errors) < ERRORS_KEPT:
@@ -561,8 +564,8 @@ class UpdateJob:
         flush_page()
 
         clean = not self._cancel.is_set() and self.failed == 0
-        # Retried ids that came back skipped are in skipped_now; ones OData no longer returns are dropped. A
-        # cancelled run may not have reached every retry, so it keeps the whole earlier list.
+        # Retried ids that came back skipped or failed are in skipped_now; ones OData no longer returns are dropped.
+        # A cancelled run may not have reached every retry, so it keeps the whole earlier list.
         carried = previous_skips if self._cancel.is_set() else []
         remaining = sorted((set(carried) | skipped_now) - resolved)
         after = newest if clean else before
