@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import threading
 from pathlib import Path
 
 import crops_path  # noqa: F401
@@ -60,12 +62,17 @@ def _sidecar(crops: Path, image_key: str) -> tuple[list[int], tuple[int, int]]:
 
 
 def _read_cache(path: Path, newest_source_ns: int) -> tuple[bytes, int] | None:
-    """Cached PNG bytes and count when the file is at least as new as every source, else None."""
+    """Cached PNG bytes and count when the file is at least as new as every source and decodes, else None.
+
+    ``Image.open`` reads only the header, so a file cut short mid-pixels would pass it; ``load`` decodes the
+    pixels so a torn file counts as a miss and is rebuilt.
+    """
     try:
         if path.stat().st_mtime_ns < newest_source_ns:
             return None
         data = path.read_bytes()
         with Image.open(io.BytesIO(data)) as image:
+            image.load()
             return data, int(image.info.get(COUNT_FIELD, "0"))
     except (OSError, ValueError):
         return None
@@ -106,9 +113,15 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     buffer = io.BytesIO()
     Image.fromarray(bitmask, mode="L").save(buffer, format="PNG", pnginfo=info, optimize=True)
     data = buffer.getvalue()
+    # Write beside the cache file and rename, as cardmask.ensure_card_mask does, so a crash or a concurrent reader
+    # never sees half a PNG at the cache path. cardmask imports this module, so the helper cannot be shared yet.
+    temporary = cached_file.with_name(f".{cached_file.name}.{threading.get_ident()}.tmp")
     try:
         cached_file.parent.mkdir(parents=True, exist_ok=True)
-        cached_file.write_bytes(data)
+        temporary.write_bytes(data)
+        os.replace(temporary, cached_file)
     except OSError:
         pass
+    finally:
+        temporary.unlink(missing_ok=True)
     return data, len(regions)
