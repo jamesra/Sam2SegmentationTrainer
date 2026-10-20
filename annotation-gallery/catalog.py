@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import functools
 import io
 import json
 import os
 import sqlite3
+import threading
 import zipfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 
 import crops_path  # noqa: F401
 from annotation_crops.ignore import load_ignore_ids as _load_ignore_ids
@@ -45,6 +47,39 @@ CREATE TABLE IF NOT EXISTS locations (
     sam2ScoredAt TEXT
 )
 """
+
+_Function = TypeVar("_Function", bound=Callable[..., Any])
+
+# Gallery handler threads share approved.json, ignore.json and held reviews. Every read and write of the first
+# two, every review mutator, and held-review saves hold this lock, so two reviewers' clicks cannot drop each
+# other's change and no reader sees a half-written file. Reentrant because mutators call each other (approve
+# restores a rejected one).
+_REVIEW_LOCK = threading.RLock()
+
+
+def _review_locked(function: _Function) -> _Function:
+    """Run *function* while holding the review-list lock."""
+    @functools.wraps(function)
+    def locked(*args: Any, **kwargs: Any) -> Any:
+        with _REVIEW_LOCK:
+            return function(*args, **kwargs)
+    return locked  # type: ignore[return-value]
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write *text* to a temp file beside *path*, then rename it over *path*.
+
+    Another process reading *path* (training, a second gallery) sees the old file or the new one, and a crash
+    mid-write leaves the old file in place. Callers hold the review lock, so one temp name per process is enough.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
 
 def sqlite_path(crops: str | os.PathLike[str]) -> Path:
     """Return `{AnnotationCrops}/annotation_crops.sqlite`."""
@@ -87,11 +122,13 @@ def _ensure_locations_schema(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+@_review_locked
 def load_ignore_ids(crops: str | os.PathLike[str]) -> set[int]:
     """Load ignored location ids from `ignore.json` (a JSON array)."""
     return _load_ignore_ids(crops)
 
 
+@_review_locked
 def save_ignore_ids(crops: str | os.PathLike[str], ids: Iterable[int]) -> None:
     """Write `ignore.json` as a sorted JSON array of location ids."""
     _save_ignore_ids(crops, ids)
@@ -106,12 +143,20 @@ def _approval_key(location_id: int, image_key: str | None) -> tuple[int, str]:
     return (int(location_id), image_key or "")
 
 
+@_review_locked
 def load_approved(crops: str | os.PathLike[str]) -> set[tuple[int, str]]:
-    """Load approved windows from `approved.json`. The masks stay in the dataset."""
+    """Load approved windows from `approved.json`. The masks stay in the dataset.
+
+    Unreadable JSON is an empty set, as for `ignore.json`, so one bad file does not break the catalog.
+    """
     path = approved_path(crops)
     if not path.is_file():
         return set()
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        print(f"annotation-gallery: unreadable approved list {path}", flush=True)
+        return set()
     if not isinstance(payload, list):
         return set()
     keys: set[tuple[int, str]] = set()
@@ -125,13 +170,14 @@ def load_approved(crops: str | os.PathLike[str]) -> set[tuple[int, str]]:
     return keys
 
 
+@_review_locked
 def save_approved(crops: str | os.PathLike[str], keys: Iterable[tuple[int, str]]) -> None:
     """Write `approved.json` as sorted location and image-key pairs."""
     ordered = [
         {"location_id": location_id, "image_key": image_key}
         for location_id, image_key in sorted(set(keys))
     ]
-    approved_path(crops).write_text(json.dumps(ordered), encoding="utf-8")
+    _write_text_atomic(approved_path(crops), json.dumps(ordered))
 
 
 def _location_image_keys(crops: str | os.PathLike[str], location_id: int) -> list[str]:
@@ -174,6 +220,7 @@ def location_image_keys(crops: str | os.PathLike[str], location_ids: Iterable[in
     return sorted(keys)
 
 
+@_review_locked
 def approve_window(
     crops: str | os.PathLike[str],
     location_id: int,
@@ -195,6 +242,7 @@ def approve_window(
     return True
 
 
+@_review_locked
 def unapprove_window(
     crops: str | os.PathLike[str],
     location_id: int,
@@ -288,6 +336,7 @@ def list_catalog_rows(crops: str | os.PathLike[str]) -> list[dict[str, Any]]:
     return result
 
 
+@_review_locked
 def ignore_location(
     crops: str | os.PathLike[str],
     location_id: int,
@@ -307,6 +356,7 @@ def ignore_location(
     return True
 
 
+@_review_locked
 def review_locations(
     crops: str | os.PathLike[str],
     location_ids: Iterable[int],
@@ -347,6 +397,7 @@ def review_locations(
     return len(ids)
 
 
+@_review_locked
 def restore_location(
     crops: str | os.PathLike[str],
     location_id: int,
@@ -417,6 +468,7 @@ def import_ignore_ids(crops: str | os.PathLike[str], ids: Iterable[int]) -> dict
     return import_review_lists(crops, ids, [], replace=False)
 
 
+@_review_locked
 def import_review_lists(
     crops: str | os.PathLike[str],
     rejected_ids: Iterable[int],
@@ -549,6 +601,7 @@ def load_held_reviews(registry: str | os.PathLike[str]) -> dict[str, dict[str, A
     return found
 
 
+@_review_locked
 def save_held_review(
     registry: str | os.PathLike[str],
     volume: str,
@@ -566,7 +619,7 @@ def save_held_review(
             for location_id, image_key in sorted(set(approved_keys))
         ],
     }
-    (folder / f"{volume}.json").write_text(json.dumps(document), encoding="utf-8")
+    _write_text_atomic(folder / f"{volume}.json", json.dumps(document))
 
 
 def parse_training_review(payload: Any) -> list[tuple[str, list[int], list[tuple[int, str]]]]:
