@@ -1824,14 +1824,41 @@
     renderTimer = window.setTimeout(render, 120);
   }
 
+  // catalog-latest-begin
+  // Hands out one "still current?" check per request: only the newest request, while its own key still holds,
+  // may apply its response. An older response for another volume or training set is dropped.
+  function makeLatest() {
+    let newest = 0;
+    return (keyHolds) => {
+      const mine = ++newest;
+      return () => mine === newest && keyHolds();
+    };
+  }
+  // catalog-latest-end
+
+  const catalogLatest = makeLatest();
+
   async function loadCatalog(applyDefaultSort = false, preserveViewer = false) {
-    if (!state.volume) {
+    const { volume, trainingSet } = state;
+    const isLatest = catalogLatest(() => state.volume === volume && state.trainingSet === trainingSet);
+    if (!volume) {
       state.rows = [];
       indexCatalog();
       render();
       return;
     }
-    const payload = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/catalog`));
+    let payload;
+    try {
+      payload = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/catalog`));
+    } catch (error) {
+      if (!isLatest()) {
+        return;
+      }
+      throw error;
+    }
+    if (!isLatest()) {
+      return;
+    }
     state.rows = payload.rows || [];
     indexCatalog();
     if (!preserveViewer && viewer.locationId && !state.rows.some((row) => String(row.location_id) === viewer.locationId && visibleClasses().has(reviewClass(row)))) {
