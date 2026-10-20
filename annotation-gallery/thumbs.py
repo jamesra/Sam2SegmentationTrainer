@@ -19,6 +19,7 @@ import os
 import re
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -215,15 +216,20 @@ def _thumb_dest(crops: Path, size: int, image_key: str) -> Path:
 
 
 def _encode_key(job: tuple[Path, str, list[int]]) -> int:
-    """Write every stale size for one crop. The source file is opened once."""
+    """Write every stale size for one crop. The source file is opened once.
+
+    Any error on this crop (an unreadable file, or Pillow refusing it, such as
+    ``DecompressionBombError``) is logged and counts as zero written, so one
+    bad image does not end the pass for the crops after it.
+    """
     crops, image_key, sizes = job
     try:
         source = find_crop_image(crops, image_key)
         if source is None:
             return 0
         _write_jpegs(source, [(_thumb_dest(crops, size, image_key), size) for size in sizes])
-    except OSError as exc:
-        print(f"annotation-gallery thumbnail {image_key}: {exc}", flush=True)
+    except Exception as exc:
+        print(f"annotation-gallery thumbnail {image_key}: {type(exc).__name__}: {exc}", flush=True)
         return 0
     return len(sizes)
 
@@ -341,14 +347,25 @@ class _BackfillGate:
             thread.start()
 
     def _run(self) -> None:
+        """Run passes until none is queued.
+
+        A pass that raises is logged with its traceback and does not stop the
+        queued follow-up. ``_running`` is cleared on every way out, including a
+        ``BaseException`` that ends the thread, so a later request starts a new
+        thread instead of only queueing behind a dead one.
+        """
         while True:
             with self._lock:
                 registry = self._registry
             if registry is not None:
                 try:
                     _backfill_registry(registry)
-                except OSError as exc:
-                    print(f"annotation-gallery thumbnails: {exc}", flush=True)
+                except Exception:
+                    print(f"annotation-gallery thumbnails: pass failed\n{traceback.format_exc()}", end="", flush=True)
+                except BaseException:
+                    with self._lock:
+                        self._running = False
+                    raise
             with self._lock:
                 if self._queued:
                     self._queued = False
