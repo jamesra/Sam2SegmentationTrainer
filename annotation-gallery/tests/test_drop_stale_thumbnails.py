@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 GALLERY_ROOT = Path(__file__).resolve().parents[1]
@@ -37,8 +37,11 @@ def _card_mask(crops: Path, size: int, key: str, location_id: int) -> Path:
 
 @settings(max_examples=40, deadline=None)
 @given(listed=st.sets(_KEY, min_size=1, max_size=4), other=st.sets(_KEY, max_size=4))
+@example(listed={"V"}, other={"v"})  # Windows file names are case-insensitive: "v" is the same file as "V"
 def test_listed_keys_lose_every_size_and_unlisted_keys_stay(listed: set[str], other: set[str]) -> None:
-    kept_keys = {k for k in other if k not in listed and not any(k.startswith(f"{c}_") for c in listed)}
+    # Compare case-folded: on a case-insensitive filesystem keys differing only by case name the same file.
+    folded = {c.casefold() for c in listed}
+    kept_keys = {k for k in other if k.casefold() not in folded and not any(k.casefold().startswith(f"{c}_") for c in folded)}
     with tempfile.TemporaryDirectory() as tmp:
         crops = Path(tmp)
         gone = [_thumb(crops, size, key) for key in listed for size in THUMB_SIZES]
