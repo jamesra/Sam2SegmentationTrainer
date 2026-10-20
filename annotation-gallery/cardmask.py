@@ -175,16 +175,3 @@ def drop_card_masks(crops: Path, image_keys: list[str]) -> int:
                 path.unlink(missing_ok=True)
                 removed += 1
     return removed
-
-
-def drop_card_masks_for_location(crops: Path, location_id: int) -> int:
-    """Delete one location's layers in every tile, for review moves that touch only that location."""
-    removed = 0
-    for size in THUMB_SIZES:
-        folder = crops.joinpath(*CARD_MASK_DIR, str(size))
-        if not folder.is_dir():
-            continue
-        for path in folder.glob(f"*_{int(location_id)}.png"):
-            path.unlink(missing_ok=True)
-            removed += 1
-    return removed
