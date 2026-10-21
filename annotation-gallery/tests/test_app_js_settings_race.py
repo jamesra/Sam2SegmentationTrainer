@@ -83,6 +83,8 @@ const context = {{
   rememberView: () => {{}},
   render: () => events.push("render"),
   loadCatalog: async () => {{ events.push("catalog:" + state.volume + "@" + state.trainingSet); }},
+  // Opening a volume also looks for a running Update all (its own tests: test_app_js_update_strip.py).
+  watchUpdate: async () => {{}},
   document: {{
     body: {{ classList: {{ toggle: (name, on) => events.push("refresh:" + Boolean(on)) }} }},
     getElementById: (id) => fields[id],

@@ -3029,6 +3029,7 @@
     undoStack.length = 0;
     state.volume = els.volume.value;
     rememberView(true);
+    watchUpdate().catch(() => {});
     tagEpoch += 1;
     state.tagIds = null;
     if (els.tags) {
@@ -3186,6 +3187,7 @@
       render();
       return;
     }
+    watchUpdate().catch(() => {});
     await loadSettings();
     if (!isLatest()) {
       return;
@@ -3363,17 +3365,26 @@
     }
   }
 
-  // Update all: one background job per volume on the server; this dialog starts it and polls its progress.
+  // Update all: one background job per volume on the server. The dialog only asks (what will be checked, Start); the
+  // progress, Cancel and the result live in a slim strip under the cards, so the view is never covered while it runs.
+  // The strip is also picked up again after a reload or a volume switch, because the job outlives the page.
   const updateUi = {
     timer: 0,
     wasRunning: false,
+    cancelling: false,
     dialog: document.getElementById("update-dialog"),
-    bar: document.getElementById("update-bar"),
     since: document.getElementById("update-since"),
+    last: document.getElementById("update-last"),
+    start: document.getElementById("update-start"),
+    close: document.getElementById("update-close"),
+    strip: document.getElementById("update-strip"),
+    title: document.getElementById("update-strip-title"),
+    bar: document.getElementById("update-bar"),
     line: document.getElementById("update-line"),
     detail: document.getElementById("update-detail"),
-    start: document.getElementById("update-start"),
+    detailToggle: document.getElementById("update-details-toggle"),
     cancel: document.getElementById("update-cancel"),
+    dismiss: document.getElementById("update-dismiss"),
   };
 
   function updateUrl(suffix = "") {
@@ -3381,52 +3392,121 @@
   }
 
   function describeWatermark(status) {
-    if (status.watermark) {
-      return `Changes since ${status.watermark.replace("T", " ").replace(/\.\d+Z$/, "Z")} will be checked.`;
+    const since = status.watermark || status.watermarkAfter;
+    if (since) {
+      return `Changes since ${since.replace("T", " ").replace(/\.\d+Z$/, "Z")} will be checked.`;
     }
     return "First run: starts from the age of the oldest masks, so it may redraw more than later runs.";
   }
 
-  function paintUpdate(status) {
+  // update-strip-view-begin
+  // What the strip shows for one status from the server: its words, the bar, and which buttons apply. No DOM here.
+  function updateStripView(status, volume, cancelling) {
     const running = Boolean(status.running);
     const phase = status.phase || "idle";
-    updateUi.start.hidden = running;
-    updateUi.cancel.hidden = !running;
-    updateUi.bar.hidden = !(running || status.pages);
-    updateUi.bar.max = Math.max(1, Number(status.pages) || 1);
-    updateUi.bar.value = Math.min(Number(status.page) || 0, updateUi.bar.max);
-    if (phase === "idle") {
-      updateUi.since.textContent = describeWatermark(status);
-      const last = status.lastCounts || {};
-      updateUi.line.textContent = status.lastRun
-        ? `Last run ${status.lastRun}: ${last.refreshed || 0} refreshed, ${last.added || 0} added, ${last.skipped || 0} skipped.`
-        : "";
-      updateUi.detail.hidden = true;
-      return;
-    }
-    updateUi.since.textContent = status.watermarkBefore
-      ? `Changes since ${status.watermarkBefore.replace("T", " ").replace(/\.\d+Z$/, "Z")}.`
+    const count = (value) => Number(value || 0).toLocaleString("en-US");
+    const circles = status.circles ? `, ${count(status.circles)} circles` : "";
+    const counts = `${count(status.refreshed)} refreshed, ${count(status.added)} added${circles}, ${count(status.skipped)} skipped, ${count(status.failed)} failed`;
+    const since = status.watermarkBefore
+      ? status.watermarkBefore.replace("T", " ").replace(/\.\d+Z$/, "Z")
       : "";
-    const circles = status.circles ? `, ${status.circles} circles` : "";
-    const counts = `${status.refreshed || 0} refreshed, ${status.added || 0} added${circles}, ${status.skipped || 0} skipped, ${status.failed || 0} failed`;
-    const place = status.pages ? `page ${status.page} of ${status.pages}: ` : "";
-    const label = { done: "Finished. ", cancelled: "Cancelled. ", failed: "Finished with failures. " }[phase] || "";
-    updateUi.line.textContent = `${label}${place}${counts}`;
+    const place = status.pages ? `page ${count(status.page)} of ${count(status.pages)}` : "";
+    let headline;
+    if (running && cancelling) {
+      headline = "Cancelling, finishing the row in progress";
+    } else if (running && phase === "reading catalog") {
+      headline = "Reading the catalog";
+    } else if (running && phase === "retrying skipped") {
+      headline = "Retrying locations skipped last time";
+    } else if (running) {
+      headline = since ? `Checking changes since ${since}` : "Checking changes";
+    } else {
+      headline = { done: "Finished", cancelled: "Cancelled", failed: "Finished with failures" }[phase] || "";
+    }
+    const parts = [headline, running && !status.pages ? "" : place, phase === "idle" ? "" : counts];
     const lines = [...(status.notes || []), ...(status.errors || []), ...(status.skipLines || []).slice(0, 20)];
     if (status.skipped > (status.skipLines || []).length) {
       lines.push(`... ${status.skipped} skipped in all; the full list is in update_all.log`);
     }
-    updateUi.detail.textContent = lines.join("\n");
-    updateUi.detail.hidden = lines.length === 0;
+    const max = Math.max(1, Number(status.pages) || 1);
+    return {
+      title: running ? `Updating ${volume}` : `Update ${volume}`,
+      line: parts.filter(Boolean).join(" · "),
+      tone: running ? "running" : ({ done: "ok", cancelled: "warn" }[phase] || "bad"),
+      indeterminate: running && !status.pages,
+      max,
+      value: Math.min(Number(status.page) || 0, max),
+      showBar: running || Boolean(status.pages),
+      showCancel: running && !cancelling,
+      showDismiss: !running,
+      detail: lines.join("\n"),
+    };
+  }
+  // update-strip-view-end
+
+  let updateStripShown = false;
+
+  function showUpdateStrip(visible) {
+    updateUi.strip.hidden = !visible;
+    if (visible !== updateStripShown) {
+      updateStripShown = visible;
+      // The cards' area just lost or regained the strip's height, so lay them out for the new size.
+      render(true);
+    }
+  }
+
+  function paintUpdate(status) {
+    const phase = status.phase || "idle";
+    if (phase === "idle" && !status.running) {
+      showUpdateStrip(false);
+      updateUi.since.textContent = describeWatermark(status);
+      const last = status.lastCounts || {};
+      updateUi.last.textContent = status.lastRun
+        ? `Last run ${status.lastRun}: ${last.refreshed || 0} refreshed, ${last.added || 0} added, ${last.skipped || 0} skipped.`
+        : "";
+      return;
+    }
+    if (!status.running) {
+      updateUi.cancelling = false;
+    }
+    const view = updateStripView(status, state.volume, updateUi.cancelling);
+    updateUi.strip.dataset.tone = view.tone;
+    updateUi.title.textContent = view.title;
+    updateUi.line.textContent = view.line;
+    updateUi.line.title = view.line;
+    updateUi.bar.hidden = !view.showBar;
+    if (view.indeterminate) {
+      updateUi.bar.removeAttribute("value");
+    } else {
+      updateUi.bar.max = view.max;
+      updateUi.bar.value = view.value;
+    }
+    updateUi.cancel.hidden = !view.showCancel;
+    updateUi.dismiss.hidden = !view.showDismiss;
+    updateUi.detail.textContent = view.detail;
+    updateUi.detailToggle.hidden = !view.detail;
+    if (!view.detail) {
+      updateUi.detail.hidden = true;
+      updateUi.detailToggle.setAttribute("aria-expanded", "false");
+    }
+    showUpdateStrip(true);
+  }
+
+  // The status of this volume's job, or null when it cannot be read (a viewer without review rights, a lost link).
+  async function readUpdateStatus() {
+    const volume = state.volume;
+    try {
+      const status = await getJson(updateUrl());
+      return volume === state.volume ? status : null;
+    } catch (error) {
+      return null;
+    }
   }
 
   async function pollUpdate() {
     window.clearTimeout(updateUi.timer);
-    let status;
-    try {
-      status = await getJson(updateUrl());
-    } catch (error) {
-      updateUi.line.textContent = error.message;
+    const status = await readUpdateStatus();
+    if (!status) {
       return;
     }
     paintUpdate(status);
@@ -3447,28 +3527,56 @@
     }
   }
 
+  // A volume was opened: follow its job if one is running (started by this page earlier, or by another), else show none.
+  async function watchUpdate() {
+    window.clearTimeout(updateUi.timer);
+    updateUi.wasRunning = false;
+    updateUi.cancelling = false;
+    showUpdateStrip(false);
+    if (!state.volume) {
+      return;
+    }
+    const status = await readUpdateStatus();
+    if (status && status.running) {
+      await pollUpdate();
+    }
+  }
+
   async function openUpdateAll() {
     if (!state.volume) {
       return;
     }
+    const status = await readUpdateStatus();
+    if (status && status.running) {
+      // Already going: the strip is the whole interface, there is nothing to ask.
+      await pollUpdate();
+      return;
+    }
+    if (status) {
+      updateUi.since.textContent = describeWatermark(status);
+      const last = status.lastCounts || {};
+      updateUi.last.textContent = status.lastRun
+        ? `Last run ${status.lastRun}: ${last.refreshed || 0} refreshed, ${last.added || 0} added, ${last.skipped || 0} skipped.`
+        : "";
+    }
+    updateUi.start.disabled = false;
     updateUi.dialog.hidden = false;
-    updateUi.line.textContent = "";
-    await pollUpdate();
   }
 
   async function startUpdateAll() {
-    updateUi.start.hidden = true;
-    updateUi.line.textContent = "Starting...";
+    updateUi.start.disabled = true;
     try {
       const status = await getJson(updateUrl(), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       });
+      updateUi.dialog.hidden = true;
+      updateUi.wasRunning = true;
       paintUpdate(status);
     } catch (error) {
-      updateUi.line.textContent = error.message;
-      updateUi.start.hidden = false;
+      updateUi.start.disabled = false;
+      els.status.textContent = error.message;
       return;
     }
     updateUi.timer = window.setTimeout(pollUpdate, 500);
@@ -3482,18 +3590,33 @@
   updateUi.start.addEventListener("click", () => {
     startUpdateAll();
   });
+  updateUi.close.addEventListener("click", () => {
+    updateUi.dialog.hidden = true;
+  });
   updateUi.cancel.addEventListener("click", () => {
+    updateUi.cancelling = true;
+    updateUi.cancel.hidden = true;
+    updateUi.line.textContent = "Cancelling, finishing the row in progress";
     getJson(updateUrl("/cancel"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     }).catch((error) => {
-      updateUi.line.textContent = error.message;
+      updateUi.cancelling = false;
+      updateUi.cancel.hidden = false;
+      els.status.textContent = error.message;
     });
   });
-  document.getElementById("update-close").addEventListener("click", () => {
+  updateUi.detailToggle.addEventListener("click", () => {
+    const open = updateUi.detail.hidden;
+    updateUi.detail.hidden = !open;
+    updateUi.detailToggle.setAttribute("aria-expanded", String(open));
+    render(true);
+  });
+  updateUi.dismiss.addEventListener("click", () => {
     window.clearTimeout(updateUi.timer);
-    updateUi.dialog.hidden = true;
+    updateUi.detail.hidden = true;
+    showUpdateStrip(false);
   });
 
   document.getElementById("volume-settings").addEventListener("click", () => {

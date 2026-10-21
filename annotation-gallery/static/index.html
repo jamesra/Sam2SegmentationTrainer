@@ -132,6 +132,17 @@
     <div id="spacer" class="spacer"></div>
     <div id="grid" class="grid"></div>
   </div>
+  <footer id="update-strip" class="update-strip" data-tone="running" role="status" aria-live="polite" hidden>
+    <div class="update-strip-main">
+      <strong id="update-strip-title" class="update-strip-title">Update all</strong>
+      <progress id="update-bar" class="update-bar" value="0" max="1"></progress>
+      <span id="update-line" class="update-strip-line"></span>
+      <button type="button" id="update-details-toggle" aria-controls="update-detail" aria-expanded="false" hidden>Details</button>
+      <button type="button" id="update-cancel" class="review-only" hidden>Cancel</button>
+      <button type="button" id="update-dismiss" aria-label="Dismiss" title="Dismiss" hidden>×</button>
+    </div>
+    <pre id="update-detail" class="update-strip-detail" hidden></pre>
+  </footer>
   <div id="viewer" class="viewer" hidden>
     <div class="viewer-bar">
       <button type="button" id="viewer-back" hidden>Back</button>
@@ -198,12 +209,10 @@
     <div class="import-card" role="dialog" aria-labelledby="update-title">
       <h2 id="update-title">Update all</h2>
       <p id="update-since" class="import-totals"></p>
-      <progress id="update-bar" class="update-bar" value="0" max="1" hidden></progress>
-      <p id="update-line" class="import-totals" aria-live="polite"></p>
-      <pre id="update-detail" hidden></pre>
+      <p id="update-last" class="import-totals"></p>
+      <p class="import-totals">It runs in the background. Progress and Cancel are in the bar under the cards, so you can keep reviewing.</p>
       <div class="import-actions">
         <button type="button" id="update-start" class="review-only">Start</button>
-        <button type="button" id="update-cancel" class="review-only" hidden>Cancel run</button>
         <button type="button" id="update-close">Close</button>
       </div>
     </div>
