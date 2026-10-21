@@ -284,7 +284,7 @@ sam2-em-infer --image /path/to/crop.png --checkpoint /storage4/Sam2Trainer/runs/
 # The command below exports best_model.pt by hand. Name the file for the model: v<VERSION>.<EPOCH>.pt, here v1.6.pt (a label may lead it: sem-v1.6.pt)
 # for run sam2_em_v1 and epoch 6 (VERSION comes from the run name, EPOCH from best_model.json that training writes
 # beside best_model.pt; for an older run pass --epoch N, and --model-id v<N> when the run name has no _vN).
-# --description "..." sets the operator's description; leave it out to keep the one already in the manifest.
+# --model-id, --display-name and --description are optional. Each is taken from: the argument, then <run>/model.json, then (description only) the manifest already at --out, then a value inferred from the run (id from the run name, display name from the id, a description naming the run and its training set). The first export writes <run>/model.json with those inferred values for you to edit; an existing model.json is never overwritten, and an argument is used for that export only.
 # best_model.pt is weights only; this writes the file the server expects.
 sam2-em-export-serve \
   --checkpoint /storage4/Sam2Trainer/runs/sam2_em_v1/best_model.pt \

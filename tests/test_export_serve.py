@@ -126,7 +126,8 @@ class ExportServeTests(unittest.TestCase):
         self.assertEqual(validate_manifest(manifest), [])
         self.assertEqual(manifest["model"]["model_id"], "v9")
         self.assertEqual(manifest["model"]["model_version"], "v9.2")
-        self.assertEqual(manifest["model"]["description"], "")
+        self.assertEqual(manifest["model"]["description"], "Run sam2_em_v9, trained on training set v3.")
+        self.assertEqual(manifest["model"]["display_name"], "v9")
         self.assertEqual(manifest["training_data"], {"set": "v3", "fingerprint": "f00"})
         self.assertEqual(manifest["model"]["base_checkpoint"], "sam2.1.pt")
 
@@ -144,7 +145,7 @@ class ExportServeTests(unittest.TestCase):
             self._export(tmp)
             path = Path(tmp) / "m.model.json"
             written = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(written["model"]["description"], "")
+            self.assertEqual(written["model"]["description"], "Run run_v3.")
             written["model"]["description"] = "Trained on the repopulated set; use for RPC1."
             path.write_text(json.dumps(written), encoding="utf-8")
 
@@ -154,6 +155,60 @@ class ExportServeTests(unittest.TestCase):
             replaced = json.loads(path.read_text(encoding="utf-8"))["model"]["description"]
         self.assertEqual(kept, "Trained on the repopulated set; use for RPC1.")
         self.assertEqual(replaced, "A new description")
+
+    def test_the_first_export_writes_model_json_with_the_inferred_defaults(self) -> None:
+        with TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run_v3"
+            run.mkdir()
+            (run / "training_data.json").write_text(
+                json.dumps({"set": "v3.1", "volumes": {"RC1": {}, "RPC1": {}}}), encoding="utf-8"
+            )
+            self._export(tmp)
+            written = json.loads((run / "model.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            written,
+            {
+                "model_id": "v3",
+                "display_name": "v3",
+                "description": "Run run_v3, trained on training set v3.1 (RC1, RPC1).",
+            },
+        )
+
+    def test_model_json_supplies_the_values_and_is_never_overwritten(self) -> None:
+        with TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run_v3"
+            run.mkdir()
+            edited = {"display_name": "Mito v3", "description": "For mitochondria."}
+            (run / "model.json").write_text(json.dumps(edited), encoding="utf-8")
+            self._export(tmp)
+            manifest = json.loads((Path(tmp) / "m.model.json").read_text(encoding="utf-8"))["model"]
+            on_disk = json.loads((run / "model.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["display_name"], "Mito v3")
+        self.assertEqual(manifest["description"], "For mitochondria.")
+        self.assertEqual(on_disk, edited)  # the operator's file is left as written
+
+    def test_arguments_win_over_model_json_and_are_not_written_to_it(self) -> None:
+        with TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run_v3"
+            run.mkdir()
+            self._export(tmp, display_name="Override", description="Once only")
+            manifest = json.loads((Path(tmp) / "m.model.json").read_text(encoding="utf-8"))["model"]
+            on_disk = json.loads((run / "model.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["display_name"], manifest["description"]), ("Override", "Once only"))
+        self.assertEqual((on_disk["display_name"], on_disk["description"]), ("v3", "Run run_v3."))
+
+    def test_model_json_can_supply_the_model_id_for_a_run_name_without_a_version(self) -> None:
+        with TemporaryDirectory() as tmp, mock.patch(
+            "sam2_segmentation_trainer.export_serve.load_finetuned_model", return_value=nn.Linear(2, 2)
+        ), contextlib.redirect_stdout(io.StringIO()):
+            run = Path(tmp) / "scratch"
+            run.mkdir()
+            (run / "model.json").write_text(json.dumps({"model_id": "v7"}), encoding="utf-8")
+            export_serve_checkpoint(
+                finetuned=run / "best_model.pt", base_ckpt=Path("b.pt"), out=Path(tmp) / "m.pt", epoch=2
+            )
+            manifest = json.loads((Path(tmp) / "m.model.json").read_text(encoding="utf-8"))["model"]
+        self.assertEqual(manifest["model_version"], "v7.2")
 
     def test_a_run_name_without_a_version_needs_an_explicit_model_id(self) -> None:
         with TemporaryDirectory() as tmp, mock.patch(
