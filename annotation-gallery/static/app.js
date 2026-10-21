@@ -237,6 +237,14 @@
         frame: els.viewerFrame,
         maskCanvas: els.viewerMask,
         getHue: () => viewer.hue,
+        persists: () => state.converter,
+        onChange: (polygon) => {
+          if (state.converter) {
+            saveRetrace(polygon).catch((error) => {
+              els.status.textContent = error.message;
+            });
+          }
+        },
         setStatus: (text) => {
           els.status.textContent = text;
         },
@@ -256,6 +264,44 @@
         },
       })
     : null;
+
+  // Converter: the retraced outline replaces the card's proposal (and so the batch); the database is not written.
+  async function saveRetrace(polygon) {
+    const locationId = viewer.locationId;
+    const imageKey = viewer.imageKey;
+    const volume = state.volume;
+    const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/converter/edit`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        location_id: Number(locationId),
+        image_key: imageKey,
+        rings: [polygon.exterior, ...polygon.holes],
+      }),
+    });
+    const row = viewerRow();
+    if (row) {
+      row.loss = 1 - Number(result.iou);
+      row.conv = { ...(row.conv || {}), iou: result.iou, reason: "retraced" };
+    }
+    if (locationId !== viewer.locationId || volume !== state.volume) {
+      return;
+    }
+    // Show the stored mask: the outline just drawn, now as the card's mask.
+    const mask = await loadImage(`${fileUrl(volume, `masks/${imageKey}_${locationId}.png`)}&t=${Date.now()}`);
+    if (locationId !== viewer.locationId) {
+      return;
+    }
+    retraceUi.reset();
+    syncRetraceButton();
+    viewer.mask = mask;
+    viewer.overlay = composeOverlay(viewer.image, mask, viewer.hue, viewer.visibility);
+    layerEpoch += 1;
+    resetVisibleCards();
+    paintViewer();
+    placeViewerInfo();
+    els.status.textContent = `Retrace saved to the converter batch (${Math.round(Number(result.iou) * 100)}% overlap with the current outline). The database is not changed.`;
+  }
 
   function syncRetraceButton() {
     if (retraceButton && retraceUi) {

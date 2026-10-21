@@ -795,6 +795,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if path == "/api/converter/structures":
             self._handle_converter_create()
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/converter/edit", path)
+        if match:
+            self._handle_converter_edit(match.group(1))
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/viking-link", path)
         if match:
             self._handle_viking_link(match.group(1))
@@ -940,6 +944,25 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
         self._send_json(started.snapshot())
+
+    def _handle_converter_edit(self, volume: str) -> None:
+        """POST {location_id, image_key, rings}: a retraced outline replaces the card's proposal (the batch, not the database)."""
+        if not self._review_granted(volume):
+            return
+        try:
+            body = self._read_json()
+            location_id = int(body["location_id"])
+            image_key = str(body["image_key"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "location_id, image_key and rings required"}, status=400)
+            return
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        try:
+            self._send_json(converter_web.apply_edit(crops, location_id, image_key, body.get("rings")))
+        except converter_web.EditRejected as rejected:
+            self._send_json({"error": str(rejected)}, status=400)
 
     def _handle_converter_create(self) -> None:
         """POST {structureId, volume, typeCodes?, zMin?, zMax?, channel?, filter?}: make the structure's set and start building."""

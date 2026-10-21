@@ -55,3 +55,30 @@
 #   recomputed, in every crop window the circle reaches. Only the listed locations change, and the file is
 #   written once at the end. A volume without that file is left without one (the dialog says so). Deleted
 #   annotations do not appear in an OData "changed since" query, so their circles stay until the next export.
+
+## Converter (`/converter/`)
+
+A twin of the gallery that turns the annotations of one Viking structure into proposed plain polygons. It is a mode of this
+same server, off unless `GALLERY_CONVERTER_ROOT` is set. A user opens `/converter/`, enters a structure ID and presses
+**Build structure**; each matching annotation (circle, polygon, curve polygon, closed curve; filter by type and section
+range) is sent to the segmentation server, and a card appears with the proposal and, as a thin line, the current outline.
+**Approve** adds the card to the structure's batch (`Download approved`, JSON lines); **Reject** leaves that location alone.
+Nothing is written to the database. The pen retrace (key `R` in the viewer, also in the gallery) edits the outline; in the
+converter the edit replaces the proposal, in the gallery it is only shown.
+
+Each build is a training set `structure-<id>` under `GALLERY_CONVERTER_ROOT`, laid out like any crops folder, so the grid,
+viewer, approve and reject are the gallery's own.
+
+| Setting | Meaning |
+|---|---|
+| `GALLERY_CONVERTER_ROOT` | Folder builds are kept in. Unset turns the converter off. |
+| `GALLERY_SEGMENTATION_TARGET` | `host:port` of the segmentation server's TLS gRPC port. |
+| `GALLERY_SEGMENTATION_CA` | Optional PEM of trusted roots. |
+| `GALLERY_SEGMENTATION_TLS_NAME` | Optional name to verify the certificate against when reached by another name. |
+| `GALLERY_CONVERTER_VIKINGXML` | URL template of the volume's VikingXML, with `{volume}`: where the tile pyramids are listed. |
+| `GALLERY_CONVERTER_TILE_CACHE` | Optional folder for cached tiles (revalidated by ETag). |
+| `GALLERY_CONVERTER_STREAMS` | Segmentation streams at once across all builds (default 1). |
+
+What the approved batch holds (`type_code` 6, plain `POLYGON` control points in mosaic pixels, the source shape's hash, the
+model and the overlap with the old outline) is for a later database writer; none exists yet. Neighbouring annotations are
+not yet sent to the segmentation server as background masks.

@@ -4,6 +4,7 @@ gallery's own routes, and the approved cards come out as a batch file."""
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import threading
 from http.client import HTTPConnection
@@ -333,3 +334,56 @@ def test_cancel_stops_a_running_build(clean_httpd) -> None:
     gate.set()
     done = wait_until_done(clean_httpd)
     assert done["phase"] == "cancelled" and done["refreshed"] == 1
+
+
+# ---- retrace edits -----------------------------------------------------------------------------------------------
+
+def test_an_edited_outline_replaces_the_proposal_and_reaches_the_batch(httpd, built: Path) -> None:
+    key = f"{fixtures.VOLUME}_7_D1_L11"
+    card_before = {c["location_id"]: c for c in get_json(httpd, f"/api/volumes/RC1/converter/cards?set={SET}")[1]["cards"]}[11]
+    # A 100 x 60 px rectangle in the card's crop pixels, a long way from the circle.
+    rect = [[100, 100], [200, 100], [200, 160], [100, 160], [100, 100]]
+    status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 11, "image_key": key, "rings": [rect]})
+    payload = json.loads(raw)
+    assert status == 200 and payload["iou"] < card_before["iou"]
+
+    from PIL import Image
+    import numpy as np
+    mask = np.asarray(Image.open(built / "masks" / f"{key}_11.png")) > 0
+    assert abs(int(mask.sum()) - 100 * 60) < 400
+    ys, xs = np.nonzero(mask)
+    assert 99 <= xs.min() <= 101 and 199 <= xs.max() <= 201 and 99 <= ys.min() <= 101
+
+    request(httpd, "POST", f"/api/volumes/RC1/approve?set={SET}", {"location_id": 11, "image_key": key})
+    row = json.loads(request(httpd, "GET", f"/api/volumes/RC1/converter/batch?set={SET}")[1].splitlines()[0])
+    assert row["mosaic_wkt"] == payload["candidate_wkt"] and row["mosaic_wkt"].startswith("POLYGON ((")
+    cards = {c["location_id"]: c for c in get_json(httpd, f"/api/volumes/RC1/converter/cards?set={SET}")[1]["cards"]}
+    assert cards[11]["reason"] == "retraced" and cards[12]["reason"] is None
+
+
+def test_the_edit_wkt_is_in_mosaic_pixels(httpd, built: Path) -> None:
+    key = f"{fixtures.VOLUME}_7_D1_L11"
+    connection = sqlite3.connect(built / "annotation_crops.sqlite")
+    ox, oy = connection.execute("SELECT origin_x, origin_y FROM converter_cards WHERE location_id = 11").fetchone()
+    rect = [[10, 20], [60, 20], [60, 50], [10, 50], [10, 20]]
+    payload = json.loads(request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 11, "image_key": key, "rings": [rect]})[1])
+    from converter import geo
+    ring = geo.parse_wkt_polygons(payload["candidate_wkt"])[0][0]
+    xs, ys = zip(*ring)
+    assert (min(xs), max(xs), min(ys), max(ys)) == (ox + 10, ox + 60, oy + 20, oy + 50)
+
+
+@pytest.mark.parametrize("rings", [None, [], [[[0, 0], [1, 1]]], [[[0, 0], [1, "x"], [2, 2]]], [[[0, 0], [1, 0], [1, 1], [0, 0]]]])
+def test_bad_edits_are_refused_and_change_nothing(httpd, built: Path, rings) -> None:
+    key = f"{fixtures.VOLUME}_7_D1_L11"
+    before = (built / "masks" / f"{key}_11.png").read_bytes()
+    status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 11, "image_key": key, "rings": rings})
+    assert status == 400 and "error" in json.loads(raw)
+    assert (built / "masks" / f"{key}_11.png").read_bytes() == before
+
+
+def test_editing_a_missing_card_or_without_review_rights(httpd, built: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rect = [[100, 100], [200, 100], [200, 160], [100, 160], [100, 100]]
+    assert request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 99, "image_key": "nope", "rings": [rect]})[0] == 400
+    monkeypatch.setenv("GALLERY_STUB_ROLE", "read")
+    assert request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 11, "image_key": "k", "rings": [rect]})[0] == 403

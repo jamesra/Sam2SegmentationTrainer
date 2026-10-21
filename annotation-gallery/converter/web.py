@@ -24,7 +24,6 @@ one constant to change."""
 
 def converter_root(environ: Optional[Dict[str, str]] = None) -> Optional[Path]:
     """The folder builds are kept in, or None when the converter is switched off (``GALLERY_CONVERTER_ROOT`` unset)."""
-    import os
 
     mapping = environ if environ is not None else os.environ
     raw = (mapping.get("GALLERY_CONVERTER_ROOT") or "").strip()
@@ -137,3 +136,79 @@ def approved_batch(crops: Path) -> List[Dict[str, Any]]:
 def batch_jsonl(crops: Path) -> bytes:
     lines = [json.dumps(row, separators=(",", ":")) for row in approved_batch(crops)]
     return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+
+
+MAX_EDIT_VERTICES = 20000
+MIN_EDIT_AREA = 4.0
+
+
+class EditRejected(Exception):
+    """The edited outline cannot replace the proposal; the message is for the reviewer."""
+
+
+def _ring_from(payload: Any) -> List[tuple]:
+    if not isinstance(payload, list) or len(payload) < 3:
+        raise EditRejected("an outline needs at least three points")
+    points = []
+    for item in payload:
+        try:
+            x, y = float(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError):
+            raise EditRejected("outline points must be [x, y] numbers") from None
+        if x != x or y != y or abs(x) > 1e7 or abs(y) > 1e7:
+            raise EditRejected("outline points are out of range")
+        points.append((x, y))
+    if points[0] != points[-1]:
+        points.append(points[0])
+    return points
+
+
+def apply_edit(crops: Path, location_id: int, image_key: str, rings: Any) -> Dict[str, Any]:
+    """Replace a card's proposed polygon with a retraced one.
+
+    ``rings`` are in the card's crop pixels (pixel-edge coordinates, the stored orientation): the exterior first, then
+    holes. The mask PNG, the candidate WKT (plain POLYGON control points in mosaic pixels) and the overlap with the
+    current outline are rewritten, and the card's cached layers dropped. The database is not touched.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from converter import builder as builder_module
+    from converter import contour as contour_module
+    from refresh import drop_stale_thumbnails
+
+    if not isinstance(rings, list) or not rings or sum(len(r) for r in rings if isinstance(r, list)) > MAX_EDIT_VERTICES:
+        raise EditRejected("an outline is required")
+    parsed = [_ring_from(ring) for ring in rings]
+    connection = catalog.connect(crops)
+    try:
+        if not _has_cards(crops):
+            raise EditRejected("this is not a converter set")
+        card = connection.execute(
+            "SELECT * FROM converter_cards WHERE location_id = ? AND image_key = ? AND state = 'built'", [location_id, image_key]
+        ).fetchone()
+        if card is None:
+            raise EditRejected("no such card")
+        origin = (int(card["origin_x"]), int(card["origin_y"]))
+        downsample = int(card["downsample"])
+        protocol = [[(x + origin[0], y + origin[1]) for x, y in ring] for ring in parsed]
+        mask = builder_module.draw_mask(protocol, origin)
+        if int(mask.sum()) < MIN_EDIT_AREA:
+            raise EditRejected("the outline is empty")
+        original_path = crops / "original" / f"{image_key}_{location_id}.png"
+        original = np.asarray(Image.open(original_path)) > 0 if original_path.is_file() else np.zeros_like(mask)
+        ratio = builder_module.iou(original, mask)
+        shape = contour_module.Contour(
+            exterior=np.array(protocol[0], dtype=float), holes=[np.array(ring, dtype=float) for ring in protocol[1:]]
+        )
+        wkt = builder_module.candidate_polygon_wkt(shape, downsample)
+        builder_module._write_png(crops / "masks" / f"{image_key}_{location_id}.png", mask * 255)
+        connection.execute(
+            "UPDATE converter_cards SET candidate_wkt = ?, iou = ?, reason = 'retraced' WHERE location_id = ? AND image_key = ?",
+            [wkt, ratio, location_id, image_key],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    drop_stale_thumbnails(crops, [image_key])
+    return {"ok": True, "location_id": location_id, "iou": ratio, "candidate_wkt": wkt}

@@ -3,7 +3,8 @@
  * command does it (geometry in retrace.js). Starting inside the shape and leaving it grows the shape; starting outside
  * and crossing it twice removes the side counter-clockwise from the first crossing (hold Ctrl to remove the other).
  *
- * The gallery cannot write annotations yet, so a finished retrace is only shown, with a notice saying so.
+ * The gallery cannot write annotations yet, so a finished retrace is only shown, with a notice saying so. In the
+ * converter the host page keeps the edit itself (deps.persists() is true), so the notice is not shown.
  */
 (function (root) {
   "use strict";
@@ -12,7 +13,8 @@
 
   /**
    * deps: frame (the element holding the canvases), maskCanvas (the viewer's mask canvas; its size is the pixel
-   * space), getMask() -> { width, height, inside(x, y) } | null, getHue() -> "#rrggbb", setStatus(text), onChange().
+   * space), getMask() -> { width, height, inside(x, y) } | null, getHue() -> "#rrggbb", setStatus(text), onChange(polygon),
+   * persists() -> true when the host saves the edit (no "not saved" notice).
    */
   function create(deps) {
     const Retrace = root.Retrace;
@@ -116,8 +118,9 @@
       }
       state.polygon = result.polygon;
       paint();
-      deps.setStatus(`Retrace: ${result.action.toLowerCase().replace(/_/g, " ")}. ${NOT_SAVED}`);
-      if (dialog) {
+      const persists = Boolean(deps.persists && deps.persists());
+      deps.setStatus(`Retrace: ${result.action.toLowerCase().replace(/_/g, " ")}.${persists ? "" : ` ${NOT_SAVED}`}`);
+      if (dialog && !persists) {
         dialog.hidden = false;
       }
       deps.onChange && deps.onChange(state.polygon);
