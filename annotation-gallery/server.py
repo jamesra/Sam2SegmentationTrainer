@@ -811,13 +811,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         volume = match.group(1)
         action = match.group(2)
-        principal = self._principal()
-        role = principal.grants.get(volume)
-        if role is None:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        if role != PERMISSION_REVIEW:
-            self._send_json({"error": "review required"}, status=403)
+        if not self._review_granted(volume):
             return
         try:
             body = self._read_json()
@@ -828,10 +822,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError, json.JSONDecodeError):
             self._send_json({"error": "location_id required"}, status=400)
             return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         if action == "ignore":
             ignore_location(crops, location_id, image_key)
@@ -890,12 +882,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
 
     def _handle_review_batch(self, volume: str) -> None:
         """Approve or reject a list of whole locations: body ``{"action": "approve"|"ignore", "location_ids": [...]}``."""
-        role = self._principal().grants.get(volume)
-        if role is None:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        if role != PERMISSION_REVIEW:
-            self._send_json({"error": "review required"}, status=403)
+        if not self._review_granted(volume):
             return
         try:
             body = self._read_json()
@@ -907,10 +894,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError, json.JSONDecodeError):
             self._send_json({"error": "action (approve or ignore) and location_ids required"}, status=400)
             return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         count = review_locations(crops, location_ids, action)
         if action == "ignore":
@@ -996,14 +981,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_ignore_export(self, volume: str) -> None:
-        principal = self._principal()
-        if volume not in principal.grants:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         ids = sorted(load_ignore_ids(crops))
         approved = [
@@ -1018,14 +997,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_repair_pack(self, volume: str) -> None:
-        principal = self._principal()
-        if volume not in principal.grants:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         payload = build_repair_pack(crops, volume=volume, viking_template=viking_template())
         if not payload:
@@ -1039,23 +1012,15 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _handle_ignore_import(self, volume: str) -> None:
-        principal = self._principal()
-        role = principal.grants.get(volume)
-        if role is None:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        if role != PERMISSION_REVIEW:
-            self._send_json({"error": "review required"}, status=403)
+        if not self._review_granted(volume):
             return
         try:
             rejected, approved, replace = parse_review_import(self._read_json())
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             self._send_json({"error": str(exc) or "invalid review list"}, status=400)
             return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         result = import_review_lists(crops, rejected, approved, replace=replace)
         self._send_json({"ok": True, "volume": volume, **result})
@@ -1148,25 +1113,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
         }
 
     def _handle_settings_get(self, volume: str) -> None:
-        principal = self._principal()
-        if volume not in principal.grants:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         self._send_json(self._settings_payload(volume, load_source_document(crops)))
 
     def _handle_settings_post(self, volume: str) -> None:
-        principal = self._principal()
-        role = principal.grants.get(volume)
-        if role is None:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        if role != PERMISSION_REVIEW:
-            self._send_json({"error": "review required"}, status=403)
+        if not self._review_granted(volume):
             return
         try:
             body = self._read_json()
@@ -1182,13 +1135,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self._send_json(self._settings_payload(volume, saved))
 
     def _handle_refresh_location(self, volume: str) -> None:
-        principal = self._principal()
-        role = principal.grants.get(volume)
-        if role is None:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        if role != PERMISSION_REVIEW:
-            self._send_json({"error": "review required"}, status=403)
+        if not self._review_granted(volume):
             return
         try:
             body = self._read_json()
@@ -1196,10 +1143,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError, json.JSONDecodeError):
             self._send_json({"error": "location_id required"}, status=400)
             return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         source = load_source_document(crops)
         url = odata_endpoint(volume, source)
@@ -1227,23 +1172,15 @@ class GalleryHandler(BaseHTTPRequestHandler):
 
     def _handle_import_location(self, volume: str) -> None:
         """Look a location id up in OData and, when the volume has the crop images, import it."""
-        principal = self._principal()
-        role = principal.grants.get(volume)
-        if role is None:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        if role != PERMISSION_REVIEW:
-            self._send_json({"error": "review required"}, status=403)
+        if not self._review_granted(volume):
             return
         try:
             location_id = int(self._read_json().get("location_id"))
         except (TypeError, ValueError, json.JSONDecodeError):
             self._send_json({"error": "location_id required"}, status=400)
             return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
+        crops = self._granted_crops(volume)
+        if crops is None:
             return
         job = update_all.current_job(volume)
         if job is not None and job.running:
@@ -1276,15 +1213,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self._send_json(result)
 
     def _handle_catalog(self, volume: str) -> None:
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
         principal = self._principal()
-        if volume not in principal.grants:
-            self._send_json({"error": "not found"}, status=404)
-            return
-        try:
-            crops = crops_dir(self._registry(), volume)
-        except (ValueError, FileNotFoundError):
-            self._send_json({"error": "not found"}, status=404)
-            return
         body_json, body_gzip = catalog_body(crops, volume, principal.grants[volume], read_crop_size(crops) or 1024)
         wants_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
         body = body_gzip if wants_gzip else body_json
@@ -1402,6 +1334,25 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
             return
         self._send_file(target, content_type_for(target))
+
+    def _review_granted(self, volume: str) -> bool:
+        """True when the caller may review ``volume``; otherwise sends 404 (no grant) or 403 (read-only)."""
+        role = self._principal().grants.get(volume)
+        if role is None:
+            self._send_json({"error": "not found"}, status=404)
+        elif role != PERMISSION_REVIEW:
+            self._send_json({"error": "review required"}, status=403)
+        return role == PERMISSION_REVIEW
+
+    def _granted_crops(self, volume: str) -> Path | None:
+        """Crops folder of a volume the caller holds a grant on; otherwise sends 404 and returns None."""
+        try:
+            if volume in self._principal().grants:
+                return crops_dir(self._registry(), volume)
+        except (ValueError, FileNotFoundError):
+            pass
+        self._send_json({"error": "not found"}, status=404)
+        return None
 
     def _principal(self) -> Principal:
         try:

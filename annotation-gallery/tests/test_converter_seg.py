@@ -188,6 +188,11 @@ def test_polygon_with_hole_keeps_the_hole_empty_and_clicks_avoid_it() -> None:
         assert prompt.foreground_mask.pixels[y - prompt.foreground_mask.y0, x - prompt.foreground_mask.x0]
 
 
+def test_polygons_are_sent_as_a_correction_and_circles_as_a_seed() -> None:
+    assert seed.polygon_prompt([(0, 0), (100, 0), (100, 100), (0, 100), (0, 0)]).mask_role == pb.MASK_ROLE_CORRECTION
+    assert seed.circle_prompt(50, 50, 20).mask_role == pb.MASK_ROLE_SEED
+
+
 def test_interior_points_are_deepest_first() -> None:
     mask = seed.disc_mask(300, 300, 50)
     points = seed.interior_points(mask)

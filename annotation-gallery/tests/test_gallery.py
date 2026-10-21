@@ -1397,3 +1397,50 @@ def test_grants_match_database_names_regardless_of_case() -> None:
 
     assert grants_for_registry({"cped": "read"}, ["CPED"], {"CPED": "CPED"}) == {"CPED": "read"}
     assert grants_for_registry({"Cped": "read", "cped": "review"}, ["CPED"]) == {"CPED": "review"}
+
+
+_READ_ROUTES = [
+    ("GET", "/api/volumes/{v}/catalog", None),
+    ("GET", "/api/volumes/{v}/ignore-list", None),
+    ("GET", "/api/volumes/{v}/settings", None),
+    ("GET", "/api/volumes/{v}/repair-pack", None),
+]
+_REVIEW_ROUTES = [
+    ("POST", "/api/volumes/{v}/ignore", {"location_id": 42}),
+    ("POST", "/api/volumes/{v}/approve", {"location_id": 42}),
+    ("POST", "/api/volumes/{v}/review-batch", {"action": "approve", "location_ids": [42]}),
+    ("POST", "/api/volumes/{v}/ignore-list", {"locationIds": [42]}),
+    ("POST", "/api/volumes/{v}/settings", {"odata": "", "exporter": "tiled"}),
+    ("POST", "/api/volumes/{v}/refresh-location", {"location_id": 42}),
+    ("POST", "/api/volumes/{v}/import-location", {"location_id": 42}),
+]
+
+
+def _call(httpd: tuple[str, int], route: tuple, volume: str, bearer: str) -> tuple[int, dict]:
+    method, path, body = route
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    return _request(httpd, method, path.format(v=volume), body=data, bearer=bearer)
+
+
+@pytest.mark.parametrize("route", _READ_ROUTES + _REVIEW_ROUTES)
+def test_unknown_volume_is_404(httpd: tuple[str, int], route: tuple) -> None:
+    assert _call(httpd, route, "NOPE", "review") == (404, {"error": "not found"})
+
+
+@pytest.mark.parametrize("route", _REVIEW_ROUTES)
+def test_read_only_grant_on_write_routes_is_403(httpd: tuple[str, int], route: tuple) -> None:
+    assert _call(httpd, route, "RC2", "read") == (403, {"error": "review required"})
+
+
+@pytest.mark.parametrize(
+    "route",
+    _READ_ROUTES + [r for r in _REVIEW_ROUTES if not r[1].endswith("/settings")],
+)
+def test_missing_crops_dir_is_404(
+    httpd: tuple[str, int], route: tuple, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def gone(registry: Path, name: str) -> Path:
+        raise FileNotFoundError(name)
+
+    monkeypatch.setattr("server.crops_dir", gone)
+    assert _call(httpd, route, "RC2", "review") == (404, {"error": "not found"})

@@ -215,6 +215,7 @@ class SegmentationClient:
         self._channel = channel
         self._stub = pb_grpc.SegmentationServiceStub(channel)
         self._model_id = model_id
+        self._model_probed = model_id is not None
         self._idle_timeout = idle_timeout_seconds
         self._total_timeout = total_timeout_seconds
 
@@ -223,6 +224,17 @@ class SegmentationClient:
 
     def status(self) -> "pb.ServerStatusResponse":
         return self._stub.GetServerStatus(pb.ServerStatusRequest(), timeout=15)
+
+    def model_id(self) -> Optional[str]:
+        """The model id requests carry: the one given, else the one the server reports (it refuses requests without it
+        when its manifest says so). A server that cannot say leaves it unset."""
+        if self._model_id is None and not self._model_probed:
+            self._model_probed = True
+            try:
+                self._model_id = self.status().model.model_id or None
+            except grpc.RpcError as error:
+                LOGGER.warning("could not read the server's model id: %s", error)
+        return self._model_id
 
     def segment(
         self,
@@ -255,8 +267,9 @@ class SegmentationClient:
         )
         if prompt.background_points:
             start.background_feature.points.extend(pb.Point(x=int(x), y=int(y)) for x, y in prompt.background_points)
-        if self._model_id:
-            start.model_id = self._model_id
+        model_id = self.model_id()
+        if model_id and model_id != "unknown":
+            start.model_id = model_id
         # A tile holding a foreground click must be cached before `start` (else NOT_FOUND), and every tile listed in
         # start.tiles is pinned for the call. A mask-only prompt lists its first foreground tile.
         start_cells: List[Tuple[int, int]] = []

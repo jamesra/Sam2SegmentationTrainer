@@ -5,7 +5,10 @@ Everything is in mosaic pixels at the request's downsample, X right, Y up, like 
 * A circle (LocationType 1) is a disc mask plus four clicks on its rim at 0.95 r, the encoding Viking's own segmentation
   command uses for circles.
 * A polygon, curve polygon or closed curve (4, 6, 7) is the filled polygon plus clicks inside it: the point farthest from
-  the edge and one more in each of up to three well-separated deep parts.
+  the edge and one more in each of up to three well-separated deep parts. It is sent with ``MASK_ROLE_CORRECTION``: the
+  outline is an existing annotation that may be wrong, not a trusted starting shape. Checked live on the v5 server with an
+  RC1 location (1473146): as a SEED the walk leaked out of the structure (IoU with the original 0.23); as a CORRECTION it
+  followed the boundary (IoU 0.94).
 * Points and open curves are not seedable.
 """
 
@@ -110,4 +113,4 @@ def polygon_prompt(ring: Sequence[Tuple[float, float]], holes: Sequence[Sequence
     clicks = interior_points(mask)
     if not clicks:
         raise NotSeedable("polygon is empty at this downsample")
-    return Prompt(foreground_points=clicks, foreground_mask=mask, mask_role=pb.MASK_ROLE_SEED)
+    return Prompt(foreground_points=clicks, foreground_mask=mask, mask_role=pb.MASK_ROLE_CORRECTION)
