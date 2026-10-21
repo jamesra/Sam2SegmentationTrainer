@@ -8,7 +8,7 @@ vertices are multiplied by the logit scale and mapped into mosaic pixels, X righ
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional
 
 import contourpy
 import numpy as np

@@ -15,7 +15,7 @@ import logging
 import queue
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import grpc
 import numpy as np

@@ -12,7 +12,7 @@ Everything is in mosaic pixels at the request's downsample, X right, Y up, like 
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
