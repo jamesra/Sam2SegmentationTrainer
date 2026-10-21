@@ -51,17 +51,30 @@ CREATE TABLE IF NOT EXISTS locations (
 _Function = TypeVar("_Function", bound=Callable[..., Any])
 
 # Gallery handler threads share approved.json, ignore.json and held reviews. Every read and write of the first
-# two, every review mutator, and held-review saves hold this lock, so two reviewers' clicks cannot drop each
-# other's change and no reader sees a half-written file. Reentrant because mutators call each other (approve
-# restores a rejected one).
-_REVIEW_LOCK = threading.RLock()
+# two, every review mutator, and held-review saves hold the lock of the folder they work in (the volume's
+# AnnotationCrops, or the registry for held reviews), so two reviewers' clicks cannot drop each other's change
+# and no reader sees a half-written file, while a long batch review on one volume does not hold up the catalog
+# of another. Reentrant because mutators call each other (approve restores a rejected one).
+_REVIEW_LOCKS: dict[str, threading.RLock] = {}
+_REVIEW_LOCKS_GUARD = threading.Lock()
+
+
+def _review_lock(folder: str | os.PathLike[str]) -> threading.RLock:
+    """The review-list lock for *folder*; every spelling of one path gets the same lock."""
+    key = os.path.normcase(os.path.abspath(os.fspath(folder)))
+    with _REVIEW_LOCKS_GUARD:
+        lock = _REVIEW_LOCKS.get(key)
+        if lock is None:
+            lock = _REVIEW_LOCKS[key] = threading.RLock()
+        return lock
 
 
 def _review_locked(function: _Function) -> _Function:
-    """Run *function* while holding the review-list lock."""
+    """Run *function* holding the review-list lock of its first argument (``crops`` or ``registry``)."""
     @functools.wraps(function)
     def locked(*args: Any, **kwargs: Any) -> Any:
-        with _REVIEW_LOCK:
+        folder = args[0] if args else kwargs.get("crops", kwargs.get("registry"))
+        with _review_lock(folder):
             return function(*args, **kwargs)
     return locked  # type: ignore[return-value]
 
@@ -70,7 +83,8 @@ def _write_text_atomic(path: Path, text: str) -> None:
     """Write *text* to a temp file beside *path*, then rename it over *path*.
 
     Another process reading *path* (training, a second gallery) sees the old file or the new one, and a crash
-    mid-write leaves the old file in place. Callers hold the review lock, so one temp name per process is enough.
+    mid-write leaves the old file in place. Callers hold the review lock of the folder *path* is in, so one temp
+    name per process is enough.
     """
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:

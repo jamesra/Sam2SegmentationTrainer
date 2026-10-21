@@ -253,3 +253,58 @@ def test_damaged_approved_list_is_never_overwritten(keys, data):
                 mutate()
             assert catalog.approved_path(crops).read_bytes() == damaged
         assert sorted(path.name for path in crops.iterdir()) == ["approved.json"]
+
+
+def _finishes_while_held(held_folder, call, timeout: float = 2.0) -> bool:
+    """Hold *held_folder*'s review lock in another thread and report whether *call* returns within *timeout*."""
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with catalog._review_lock(held_folder):
+            holding.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(5)
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (call(), done.set()))
+    worker.start()
+    finished = done.wait(timeout)
+    release.set()
+    holder.join(5)
+    worker.join(5)
+    return finished
+
+
+def test_review_on_one_volume_does_not_block_another(tmp_path):
+    """A long batch review holds only its own volume's lock; another volume's catalog reads go on."""
+    busy, other = tmp_path / "busy", tmp_path / "other"
+    busy.mkdir()
+    other.mkdir()
+    catalog.save_approved(other, [(1, "a")])
+    assert _finishes_while_held(busy, lambda: catalog.load_approved(other))
+    assert _finishes_while_held(busy, lambda: catalog.ignore_location(other, 7))
+    assert catalog.load_ignore_ids(other) == {7}
+
+
+def test_review_on_one_volume_still_waits_for_that_volume(tmp_path):
+    assert not _finishes_while_held(tmp_path, lambda: catalog.load_approved(tmp_path), timeout=0.3)
+
+
+def test_every_spelling_of_a_folder_shares_one_lock(tmp_path):
+    spelled = tmp_path / "sub" / ".." / "crops"
+    assert catalog._review_lock(tmp_path / "crops") is catalog._review_lock(spelled)
+    assert catalog._review_lock(str(tmp_path / "crops")) is catalog._review_lock(tmp_path / "crops")
+    if sys.platform == "win32":
+        assert catalog._review_lock(str(tmp_path / "crops").upper()) is catalog._review_lock(tmp_path / "crops")
+    assert catalog._review_lock(tmp_path / "a") is not catalog._review_lock(tmp_path / "b")
+
+
+def test_keyword_folder_argument_takes_the_same_lock(tmp_path):
+    assert not _finishes_while_held(tmp_path, lambda: catalog.load_approved(crops=tmp_path), timeout=0.3)
+    assert not _finishes_while_held(
+        tmp_path, lambda: catalog.save_held_review(registry=tmp_path, volume="v", rejected_ids=[], approved_keys=[]),
+        timeout=0.3,
+    )
