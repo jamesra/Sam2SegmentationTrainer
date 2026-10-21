@@ -2,7 +2,9 @@
 
 One watermark per volume (``update_state.json`` in ``AnnotationCrops``) says how far the volume has been checked.
 The job asks OData for every location changed since it, walks those rows page by page, and moves the watermark
-only when the whole run finished without a failure.
+only when the whole run finished without a failure. A result too long for one page is read to the end by following
+each page's ``@odata.nextLink``; the request carries no ``$top``, which would cap the whole result and end the walk
+after the first page (see ``locations_url``).
 
 For each row OData returns:
 
@@ -15,6 +17,7 @@ Skipped ids are remembered and retried at the start of the next run, because the
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -145,8 +148,16 @@ def initial_watermark(crops: str | os.PathLike[str]) -> datetime:
 
 # ------------------------------------------------------------------ OData paging
 
-def http_get_json(url: str) -> dict[str, Any]:
-    request = Request(url, headers={"Accept": "application/json"})
+def http_get_json(url: str, *, max_page_size: int | None = None) -> dict[str, Any]:
+    """GET one OData document.
+
+    ``max_page_size`` is sent as ``Prefer: odata.maxpagesize``: the standard way to ask a service for pages of about
+    that many rows. The service answers with ``@odata.nextLink`` while rows remain.
+    """
+    headers = {"Accept": "application/json"}
+    if max_page_size:
+        headers["Prefer"] = f"odata.maxpagesize={int(max_page_size)}"
+    request = Request(url, headers=headers)
     with urlopen(request, timeout=120) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not isinstance(payload, dict):
@@ -154,18 +165,25 @@ def http_get_json(url: str) -> dict[str, Any]:
     return payload
 
 
-def locations_url(base: str, filter_text: str, top: int) -> str:
+def locations_url(base: str, filter_text: str) -> str:
+    """The locations matching ``filter_text`` in ID order.
+
+    There is deliberately no ``$top``. In OData ``$top`` caps the *total* rows of the answer, it is not a page size:
+    ``$top=500`` returned 500 rows and no ``@odata.nextLink`` however many locations matched, so a run only ever saw
+    the first 500 and still recorded itself as clean. Without it the service pages by itself (its own maximum, or the
+    ``Prefer`` size from :func:`http_get_json`) and every page but the last carries the link to the next.
+    """
     query = (
         f"$filter={quote(filter_text, safe='()/')}"
         f"&$orderby=ID&$select={quote(_SELECT, safe=',')}"
         f"&$expand={quote(_EXPAND, safe='();$,')}"
-        f"&$count=true&$top={int(top)}"
+        f"&$count=true"
     )
     return f"{base.rstrip('/')}/Locations?{query}"
 
 
 def iter_pages(url: str, get_json: GetJson) -> Iterator[dict[str, Any]]:
-    """Follow ``@odata.nextLink`` until a page leaves it out."""
+    """Every page of a result: follow ``@odata.nextLink`` (the continuation) until a page leaves it out."""
     next_url: str | None = url
     while next_url:
         document = get_json(next_url)
@@ -451,7 +469,11 @@ class UpdateJob:
 
     def _rows(self, url: str) -> Iterator[tuple[dict[str, Any], Iterator[dict[str, Any]]]]:
         """Yield each OData page of ``url`` with an iterator over its rows that stops once the job is cancelled."""
-        for document in iter_pages(url, self.deps.get_json):
+        get_json = self.deps.get_json
+        if get_json is http_get_json:
+            # The real getter asks for pages of this job's size; a replacement (a test's) is called as it always was.
+            get_json = functools.partial(http_get_json, max_page_size=self.page_size)
+        for document in iter_pages(url, get_json):
             yield document, takewhile(lambda _row: not self._cancel.is_set(), _entities(document))
 
     def _walk_rows(self) -> None:
@@ -537,14 +559,14 @@ class UpdateJob:
                     break
                 batch = previous_skips[start:start + RETRY_BATCH]
                 clause = " or ".join(f"ID eq {item}" for item in batch)
-                for _document, rows in self._rows(locations_url(self.odata, clause, self.page_size)):
+                for _document, rows in self._rows(locations_url(self.odata, clause)):
                     for entity in rows:
                         handle(entity, retry=True)
                     flush_page()
 
         # Everything OData changed since the watermark: one tick per page.
         self._set(phase="updating")
-        url = locations_url(self.odata, f"LastModified ge {odata_literal(before)}", self.page_size)
+        url = locations_url(self.odata, f"LastModified ge {odata_literal(before)}")
         for document, rows in self._rows(url):
             if self._cancel.is_set():
                 break
@@ -553,7 +575,9 @@ class UpdateJob:
                     total = int(document.get("@odata.count"))
                 except (TypeError, ValueError):
                     total = len(_entities(document))
-                self._set(pages=max(1, math.ceil(total / max(1, self.page_size))))
+                # The service may use its own page size, so the first page says how many rows a page holds.
+                per_page = len(_entities(document)) if document.get("@odata.nextLink") else 0
+                self._set(pages=max(1, math.ceil(total / max(1, per_page or self.page_size))))
             for entity in rows:
                 with self._lock:
                     self.entities_seen += 1

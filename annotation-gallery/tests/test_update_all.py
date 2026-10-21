@@ -51,28 +51,42 @@ def _crops(tmp_path: Path, ids: tuple[int, ...] = (1, 2)) -> Path:
 
 
 class _FakeOData:
-    """Serves the given entities in pages of `top`, with @odata.count and @odata.nextLink."""
+    """Serves the given entities like the real service: no page size is part of the query.
 
-    def __init__(self, entities: list[dict]) -> None:
+    A response holds at most `server_max` rows, or fewer when the request has ``Prefer: odata.maxpagesize`` (and
+    `honor_prefer`). ``$top`` caps the TOTAL rows of the answer, as OData defines it, and then no link is given.
+    While rows remain a response carries @odata.nextLink; @odata.count is the whole result.
+    """
+
+    def __init__(self, entities: list[dict], *, server_max: int = 16384, honor_prefer: bool = True) -> None:
         self.entities = entities
+        self.server_max = server_max
+        self.honor_prefer = honor_prefer
         self.requests: list[str] = []
+        self.prefers: list[str | None] = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 owner.requests.append(self.path)
+                prefer = self.headers.get("Prefer")
+                owner.prefers.append(prefer)
                 query = parse_qs(urlparse(self.path).query)
-                top = int(query["$top"][0])
                 skip = int(query.get("skip", ["0"])[0])
                 chosen = owner.entities
                 filter_text = query.get("$filter", [""])[0]
                 if "ID eq" in filter_text:
                     wanted = {int(part.split("eq")[1]) for part in filter_text.split(" or ")}
                     chosen = [e for e in chosen if e["ID"] in wanted]
-                page = chosen[skip:skip + top]
+                size = owner.server_max
+                if owner.honor_prefer and prefer and prefer.startswith("odata.maxpagesize="):
+                    size = min(size, int(prefer.split("=", 1)[1]))
+                if "$top" in query:
+                    chosen = chosen[:int(query["$top"][0])]
+                page = chosen[skip:skip + size]
                 body: dict = {"value": page, "@odata.count": len(chosen)}
-                if skip + top < len(chosen):
-                    body["@odata.nextLink"] = f"{self.path.split('&skip=')[0]}&skip={skip + top}"
+                if skip + size < len(chosen):
+                    body["@odata.nextLink"] = f"{self.path.split('&skip=')[0]}&skip={skip + size}"
                 raw = json.dumps(body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -182,6 +196,60 @@ def test_walk_refreshes_adds_skips_and_ticks_per_page(tmp_path: Path) -> None:
     assert state["watermark"] == "2026-03-05T00:00:00.000000Z"       # newest LastModified seen
     assert state["skipped_ids"] == [4]
     assert (crops / "update_all.log").read_text(encoding="utf-8").count("skip 4") == 1
+
+
+def _changed(count: int) -> list[dict]:
+    """`count` changed locations, IDs 1..count, each modified a day after the one before."""
+    return [_entity(i, f"2026-03-{i:02d}T00:00:00Z") for i in range(1, count + 1)]
+
+
+def test_a_result_longer_than_one_page_is_read_to_the_end_by_following_the_continuation(tmp_path: Path) -> None:
+    """Regression: the query used to carry $top=<page size>, which caps the whole answer and gives no nextLink."""
+    crops = _crops(tmp_path, ids=tuple(range(1, 8)))
+    save_state(crops, {"watermark": "2026-01-01T00:00:00.000000Z"})
+    odata = _FakeOData(_changed(7))
+    try:
+        deps, calls = _deps(odata)
+        result = _run(crops, odata, deps, page_size=3)
+    finally:
+        odata.close()
+    assert result["phase"] == "done"
+    assert calls["refresh"] == [1, 2, 3, 4, 5, 6, 7], "every row of every page was visited, once"
+    assert (result["pages"], result["page"], result["entitiesSeen"]) == (3, 3, 7)
+    assert load_state(crops)["watermark"] == "2026-03-07T00:00:00.000000Z", "the watermark covers the last page"
+    assert len(odata.requests) == 3, "one request per page, the later ones from each page's continuation link"
+    assert not any("$top" in request for request in odata.requests), "a $top would cap the total result"
+    assert odata.prefers == ["odata.maxpagesize=3"] * 3, "the job's page size is asked for as a preference"
+
+
+def test_a_service_that_ignores_the_page_size_is_still_read_to_the_end(tmp_path: Path) -> None:
+    """The service caps a response at its own maximum (16384 rows on the real one) whatever size was asked for."""
+    crops = _crops(tmp_path, ids=tuple(range(1, 6)))
+    save_state(crops, {"watermark": "2026-01-01T00:00:00.000000Z"})
+    odata = _FakeOData(_changed(5), server_max=2, honor_prefer=False)
+    try:
+        deps, calls = _deps(odata)
+        result = _run(crops, odata, deps, page_size=500)
+    finally:
+        odata.close()
+    assert result["phase"] == "done" and calls["refresh"] == [1, 2, 3, 4, 5]
+    assert result["pages"] == 3, "the page count comes from the rows a page really holds, not the size asked for"
+    assert load_state(crops)["watermark"] == "2026-03-05T00:00:00.000000Z"
+
+
+def test_the_retry_of_skipped_ids_is_read_through_the_same_continuation(tmp_path: Path) -> None:
+    crops = _crops(tmp_path, ids=())
+    skipped = list(range(1, 8))
+    save_state(crops, {"watermark": "2026-03-31T00:00:00.000000Z", "skipped_ids": skipped})
+    odata = _FakeOData(_changed(7))
+    try:
+        deps, calls = _deps(odata)
+        result = _run(crops, odata, deps, page_size=3)
+    finally:
+        odata.close()
+    assert result["phase"] == "done"
+    assert calls["add"] == skipped, "all seven skipped ids came back although a page holds three"
+    assert not any("$top" in request for request in odata.requests)
 
 
 def test_failure_keeps_the_watermark_and_skips_are_retried_next_run(tmp_path: Path) -> None:
