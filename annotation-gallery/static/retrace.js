@@ -559,7 +559,102 @@
     return false;
   }
 
+  /**
+   * Outline of the largest blob in a mask: `inside(x, y)` is true for mask pixels. Walks the pixel edges of the 4-connected
+   * largest component (so the result follows pixel corners), then drops vertices within `tolerance` of the chord. Holes
+   * are not returned. Returns a closed ring in pixel-corner coordinates, or null when the mask is empty.
+   */
+  function maskToPolygon(width, height, inside, tolerance = 1.0) {
+    const label = new Int32Array(width * height);
+    let best = { id: 0, size: 0, start: -1 };
+    let nextId = 0;
+    const stack = [];
+    for (let start = 0; start < width * height; start++) {
+      if (label[start] || !inside(start % width, Math.floor(start / width))) {
+        continue;
+      }
+      nextId += 1;
+      let size = 0;
+      label[start] = nextId;
+      stack.push(start);
+      while (stack.length) {
+        const at = stack.pop();
+        size += 1;
+        const x = at % width;
+        const y = (at - x) / width;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+            continue;
+          }
+          const n = ny * width + nx;
+          if (!label[n] && inside(nx, ny)) {
+            label[n] = nextId;
+            stack.push(n);
+          }
+        }
+      }
+      if (size > best.size) {
+        best = { id: nextId, size, start };
+      }
+    }
+    if (!best.id) {
+      return null;
+    }
+    const mine = (x, y) => x >= 0 && y >= 0 && x < width && y < height && label[y * width + x] === best.id;
+    const outgoing = new Map();
+    const add = (ax, ay, bx, by) => {
+      const key = ay * (width + 1) + ax;
+      if (!outgoing.has(key)) {
+        outgoing.set(key, []);
+      }
+      outgoing.get(key).push([bx, by]);
+    };
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (!mine(x, y)) {
+          continue;
+        }
+        if (!mine(x, y - 1)) add(x, y, x + 1, y);
+        if (!mine(x + 1, y)) add(x + 1, y, x + 1, y + 1);
+        if (!mine(x, y + 1)) add(x + 1, y + 1, x, y + 1);
+        if (!mine(x - 1, y)) add(x, y + 1, x, y);
+      }
+    }
+    // The first pixel in scan order has a free top edge: the walk starts on the outer boundary.
+    const sx = best.start % width;
+    const sy = (best.start - sx) / width;
+    const ring = [[sx, sy]];
+    let [cx, cy] = [sx + 1, sy];
+    let guard = 0;
+    while ((cx !== sx || cy !== sy) && guard++ < 4 * width * height + 8) {
+      ring.push([cx, cy]);
+      const options = outgoing.get(cy * (width + 1) + cx);
+      if (!options || !options.length) {
+        return null;
+      }
+      [cx, cy] = options.pop();
+    }
+    ring.push([sx, sy]);
+    const corners = [];
+    for (let i = 0; i < ring.length - 1; i++) {
+      const a = ring[(i + ring.length - 2) % (ring.length - 1)];
+      const b = ring[i];
+      const c = ring[i + 1];
+      if ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) !== 0) {
+        corners.push(b);
+      }
+    }
+    if (corners.length < 3) {
+      return null;
+    }
+    corners.push(corners[0]);
+    return douglasPeucker(corners, tolerance);
+  }
+
   return {
+    maskToPolygon,
     ACTION,
     EPS,
     RetraceError,

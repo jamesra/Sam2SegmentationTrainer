@@ -201,3 +201,21 @@ def test_reduce_exterior_ring_drops_collinear_vertices() -> None:
         "return R.reduceExteriorRing(p, 1.0).exterior.length;"
     )
     assert got == 5
+
+
+@needs_node
+def test_mask_outline_follows_the_largest_blob() -> None:
+    got = _run(
+        "const w = 12, h = 12;"
+        "const inside = (x, y) => (x >= 2 && x < 8 && y >= 3 && y < 9) || (x === 10 && y === 10);"
+        "const ring = R.maskToPolygon(w, h, inside);"
+        "return [ring, R.signedArea(ring)];"
+    )
+    ring, area = got
+    assert sorted(map(tuple, ring[:-1])) == [(2, 3), (2, 9), (8, 3), (8, 9)]
+    assert abs(area) == 36
+
+
+@needs_node
+def test_empty_mask_has_no_outline() -> None:
+    assert _run("return R.maskToPolygon(4, 4, () => false);") is None

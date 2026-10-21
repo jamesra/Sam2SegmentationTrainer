@@ -219,7 +219,50 @@
     // { count, base, overlap } for the open location: `base` is the tile with the negatives tinted, `overlap`
     // marks where they cover the target. Null until loaded, or when the tile has no other annotation.
     negatives: null,
+    // The open location's mask PNG, kept so the pen retrace can trace its outline.
+    mask: null,
   };
+
+  // Pen retrace (retrace.js / retrace_ui.js). It works on the whole-tile view only, never on the split parts.
+  const retraceButton = document.getElementById("viewer-retrace-btn");
+  const retraceUi = window.RetraceUI
+    ? window.RetraceUI.create({
+        frame: els.viewerFrame,
+        maskCanvas: els.viewerMask,
+        getHue: () => viewer.hue,
+        setStatus: (text) => {
+          els.status.textContent = text;
+        },
+        getMask: () => {
+          if (!viewer.mask || viewer.parts) {
+            return null;
+          }
+          const width = viewer.mask.naturalWidth || viewer.mask.width;
+          const height = viewer.mask.naturalHeight || viewer.mask.height;
+          const probe = document.createElement("canvas");
+          probe.width = width;
+          probe.height = height;
+          const context = probe.getContext("2d", { willReadFrequently: true });
+          context.drawImage(viewer.mask, 0, 0, width, height);
+          const pixels = context.getImageData(0, 0, width, height).data;
+          return { width, height, inside: (x, y) => pixels[(y * width + x) * 4] > 127 };
+        },
+      })
+    : null;
+
+  function syncRetraceButton() {
+    if (retraceButton && retraceUi) {
+      retraceButton.classList.toggle("on", retraceUi.active);
+      retraceButton.setAttribute("aria-pressed", String(retraceUi.active));
+    }
+  }
+
+  function toggleRetrace() {
+    if (retraceUi) {
+      retraceUi.toggle();
+      syncRetraceButton();
+    }
+  }
 
   function rgbToHcl(red255, green255, blue255) {
     const red = red255 / 255;
@@ -2322,6 +2365,9 @@
       maskContext.drawImage(negatives.overlap, 0, 0);
     }
     layoutViewerFrame(width, height);
+    if (retraceUi && retraceUi.polygon) {
+      retraceUi.repaint();
+    }
   }
 
   function paintViewer() {
@@ -2378,6 +2424,10 @@
   }
 
   function closeViewer() {
+    if (retraceUi) {
+      retraceUi.reset();
+      syncRetraceButton();
+    }
     viewer.token += 1;
     viewer.locationId = "";
     viewer.imageKey = "";
@@ -2403,6 +2453,11 @@
     viewer.image = null;
     viewer.overlay = null;
     viewer.negatives = null;
+    viewer.mask = null;
+    if (retraceUi) {
+      retraceUi.reset();
+      syncRetraceButton();
+    }
     for (const canvas of [els.viewerImage, els.viewerMask]) {
       canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
     }
@@ -2503,6 +2558,7 @@
       return;
     }
     viewer.image = image;
+    viewer.mask = mask;
     viewer.overlay = composeOverlay(image, mask, viewer.hue, viewer.visibility);
     viewer.parts = null;
     viewer.partIndex = null;
@@ -2674,6 +2730,15 @@
   });
 
   els.viewerClose.addEventListener("click", closeViewer);
+  if (retraceButton) {
+    retraceButton.addEventListener("click", toggleRetrace);
+  }
+  const retraceOk = document.getElementById("retrace-notice-ok");
+  if (retraceOk) {
+    retraceOk.addEventListener("click", () => {
+      document.getElementById("retrace-notice").hidden = true;
+    });
+  }
   els.viewerBack.addEventListener("click", () => {
     viewer.partIndex = null;
     paintViewer();
@@ -2742,6 +2807,16 @@
     ) {
       event.preventDefault();
       toggleNegatives();
+      return;
+    }
+    if (
+      !els.viewer.hidden
+      && (event.key === "r" || event.key === "R")
+      && !event.ctrlKey && !event.metaKey && !event.altKey
+      && !zoomKeyTarget(event)
+    ) {
+      event.preventDefault();
+      toggleRetrace();
       return;
     }
     if (!isSpaceKey(event) || zoomKeyTarget(event)) {

@@ -915,6 +915,22 @@ button.viewer-act {
   transition: opacity 80ms ease;
 }
 
+/* Pen retrace layer: above the mask, ignores the pointer until the pen is on. */
+.viewer-frame canvas.viewer-retrace {
+  pointer-events: none;
+  touch-action: none;
+}
+
+.viewer-frame canvas.viewer-retrace.active {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+button.viewer-retrace-btn.on {
+  background: var(--accent);
+  color: #fff;
+}
+
 .viewer-cues {
   position: absolute;
   inset: 0;
