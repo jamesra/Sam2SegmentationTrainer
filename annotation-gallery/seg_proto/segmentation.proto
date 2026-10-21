@@ -1,0 +1,503 @@
+syntax = "proto3";
+
+option csharp_namespace = "Viking.gRPC.SegmentationServiceTypes.V1";
+
+package segmentation;
+
+// Service for segmenting images using SAM2
+service SegmentationService {
+  // Upload an image to the server cache and receive a unique ID
+  rpc UploadImage (UploadImageRequest) returns (UploadImageResponse) {}
+  // Upload one 1024x1024 grid cell. A repeat of the same TileCoord with identical bytes
+  // refreshes the cache entry and does not re-encode.
+  rpc UploadTile (UploadTileRequest) returns (UploadTileResponse) {}
+  // Segment using uploaded grid cells. The server owns the request: it grows the mask over the
+  // cells it has, then streams TilesNeeded for the cells the mask reached that it does not have,
+  // waits for the client's TilesAnswer, and continues the same growth with them. When nothing more
+  // is needed it streams the finished SegmentationResponse and ends the call.
+  // The client sends exactly one `start`, then its foreground_mask_tile_count FOREGROUND tiles in mask_tiles
+  // messages, then one `answer` per TilesNeeded, sending BACKGROUND mask_tiles before an answer for the masks asked for.
+  //
+  // Ending: after `result` the call ends OK. A client that cancels gets no result (the call is gone).
+  // A client that leaves TilesNeeded unanswered for the server's idle limit (default 60 s) gets
+  // DEADLINE_EXCEEDED. Other statuses: INVALID_ARGUMENT for a malformed conversation or request,
+  // NOT_FOUND ("TILE_NOT_FOUND row=.. col=..") when a tile holding a foreground click is not cached,
+  // RESOURCE_EXHAUSTED also when the foreground mask is over the server's tile limit (see MaskTile),
+  // FAILED_PRECONDITION ("NO_MATCHING_MASK ...") when the starting cell yields no mask that fits the
+  // prompt, RESOURCE_EXHAUSTED when the request is over the server's size limits, UNAVAILABLE when the
+  // GPU is lost. This RPC replaced the unary SegmentTiles, which no longer exists.
+  rpc SegmentTilesStream (stream SegmentTilesStreamRequest) returns (stream SegmentTilesStreamResponse) {}
+  // Segment an image based on input coordinates (uses cached image_id or inline image_data)
+  rpc SegmentImage (SegmentationRequest) returns (SegmentationResponse) {}
+  // Auto-segmentation: each request message is one independent point set for image_id.
+  // The server writes one SegmentationResponse per set as soon as that predict() finishes.
+  // The first message must carry image_id. Later messages reuse it when image_id is 0.
+  rpc SegmentImageSets (stream SegmentImageSetRequest) returns (stream SegmentationResponse) {}
+  // Segment an image using a dictionary mapping IDs to points (id=0 for background, id!=0 for foreground)
+  rpc MultiSegmentImage (MultiSegmentationRequest) returns (SegmentationResponse) {}
+  // Delete a cached image from the server
+  rpc DeleteImage (DeleteImageRequest) returns (DeleteImageResponse) {}
+  // Return version, uptime, and a short status message for health/selection UI
+  rpc GetServerStatus (ServerStatusRequest) returns (ServerStatusResponse) {}
+}
+
+// Request to upload an image to the server cache
+message UploadImageRequest {
+  bytes image_data = 1;
+
+  // Image width
+  int32 width = 2;
+
+  // Image height
+  int32 height = 3;
+}
+
+// Response containing the cached image ID
+message UploadImageResponse {
+  uint64 image_id = 1;
+}
+
+// Stable identity of one 1024x1024 cell at a pyramid downsample.
+// This is the reusable cross-client cache key (not a sequential image_id).
+// Row and column are floor(world / (1024 * downsample)); row increases with world Y.
+message TileCoord {
+  string volume = 1;
+  int32 section = 2;
+  string channel = 3;
+  string transform = 4;
+  int32 downsample = 5;
+  int32 row = 6;
+  int32 col = 7;
+}
+
+message UploadTileRequest {
+  TileCoord coord = 1;
+  bytes image_data = 2;
+  int32 width = 3;
+  int32 height = 4;
+}
+
+message UploadTileResponse {
+  // True when this TileCoord was already encoded and the bytes were unchanged.
+  // Clients address tiles by Coord on SegmentTilesStream; no image_id is returned.
+  bool already_cached = 1;
+}
+
+// What a client wants back from a segmentation call. The values are bit flags: a request field
+// of type uint32 carries them OR-ed together (proto3 has no flags type). Zero means "not set"
+// and the server answers as it did before this field existed: MASKS | POLYGONS, upscaled.
+enum ResponseContent {
+  // Not set. Treated as RESPONSE_CONTENT_MASKS | RESPONSE_CONTENT_POLYGONS.
+  RESPONSE_CONTENT_UNSPECIFIED = 0;
+  // Fill SegmentResult.mask with a PNG of the thresholded mask.
+  RESPONSE_CONTENT_MASKS = 1;
+  // Fill SegmentResult.polygons with server-traced contours, always in full-resolution pixels.
+  RESPONSE_CONTENT_POLYGONS = 2;
+  // Fill SegmentResult.logits with the raw SAM2 logits (float16), so the client can contour at
+  // its own iso level instead of the server's hard threshold.
+  RESPONSE_CONTENT_LOGITS = 4;
+  // Modifier: the server must not upscale logits or masks. SAM2's mask decoder produces 256x256
+  // logits for a 1024x1024 window (four image pixels per sample) and normally the server upscales
+  // them bilinearly before thresholding. With this flag the server sends the native grid, and any
+  // MASKS payload has the same reduced size. SegmentResult.logits_scale is the factor from a logit
+  // sample to an image pixel (sample centre i maps to image pixel (i + 0.5) * logits_scale).
+  // The CLIENT is responsible for upscaling, after it has polygonised: contour the logits first,
+  // then multiply the vertices by logits_scale. Upscaling a mask or logits first adds no
+  // information and only smooths away the iso crossing. POLYGONS from the server stay full size.
+  RESPONSE_CONTENT_NO_UPSCALE = 8;
+}
+
+// Points are mosaic pixels at the tiles' downsample: X right, Y up (world / downsample).
+// The server refuses a request over its limits with RESOURCE_EXHAUSTED, naming the limit: by default
+// 64 tiles, 512 foreground plus background points, and 16 rectangles (see the server README).
+//
+// The prompt is the two Features and the mask tiles. Clicks are foreground_feature.points and
+// background_feature.points. Anything that is object is a FOREGROUND mask tile, never a box: a rectangle is only
+// a hint. A request needs a foreground click, a foreground rectangle or a FOREGROUND mask tile (INVALID_ARGUMENT
+// otherwise).
+message SegmentTilesRequest {
+  // The legacy prompt fields, replaced by the Features: foreground and background clicks, and SAM2 box prompts.
+  reserved 2, 3, 8;
+  reserved "foreground", "background", "foreground_boxes";
+  repeated TileCoord tiles = 1;
+  bool multimask_output = 4;
+  bool omit_labeled_image = 5;
+  // Logit above which a pixel is object. Higher values shrink the mask; lower values grow it.
+  // Optional so the server can tell an omitted field (it then uses its own default, 1.0) from an explicit 0.
+  optional float mask_threshold = 6;
+  // When true, each cell prediction is run twice: the second pass is given the first
+  // pass's low-resolution logits as SAM2's mask_input along with the same prompts.
+  bool use_mask_input = 7;
+  // Client-issued ticket, echoed in SegmentationResponse.request_id and written to the server log and
+  // debug dump so one client log line can be matched to one server result. The server does not order
+  // or cancel by it: only the client knows which of its requests is still wanted. 0 means not set.
+  uint64 request_id = 9;
+  // ResponseContent flags OR-ed together. 0 keeps the previous answer (MASKS | POLYGONS, upscaled).
+  // Only SegmentTilesStream honours it: it is the one path that fuses logits across cells.
+  uint32 response_content = 10;
+  // What the object is: the foreground clicks, rectangle hints, and the role of the FOREGROUND mask tiles.
+  optional Feature foreground_feature = 11;
+  // What the object is not: the background clicks and rectangle hints. The neighbouring annotations are
+  // BACKGROUND mask tiles, which the server asks for (TilesNeeded.masks).
+  optional Feature background_feature = 12;
+  // The model the client built these prompts for (ModelInfo.model_id from GetServerStatus). The server
+  // refuses a request whose model_id differs from the one it serves (FAILED_PRECONDITION). Unset is
+  // accepted unless the model's manifest says requires_model_id.
+  optional string model_id = 13;
+  // How many FOREGROUND MaskTiles follow `start`, in mask_tiles messages sent before anything else: one for every
+  // tile the seed or correction touches, each once. 0 when there is no foreground mask (clicks or rectangles only).
+  // The server waits for all of them before growth starts, and a count that is never reached ends the call with
+  // DEADLINE_EXCEEDED after the same idle limit as an unanswered TilesNeeded. More FOREGROUND tiles than announced
+  // is INVALID_ARGUMENT; a count over the server's limit (default 256, SEGMENTATION_MAX_MASK_TILES) is
+  // RESOURCE_EXHAUSTED, refused before any tile is read. Every request, whatever its count, is asked for BACKGROUND
+  // tiles (TilesNeeded.masks) and may send them early.
+  uint32 foreground_mask_tile_count = 14;
+}
+
+// One side of the prompt of SegmentTilesRequest: clicks and rectangle hints, plus (for the foreground) the role
+// of the FOREGROUND mask tiles. Masks themselves are MaskTiles. All coordinates are mosaic pixels at the tiles'
+// downsample, X right, Y up, like Point.
+message Feature {
+  // Was a single Mask. Masks are sent as MaskTiles.
+  reserved 3;
+  reserved "mask";
+  // SAM2 clicks: foreground clicks in the foreground Feature, background clicks in the background one.
+  repeated Point points = 1;
+  // Likelihood hints, not claims about every pixel: "most likely inside". Never taken as object; send a
+  // FOREGROUND mask tile for that. SAM2 gets one as a box for the foreground Feature (the largest that reaches a
+  // window; SAM2 takes one box per call). SAM2 has no background box, so the server passes each background
+  // rectangle as a weak negative mask_input. Ignored in the foreground when there are FOREGROUND mask tiles.
+  repeated BoundingBox rectangles = 2;
+  // What the FOREGROUND mask tiles are. Ignored for the background Feature. UNSPECIFIED is a seed.
+  MaskRole mask_role = 4;
+}
+
+// What a foreground mask is, for a model that encodes the two differently (a manifest lists the roles it
+// expects in client_contract.mask_roles).
+enum MaskRole {
+  // Not set. The server treats a foreground mask as a seed.
+  MASK_ROLE_UNSPECIFIED = 0;
+  // A trusted starting shape, such as a circle disc: the object is inside it.
+  MASK_ROLE_SEED = 1;
+  // An existing mask the user wants corrected. It may be wrong, so the model trusts it less than a seed.
+  MASK_ROLE_CORRECTION = 2;
+}
+
+// Which side of a request a MaskTile belongs to. Whether a foreground mask is a seed or a correction stays
+// Feature.mask_role.
+enum MaskKind {
+  MASK_KIND_UNSPECIFIED = 0;
+  // The object: everything set is object, and the mask is pinned in the result.
+  MASK_KIND_FOREGROUND = 1;
+  // What the object is not (the neighbouring annotations): everything set is cleared from the result.
+  MASK_KIND_BACKGROUND = 2;
+}
+
+// One tile of a mask prompt, on the same grid as the image tiles and named by the same TileCoord. A mask of any
+// size is sent as the tiles it touches, so the client never merges or coarsens it and the server reads only the
+// tiles a window covers. Mask tiles belong to one request: they
+// never enter the image cache and are not shared between streams.
+message MaskTile {
+  // The cell this tile covers. Its downsample must be the request's tiles' downsample; another one is
+  // INVALID_ARGUMENT.
+  TileCoord coord = 1;
+  MaskKind kind = 2;
+  // True when every pixel of the tile is in the mask. png is then empty.
+  bool full = 3;
+  // A 1-bit greyscale PNG, Y down like the image tile: 1024 x 1024 when scale is 0 or 1, 256 x 256 when scale
+  // is 4 (each PNG pixel stands for a 4 x 4 block, expanded by nearest neighbour; its edge is only as sharp as a
+  // block). A non-zero pixel is in the mask. A tile with nothing in it is sent with an empty png and full false,
+  // so "empty" and "not sent yet" differ. A png of the wrong size is INVALID_ARGUMENT.
+  bytes png = 4;
+  // Mosaic pixels per PNG pixel: 0 or 1 for full resolution, or 4. No other scale is accepted.
+  uint32 scale = 5;
+}
+
+// MaskTile messages of one stream message. A (coord, kind) pair may appear only once per call; a duplicate is
+// INVALID_ARGUMENT. The server holds at most a configurable number of FOREGROUND tiles per request (default
+// 256) and ends the call with RESOURCE_EXHAUSTED when more are announced or sent.
+message MaskTiles {
+  repeated MaskTile tiles = 1;
+}
+
+// Client to server on SegmentTilesStream.
+message SegmentTilesStreamRequest {
+  oneof body {
+    // Must be the first message and the only one of its kind.
+    SegmentTilesRequest start = 1;
+    // Reply to the latest TilesNeeded.
+    TilesAnswer answer = 2;
+    // Mask tiles: the FOREGROUND ones announced by SegmentTilesRequest.foreground_mask_tile_count (after `start`,
+    // before anything else), and BACKGROUND ones asked for by TilesNeeded.masks (before the answer that covers
+    // them). A client may send BACKGROUND tiles before being asked, for example the start windows' tiles; the
+    // server does not ask for those again.
+    MaskTiles mask_tiles = 3;
+  }
+}
+
+// What the client did about a TilesNeeded. Every requested tile must appear in exactly one list,
+// across one or more answers; the server waits until each has been answered.
+message TilesAnswer {
+  // Tiles that were uploaded with UploadTile and are now cached.
+  repeated TileCoord ready = 1;
+  // Tiles the client could not supply (capture failed, off the volume). Growth does not enter them.
+  repeated TileCoord unavailable = 2;
+  // BACKGROUND mask tiles the client could not supply. They are treated as having no neighbours, and growth
+  // is not blocked by them. Every tile in TilesNeeded.masks is either sent as a MaskTile or listed here.
+  repeated TileCoord masks_unavailable = 3;
+}
+
+// Server to client on SegmentTilesStream.
+message SegmentTilesStreamResponse {
+  oneof update {
+    // Upload these, then send a TilesAnswer. The server waits for it.
+    TilesNeeded needed = 1;
+    // The finished mask. The server ends the call after sending it.
+    SegmentationResponse result = 2;
+  }
+}
+
+message TilesNeeded {
+  // Image tiles to upload with UploadTile.
+  repeated TileCoord tiles = 1;
+  // Tiles whose BACKGROUND mask this request needs. The server asks for one for every tile a window it is about to predict covers, whether or not that tile's image
+  // is cached (so `tiles` may be empty here). The client answers with mask_tiles messages, empty tiles included,
+  // then the TilesAnswer. A window is predicted only when its image tiles and its BACKGROUND mask tiles are all
+  // present.
+  repeated TileCoord masks = 2;
+}
+
+// Request to delete a cached image
+message DeleteImageRequest {
+  uint64 image_id = 1;
+}
+
+// Response after deleting a cached image
+message DeleteImageResponse {
+  bool success = 1;
+}
+
+// What a model wants its input to be. The client picks the RPCs and decides what a camera move
+// invalidates from this, instead of hard-coding one model.
+enum SubmissionMode {
+  // Never sent. proto3 requires a zero value; a client rejects it.
+  SUBMISSION_MODE_UNSPECIFIED = 0;
+  // Fixed 1024x1024 cells on a grid anchored at the volume origin, sent with UploadTile and
+  // SegmentTiles. Cells are rendered without overlays and keyed by TileCoord, so they are shared
+  // across clients and a result does not depend on where the camera is.
+  SUBMISSION_MODE_FIXED_TILE_GRID = 1;
+  // The whole screen as the user sees it, sent with UploadImage and SegmentImage. The image depends
+  // on the viewport rectangle and zoom, so any view move makes an earlier result stale.
+  SUBMISSION_MODE_FULL_VIEWPORT = 2;
+}
+
+// Whether the pyramid downsample sent with FIXED_TILE_GRID can change as the user zooms.
+// Not consulted for FULL_VIEWPORT, whose scale is always the camera's.
+enum ResolutionMode {
+  // Never sent. proto3 requires a zero value; a client rejects it.
+  RESOLUTION_MODE_UNSPECIFIED = 0;
+  // One downsample (1). Every tile key is the same at every zoom.
+  RESOLUTION_MODE_SINGLE = 1;
+  // The client may submit a coarser downsample when zoomed out. Crossing a level changes every
+  // tile key, so work submitted at the old level is stale.
+  RESOLUTION_MODE_MULTI = 2;
+}
+
+// How one model wants to be fed. The server reports the one model it serves, from that model's
+// manifest (see ModelInfo); a list of named models is expected to reuse this message.
+message ModelCapabilities {
+  SubmissionMode submission_mode = 1;
+  ResolutionMode resolution_mode = 2;
+}
+
+message ServerStatusRequest {}
+
+message ServerStatusResponse {
+  string version = 1;
+  double uptime_seconds = 2;
+  string message = 3;
+  // Concurrent Upload/Segment/MultiSegment RPCs currently in flight
+  uint32 in_flight_requests = 4;
+  uint32 cached_images = 5;
+  uint64 cache_memory_bytes = 6;
+  // Exponential moving average of Upload/Segment/MultiSegment duration
+  double recent_latency_ms = 7;
+  uint32 inference_workers = 8;
+  // How the loaded model wants its input submitted. Always set.
+  ModelCapabilities capabilities = 9;
+  // Which image encoder new embeddings are made with right now: "eager" or "compiled".
+  // Starts "eager" and becomes "compiled" once the background torch.compile encoder has passed its
+  // numeric check against the eager one and been swapped in. Empty when the model does not report it.
+  string encoder_generation = 10;
+  // State of the background encoder compile: "off", "warming", "ready" or "failed".
+  string compile_status = 11;
+  // Which model this server serves, from the model's manifest (<weights stem>.model.json). Always set; a
+  // model with no manifest reports model_id "unknown" and the legacy encoding.
+  ModelInfo model = 12;
+  // Was mask_tiles, a flag for servers that accepted mask tiles. Every server does now.
+  reserved 13;
+  reserved "mask_tiles";
+}
+
+// The identity and feeding contract of the model a server serves. Everything here comes from the model's
+// manifest, which travels with the weights, so a client reads what the model's files say.
+message ModelInfo {
+  // The model's version number, v<VERSION>, such as "v4". Send it back in requests as model_id. Not the training
+  // data's number: that is training_data_set.
+  string model_id = 1;
+  // One export of that model, v<VERSION>.<EPOCH>, such as "v4.3" (the trainer's epoch index, counted from 0).
+  string model_version = 2;
+  string display_name = 3;
+  // The mask-prompt encoding the server builds mask_input with, such as "edge-confidence-v6" or
+  // "legacy-flat-v1".
+  string prompt_encoding = 4;
+  // The training data the model saw, apart from the model's own version: the data folder (such as "v3")
+  // and a short fingerprint of its manifest, approved and ignore files. "unknown" when not recorded.
+  string training_data_set = 5;
+  string training_data_fingerprint = 6;
+  // The manifest's client_contract object verbatim, as JSON: what the client must do to its masks before
+  // it sends them (circle_diameter_scale, mask_roles, background_mask, requires_model_id, ...).
+  string contract_json = 7;
+  // What the operator wrote about this model in its manifest: what changed, what to use it for. May be empty.
+  string description = 8;
+}
+
+// Request message containing the image and coordinates for single-point segmentation
+message SegmentationRequest {
+  // Fast path: ID from UploadImage. Non-zero skips set_image() and runs predict() only.
+  // Use 0 or omit to send inline image_data (re-encodes on every request).
+  uint64 image_id = 1;
+  // Image bytes used only when image_id is 0. Ignored when image_id is non-zero.
+  bytes image_data = 2;
+  int32 width = 3;
+  int32 height = 4;
+  repeated Point coordinates = 5;
+  repeated int32 labels = 6;
+  bool multimask_output = 7;
+  // When true, skip the full-frame labeled image PNG. Viking does not use it.
+  bool omit_labeled_image = 8;
+  // The model the client built this request for (ModelInfo.model_id). A different model_id is refused
+  // with FAILED_PRECONDITION. Unset is accepted unless the model's manifest says requires_model_id.
+  optional string model_id = 9;
+}
+
+// One independent auto-segmentation prompt set for a cached image.
+message SegmentImageSetRequest {
+  // Cached image from UploadImage. Required on the first message of the stream.
+  // Zero on a later message reuses the image_id from the first message.
+  uint64 image_id = 1;
+  repeated Point foreground = 2;
+  repeated Point background = 3;
+  bool multimask_output = 4;
+  // The model the client built this request for (ModelInfo.model_id). Checked on the first message of the
+  // stream; see SegmentationRequest.model_id.
+  optional string model_id = 5;
+}
+
+// Request message for segmenting with multiple labeled points (id=0 for background, id!=0 for foreground)
+message MultiSegmentationRequest {
+  // Fast path: ID from UploadImage. Non-zero skips set_image() and runs predict() only.
+  // Use 0 or omit to send inline image_data (re-encodes on every request).
+  uint64 image_id = 1;
+  // Image bytes used only when image_id is 0. Ignored when image_id is non-zero.
+  bytes image_data = 2;
+  int32 width = 3;
+  int32 height = 4;
+  // Map of label ID to foreground point (id=0 = background, id!=0 = foreground object)
+  map<int32, Point> foreground_points = 5;
+  bool multimask_output = 6;
+  // When true, skip the full-frame labeled image PNG. Viking does not use it.
+  bool omit_labeled_image = 7;
+  // The model the client built this request for (ModelInfo.model_id); see SegmentationRequest.model_id.
+  optional string model_id = 8;
+}
+
+// Point coordinates
+message Point {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+// Axis-aligned rectangle, inclusive corners, in the same pixel frame as Point (X right, Y up).
+message BoundingBox {
+  int32 x_min = 1;
+  int32 y_min = 2;
+  int32 x_max = 3;
+  int32 y_max = 4;
+}
+
+// Polygon representation as a list of points: the outer boundary of one connected piece of a mask.
+// Coordinates are integer pixel indices in the mask's own frame (X right, Y down from the top), the
+// OpenCV contour convention: point (x, y) is the centre of the pixel in column x, row y, so the traced
+// ring runs through pixel centres, half a pixel inside the true pixel edge. A client that places the
+// mask by pixel edges (as Viking does with the mask PNG) should add 0.5 to a polygon point to compare
+// the two.
+message Polygon {
+  repeated Point points = 1;
+  // Interior rings (holes) of this piece, each a closed ring in the same pixel frame as `points`.
+  // Empty for a solid piece. Added after the first release, so an older client simply never reads it.
+  // A hole is only listed when it is larger than the server's small-hole threshold (3% of the mask
+  // area); smaller holes are filled in the mask before it is traced.
+  repeated Polygon holes = 2;
+}
+
+// Response message containing the segmentation results
+message SegmentationResponse {
+  // Labeled image where each pixel value corresponds to a segment index
+  bytes labeled_image = 1;
+
+  // Width of the labeled image
+  int32 width = 2;
+
+  // Height of the labeled image
+  int32 height = 3;
+
+  // List of segment results
+  repeated SegmentResult segments = 4;
+
+  // Bottom-left of the fused mosaic in downsample pixels (Y increases upward).
+  // SegmentImage leaves these at 0; the mosaic is the uploaded viewport.
+  int32 origin_x = 5;
+  int32 origin_y = 6;
+
+  // Was requested_tiles; growth now asks for cells with TilesNeeded on SegmentTilesStream.
+  reserved 7;
+  reserved "requested_tiles";
+
+  // SegmentTilesRequest.request_id echoed back. 0 when the request carried none.
+  uint64 request_id = 8;
+}
+
+// Information about a single segment
+message SegmentResult {
+  // Index of the segment in the labeled image
+  int32 index = 1;
+
+  // Confidence score for this segment (0.0 to 1.0)
+  float score = 2;
+
+  // Binary mask for this segment (optional, may be omitted to save bandwidth)
+  bytes mask = 3;
+  // Top-left X of the mask in image coordinates
+  int32 x = 4;
+  // Top-left Y of the mask in image coordinates
+  int32 y = 5;
+
+  // List of polygons representing the contours of this segment
+  repeated Polygon polygons = 6;
+
+  // Raw SAM2 logits, little-endian float16, row-major, Y-down, logits_width x logits_height samples.
+  // Set only when RESPONSE_CONTENT_LOGITS was requested. A pixel is object where the logit is
+  // above the request's mask_threshold. Samples nobody predicted hold a large negative value.
+  bytes logits = 7;
+  int32 logits_width = 8;
+  int32 logits_height = 9;
+  // Image pixels per logit sample on both axes: 1 when the server upscaled, 4 with
+  // RESPONSE_CONTENT_NO_UPSCALE on a SAM2 window. Also the factor to apply to a reduced-size mask.
+  float logits_scale = 10;
+  // Top-left of sample (0, 0)'s footprint in the same image pixel frame as x and y. The grid is
+  // cropped to the mask's bounds plus a border of background samples, so it starts at or before
+  // (x, y); a sample (i, j) covers pixels [logits_x + i * logits_scale, ... + logits_scale).
+  int32 logits_x = 11;
+  int32 logits_y = 12;
+}
