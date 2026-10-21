@@ -63,11 +63,13 @@ from refresh import (
 from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
+from converter import web as converter_web
 from crops_path import crops_dir_for
 from thumbs import ensure_thumbnail, parse_thumb_request, start_thumbnail_watch, thumb_parts_allowed
 
 VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-FILE_PREFIXES = frozenset({"images", "masks", "ignored"})
+# "original" holds the converter's current-outline masks, drawn beside the proposal.
+FILE_PREFIXES = frozenset({"images", "masks", "ignored", "original"})
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SESSION_COOKIE = "gallery_session"
 
@@ -112,6 +114,8 @@ def list_training_sets() -> list[str]:
 
 def resolve_training_set(name: str) -> Path:
     """Return the volume-root folder for one training set. Rejects escape paths."""
+    if converter_web.SET_NAME.fullmatch(name):
+        return converter_web.resolve_structure_set(converter_web.converter_root(env_map()), name)
     if name not in list_training_sets():
         raise FileNotFoundError(name)
     registry = registry_dir()
@@ -673,7 +677,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_json({"ok": True})
             return
-        if path in {"/", "/index.html"}:
+        if path in {"/", "/index.html"} or (path in {"/converter", "/converter/"} and converter_web.converter_root(env_map())):
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
             return
         if path.startswith("/static/"):
@@ -685,6 +689,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 {
                     "identityMode": identity_mode(),
                     "vikingUrl": viking_template(),
+                    "converter": converter_web.converter_root(env_map()) is not None,
                 }
             )
             return
@@ -699,6 +704,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._clear_session(identity_logout_url())
             return
         if path == "/api/training-sets":
+            if (query.get("app") or [""])[0] == "converter":
+                sets = converter_web.list_structure_sets(converter_web.converter_root(env_map()))
+                self._send_json({"sets": sets, "default": sets[-1] if sets else ""})
+                return
             self._send_json({"sets": list_training_sets(), "default": "current"})
             return
         if path == "/api/review-lists":
@@ -728,6 +737,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/volumes/([^/]+)/ignore-list", path)
         if match:
             self._handle_ignore_export(match.group(1))
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/converter/(cards|batch)", path)
+        if match:
+            self._handle_converter_read(match.group(1), match.group(2))
             return
         match = re.fullmatch(r"/api/volumes/([^/]+)/settings", path)
         if match:
@@ -1211,6 +1224,23 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
         self._send_json(result)
+
+    def _handle_converter_read(self, volume: str, what: str) -> None:
+        """``cards``: per-card state, reason and overlap for the page. ``batch``: the approved shapes as a JSON-lines download."""
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        if what == "cards":
+            self._send_json({"cards": converter_web.card_rows(crops)})
+            return
+        body = converter_web.batch_jsonl(crops)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{self._registry().name}-{volume}-approved.jsonl"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_catalog(self, volume: str) -> None:
         crops = self._granted_crops(volume)

@@ -27,6 +27,8 @@
   const COLLAPSE_KEY = "galleryFiltersCollapsed";
   // Last training set, and the volume last opened inside each set.
   const VIEW_KEY = "galleryView";
+  // The converter page (/converter/) remembers its own view, so it never overwrites the gallery's.
+  const VIEW_STORAGE_KEY = window.ConverterMode && window.ConverterMode.onConverterPath(location.pathname) ? "converterView" : VIEW_KEY;
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
   const CACHE_MAX = 80;
 
@@ -35,6 +37,8 @@
     config: { vikingUrl: "", identityMode: "stub" },
     volume: "",
     trainingSet: "current",
+    // True on /converter/ when the server has the converter switched on (see converter.js).
+    converter: false,
     rows: [],
     permission: "read",
     hasSam2: false,
@@ -221,6 +225,8 @@
     negatives: null,
     // The open location's mask PNG, kept so the pen retrace can trace its outline.
     mask: null,
+    // Converter: the current (database) outline of the open location as an outline-only canvas, drawn over the proposal.
+    original: null,
   };
 
   // Pen retrace (retrace.js / retrace_ui.js). It works on the whole-tile view only, never on the split parts.
@@ -963,7 +969,7 @@
 
   function readView() {
     try {
-      const parsed = JSON.parse(localStorage.getItem(VIEW_KEY) || "");
+      const parsed = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) || "");
       if (!parsed || typeof parsed !== "object") {
         return { set: "", volumes: {} };
       }
@@ -987,7 +993,7 @@
     if (keepVolume && state.volume) {
       view.volumes[view.set] = state.volume;
     }
-    localStorage.setItem(VIEW_KEY, JSON.stringify(view));
+    localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view));
   }
 
   function loadCardSizePref() {
@@ -1903,6 +1909,22 @@
       return;
     }
     state.rows = payload.rows || [];
+    if (state.converter) {
+      try {
+        const cards = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/converter/cards`));
+        if (!isLatest()) {
+          return;
+        }
+        window.ConverterMode.attachCards(state.rows, cards.cards);
+      } catch {
+        // The cards are extra detail; the grid works without them.
+      }
+      const batchLink = document.getElementById("converter-batch");
+      if (batchLink) {
+        batchLink.href = window.ConverterMode.batchHref(trainingSet, volume);
+        batchLink.hidden = false;
+      }
+    }
     indexCatalog();
     if (!preserveViewer && viewer.locationId && !state.rows.some((row) => String(row.location_id) === viewer.locationId && visibleClasses().has(reviewClass(row)))) {
       closeViewer();
@@ -2171,6 +2193,9 @@
     if (row.sam2GtIou != null) {
       lines.push(`SAM2 ${Number(row.sam2GtIou).toFixed(2)}`);
     }
+    if (state.converter && row.conv) {
+      lines.push(...window.ConverterMode.infoLines(row.conv));
+    }
     if (viewer.negatives) {
       const count = viewer.negatives.count;
       lines.push(
@@ -2364,6 +2389,9 @@
     if (negatives && negatives.overlap) {
       maskContext.drawImage(negatives.overlap, 0, 0);
     }
+    if (viewer.original && image === viewer.image) {
+      maskContext.drawImage(viewer.original, 0, 0);
+    }
     layoutViewerFrame(width, height);
     if (retraceUi && retraceUi.polygon) {
       retraceUi.repaint();
@@ -2454,6 +2482,7 @@
     viewer.overlay = null;
     viewer.negatives = null;
     viewer.mask = null;
+    viewer.original = null;
     if (retraceUi) {
       retraceUi.reset();
       syncRetraceButton();
@@ -2562,6 +2591,14 @@
     viewer.overlay = composeOverlay(image, mask, viewer.hue, viewer.visibility);
     viewer.parts = null;
     viewer.partIndex = null;
+    if (state.converter && imageKey) {
+      // The annotation as it is in the database, drawn as a thin outline over the proposed mask.
+      const original = await loadOptionalImage(fileUrl(state.volume, `original/${imageKey}_${locationId}.png`));
+      if (token !== viewer.token) {
+        return;
+      }
+      viewer.original = original ? window.ConverterMode.outlineCanvas(original, "#ffe14d") : null;
+    }
     paintViewer();
     syncViewerActs();
     void loadViewerNegatives(token, image, mask);
@@ -3712,12 +3749,20 @@
     loadFiltersCollapsedPref();
     renderSortStack();
     state.config = await getJson("/api/config");
-    const setsPayload = await getJson("/api/training-sets");
+    state.converter = Boolean(window.ConverterMode && window.ConverterMode.active(location.pathname, state.config));
+    if (state.converter) {
+      window.ConverterMode.applyChrome(document);
+    }
+    const setsPayload = await getJson(state.converter ? "/api/training-sets?app=converter" : "/api/training-sets");
+    if (state.converter && !(setsPayload.sets && setsPayload.sets.length)) {
+      els.status.textContent = "No structure has been built yet.";
+      return;
+    }
     const sets = setsPayload.sets && setsPayload.sets.length ? setsPayload.sets : ["current"];
     const rememberedSet = readView().set;
     state.trainingSet = sets.includes(rememberedSet)
       ? rememberedSet
-      : (sets.includes("current") ? "current" : sets[0]);
+      : (state.converter ? setsPayload.default || sets[0] : (sets.includes("current") ? "current" : sets[0]));
     els.trainingSet.innerHTML = sets
       .map((name) => `<option value="${name}">${name}</option>`)
       .join("");

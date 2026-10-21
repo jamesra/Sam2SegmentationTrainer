@@ -16,6 +16,7 @@
     <div class="bar-end">
       <button type="button" id="filters-toggle" aria-controls="filters" aria-expanded="true" title="Hide the filter controls to make room for cards. The filters stay in effect.">Hide filters</button>
       <p id="who" class="who"></p>
+      <a id="converter-batch" class="site-link" href="#" hidden download title="Download the approved polygons as a JSON-lines batch file for the database writer">Download approved</a>
       <a id="logout" class="site-link" href="/logout" hidden title="Sign out of the gallery and Identity Server">Sign out</a>
     </div>
   </header>
@@ -229,6 +230,7 @@
       </div>
     </div>
   </div>
+  <script src="/static/converter.js"></script>
   <script src="/static/retrace.js"></script>
   <script src="/static/retrace_ui.js"></script>
   <script src="/static/app.js"></script>
