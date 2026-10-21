@@ -36,9 +36,18 @@ class RunInputs:
     num_epochs: int
     model_config: str
     pretrained: Path
+    frozen_split: str | None = None
+    """The frozen split a new run started from (``data.frozen_split``), resolved to its file; None for none."""
+    gold_set: str | None = None
+    """The gold set reported as its own validation row (``data.gold_set``), resolved to its file; None for none."""
 
     def as_json(self, *, created_utc: str) -> dict[str, Any]:
-        """JSON object written to disk. Key names stay stable."""
+        """JSON object written to disk. Key names stay stable; ``frozen_split`` and ``gold_set`` appear when set."""
+        extra: dict[str, Any] = {}
+        if self.frozen_split is not None:
+            extra["frozen_split"] = self.frozen_split
+        if self.gold_set is not None:
+            extra["gold_set"] = self.gold_set
         return {
             "run_name": self.run_name,
             "created_utc": created_utc,
@@ -59,6 +68,7 @@ class RunInputs:
             "num_epochs": self.num_epochs,
             "model_config": self.model_config,
             "pretrained_checkpoint": str(self.pretrained),
+            **extra,
         }
 
 

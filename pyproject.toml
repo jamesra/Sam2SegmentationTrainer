@@ -28,6 +28,7 @@ sam2-em-train = "sam2_segmentation_trainer.train:main"
 sam2-em-eval = "sam2_segmentation_trainer.evaluate:main"
 sam2-em-infer = "sam2_segmentation_trainer.infer:main"
 sam2-em-export-serve = "sam2_segmentation_trainer.export_serve:main"
+sam2-em-valsets = "sam2_segmentation_trainer.valsets:main"
 
 [build-system]
 requires = ["setuptools>=69"]
