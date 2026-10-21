@@ -39,6 +39,7 @@
     trainingSet: "current",
     // True on /converter/ when the server has the converter switched on (see converter.js).
     converter: false,
+    noStructures: false,
     rows: [],
     permission: "read",
     hasSam2: false,
@@ -3540,9 +3541,12 @@
     if (status.skipped > (status.skipLines || []).length) {
       lines.push(`... ${status.skipped} skipped in all; the full list is in update_all.log`);
     }
+    if (status.set && running && !cancelling && status.headline) {
+      headline = status.headline;
+    }
     const max = Math.max(1, Number(status.pages) || 1);
     return {
-      title: running ? `Updating ${volume}` : `Update ${volume}`,
+      title: status.set ? (running ? `Building ${volume}` : `Build ${volume}`) : (running ? `Updating ${volume}` : `Update ${volume}`),
       line: parts.filter(Boolean).join(" · "),
       tone: running ? "running" : ({ done: "ok", cancelled: "warn" }[phase] || "bad"),
       indeterminate: running && !status.pages,
@@ -3694,6 +3698,68 @@
     updateUi.timer = window.setTimeout(pollUpdate, 500);
   }
 
+  // Converter: build a structure. The server makes the set, starts the job, and the strip follows it like Update all.
+  const buildUi = {
+    dialog: document.getElementById("build-dialog"),
+    structure: document.getElementById("build-structure"),
+    types: document.getElementById("build-types"),
+    zMin: document.getElementById("build-zmin"),
+    zMax: document.getElementById("build-zmax"),
+    start: document.getElementById("build-start"),
+  };
+
+  async function startBuild() {
+    const structureId = Number(buildUi.structure.value);
+    if (!Number.isInteger(structureId) || structureId <= 0) {
+      els.status.textContent = "Enter the structure ID to build.";
+      return;
+    }
+    const body = {
+      structureId,
+      volume: state.noStructures ? els.volume.value : state.volume,
+      typeCodes: [...buildUi.types.querySelectorAll("input:checked")].map((box) => Number(box.value)),
+      zMin: buildUi.zMin.value,
+      zMax: buildUi.zMax.value,
+    };
+    buildUi.start.disabled = true;
+    try {
+      const started = await getJson("/api/converter/structures", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      buildUi.dialog.hidden = true;
+      const setsPayload = await getJson("/api/training-sets?app=converter");
+      els.trainingSet.innerHTML = (setsPayload.sets || []).map((name) => `<option value="${name}">${name}</option>`).join("");
+      state.trainingSet = started.set;
+      els.trainingSet.value = started.set;
+      state.noStructures = false;
+      rememberView(true);
+      await loadVolumes();
+      updateUi.wasRunning = true;
+      paintUpdate(started);
+      updateUi.timer = window.setTimeout(pollUpdate, 500);
+    } catch (error) {
+      els.status.textContent = error.message;
+    } finally {
+      buildUi.start.disabled = false;
+    }
+  }
+
+  const buildButton = document.getElementById("converter-build");
+  if (buildButton) {
+    buildButton.addEventListener("click", () => {
+      buildUi.dialog.hidden = false;
+      buildUi.structure.focus();
+    });
+    buildUi.start.addEventListener("click", () => {
+      startBuild();
+    });
+    document.getElementById("build-cancel").addEventListener("click", () => {
+      buildUi.dialog.hidden = true;
+    });
+  }
+
   document.getElementById("update-all").addEventListener("click", () => {
     openUpdateAll().catch((error) => {
       els.status.textContent = error.message;
@@ -3752,10 +3818,25 @@
     state.converter = Boolean(window.ConverterMode && window.ConverterMode.active(location.pathname, state.config));
     if (state.converter) {
       window.ConverterMode.applyChrome(document);
+      document.getElementById("converter-build").hidden = false;
     }
     const setsPayload = await getJson(state.converter ? "/api/training-sets?app=converter" : "/api/training-sets");
     if (state.converter && !(setsPayload.sets && setsPayload.sets.length)) {
-      els.status.textContent = "No structure has been built yet.";
+      // Nothing built yet: offer the volumes the user can review, so the first structure can be built. The volume list
+      // must not load the gallery's own data, so changes are swallowed until a structure exists.
+      state.noStructures = true;
+      const me = await getJson("/api/me");
+      els.who.textContent = me.displayName || "";
+      const volumes = (me.volumes || []).filter((item) => item.permission === "review");
+      els.volume.innerHTML = volumes.map((item) => `<option value="${item.name}">${item.name}</option>`).join("");
+      els.volume.addEventListener("change", (event) => {
+        if (state.noStructures) {
+          event.stopImmediatePropagation();
+        }
+      }, true);
+      els.status.textContent = volumes.length
+        ? "No structure has been built yet. Choose a volume and press Build structure."
+        : "No structure has been built yet, and you hold no review right on a volume to build one.";
       return;
     }
     const sets = setsPayload.sets && setsPayload.sets.length ? setsPayload.sets : ["current"];

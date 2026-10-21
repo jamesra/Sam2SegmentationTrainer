@@ -63,7 +63,9 @@ from refresh import (
 from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
+from converter import jobs as converter_jobs
 from converter import web as converter_web
+from converter.builder import BuildParams
 from crops_path import crops_dir_for
 from thumbs import ensure_thumbnail, parse_thumb_request, start_thumbnail_watch, thumb_parts_allowed
 
@@ -790,6 +792,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if path == "/api/review-lists":
             self._handle_training_review_import()
             return
+        if path == "/api/converter/structures":
+            self._handle_converter_create()
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/viking-link", path)
         if match:
             self._handle_viking_link(match.group(1))
@@ -871,6 +876,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (ValueError, FileNotFoundError):
             self._send_json({"error": "not found"}, status=404)
             return
+        set_name = self._registry().name
+        if converter_web.SET_NAME.fullmatch(set_name):
+            self._handle_converter_job(volume, action, crops, set_name, int(converter_web.SET_NAME.fullmatch(set_name).group(1)))
+            return
         job = update_all.current_job(volume)
         if action == "status":
             payload = update_all.idle_status(crops)
@@ -892,6 +901,73 @@ class GalleryHandler(BaseHTTPRequestHandler):
         url = odata_endpoint(volume, source).strip()
         started_job, _new = update_all.start_job(volume, crops, url, str(source.get("exporter") or "tiled"))
         self._send_json({**update_all.idle_status(crops), **started_job.snapshot()})
+
+    def _build_params(self, volume: str, structure_id: int, body: dict[str, Any]) -> BuildParams:
+        def numbers(key: str) -> tuple[int, ...]:
+            return tuple(int(item) for item in body.get(key) or [])
+
+        def optional_int(key: str) -> int | None:
+            return None if body.get(key) in (None, "") else int(body[key])
+
+        return BuildParams(
+            volume=volume,
+            odata_base=odata_base(volume),
+            structure_id=structure_id,
+            type_codes=numbers("typeCodes") or (1, 4, 6, 7),
+            z_min=optional_int("zMin"),
+            z_max=optional_int("zMax"),
+            channel=(body.get("channel") or None),
+            filter_name=(body.get("filter") or None),
+            retry_failed=bool(body.get("retryFailed", True)),
+        )
+
+    def _handle_converter_job(self, volume: str, action: str, crops: Path, set_name: str, structure_id: int) -> None:
+        """Status, start (build or continue) and cancel of a structure's build, in Update All's status shape."""
+        job = converter_jobs.current_job(set_name, volume)
+        if action == "status":
+            self._send_json(job.snapshot() if job is not None else converter_jobs.idle_status(set_name, volume))
+            return
+        if action == "cancel":
+            if job is not None and job.running:
+                job.cancel()
+            self._send_json({"ok": True, "running": bool(job and job.running)})
+            return
+        try:
+            body = self._read_json()
+            params = self._build_params(volume, structure_id, body if isinstance(body, dict) else {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "invalid build settings"}, status=400)
+            return
+        started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
+        self._send_json(started.snapshot())
+
+    def _handle_converter_create(self) -> None:
+        """POST {structureId, volume, typeCodes?, zMin?, zMax?, channel?, filter?}: make the structure's set and start building."""
+        root = converter_web.converter_root(env_map())
+        if root is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            body = self._read_json()
+            structure_id = int(body["structureId"])
+            volume = str(body["volume"])
+            if structure_id <= 0 or not VOLUME_NAME.fullmatch(volume):
+                raise ValueError("bad id")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "structureId and volume required"}, status=400)
+            return
+        if not self._review_granted(volume):
+            return
+        set_name = converter_web.structure_set_name(structure_id)
+        crops = root / set_name / volume
+        try:
+            params = self._build_params(volume, structure_id, body)
+        except (TypeError, ValueError):
+            self._send_json({"error": "invalid build settings"}, status=400)
+            return
+        converter_jobs.write_source(crops, params.odata_base, structure_id)
+        started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
+        self._send_json({**started.snapshot(), "set": set_name}, status=202)
 
     def _handle_review_batch(self, volume: str) -> None:
         """Approve or reject a list of whole locations: body ``{"action": "approve"|"ignore", "location_ids": [...]}``."""

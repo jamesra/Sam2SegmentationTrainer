@@ -137,6 +137,11 @@
     if (select) {
       select.title = "A structure whose annotations were converted. Each card shows the proposed polygon; the thin line is the current outline.";
     }
+    const update = doc.getElementById("update-all");
+    if (update) {
+      update.textContent = "Continue build";
+      update.title = "Build the cards of this structure that are missing, and retry the failed ones. Cards already built are kept.";
+    }
     doc.body.classList.add("converter");
   }
 

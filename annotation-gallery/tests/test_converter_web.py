@@ -197,3 +197,139 @@ def test_structure_set_helpers(converter_root: Path, built: Path) -> None:
     with pytest.raises(FileNotFoundError):
         web.resolve_structure_set(None, SET)
     assert web.list_structure_sets(None) == []
+
+
+# ---- build jobs over HTTP ----------------------------------------------------------------------------------------
+
+import time  # noqa: E402
+
+from converter import jobs  # noqa: E402
+
+
+@pytest.fixture
+def job_env(tmp_path: Path, converter_root: Path, monkeypatch: pytest.MonkeyPatch):
+    """A gallery with volume RC1 granted, and build jobs wired to the synthetic tileset and a stand-in segmenter."""
+    (tmp_path / "gallery-volumes" / "RC1").mkdir(parents=True)
+    entities = [
+        fixtures._entity(11, 1, "POINT (1400 1600)", radius=80),
+        fixtures._entity(12, 1, "POINT (1700 1900)", radius=80),
+    ]
+    truth = {11: fixtures._disc(1400, 1600, 80), 12: fixtures._disc(1700, 1900, 80)}
+    volume = fixtures.parse_viking_xml(fixtures.VIKING_XML, source="x")
+
+    def get_json(url: str):
+        return {"@odata.count": 2, "value": entities}
+
+    jobs._JOBS.clear()
+    jobs.OVERRIDES.update(
+        make_client=lambda: fixtures.FakeSegmenter(lambda location_id: truth[location_id], size=256),
+        make_volume=lambda name: volume,
+        make_cache=lambda: fixtures.TileCache(None, fixtures.tile_http),
+        get_json=get_json,
+    )
+    yield
+    jobs.OVERRIDES.clear()
+    jobs._JOBS.clear()
+
+
+def wait_until_done(httpd, set_name: str = SET, seconds: float = 20.0) -> Dict[str, Any]:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        status, payload = get_json(httpd, f"/api/volumes/RC1/update-all?set={set_name}")
+        assert status == 200
+        if not payload["running"]:
+            return payload
+        time.sleep(0.05)
+    raise AssertionError("the build did not finish")
+
+
+@pytest.fixture
+def clean_httpd(converter_root: Path, job_env):
+    server = make_server("127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address[:2]
+    try:
+        yield str(host), int(port)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_creating_a_structure_builds_it_and_reports_in_update_alls_shape(clean_httpd) -> None:
+    status, raw, _ = request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 500, "volume": "RC1"})
+    payload = json.loads(raw)
+    assert status == 202 and payload["set"] == SET
+
+    done = wait_until_done(clean_httpd)
+    assert done["phase"] == "done" and done["refreshed"] == 2 and done["failed"] == 0 and done["pages"] == 2
+    assert done["headline"] == "Finished"
+    assert get_json(clean_httpd, "/api/training-sets?app=converter")[1]["sets"] == [SET]
+    rows = get_json(clean_httpd, f"/api/volumes/RC1/catalog?set={SET}")[1]["rows"]
+    assert sorted(row["location_id"] for row in rows) == [11, 12]
+
+
+def test_continuing_skips_built_cards(clean_httpd) -> None:
+    request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 500, "volume": "RC1"})
+    wait_until_done(clean_httpd)
+
+    status, raw, _ = request(clean_httpd, "POST", f"/api/volumes/RC1/update-all?set={SET}", {})
+    assert status == 200
+    done = wait_until_done(clean_httpd)
+    assert done["refreshed"] == 0 and done["skipped"] == 2
+
+
+def test_idle_status_of_a_structure_without_a_job(clean_httpd, converter_root: Path) -> None:
+    (converter_root / "structure-9" / "RC1").mkdir(parents=True)
+    status, payload = get_json(clean_httpd, "/api/volumes/RC1/update-all?set=structure-9")
+    assert status == 200 and payload["phase"] == "idle" and payload["running"] is False
+
+
+def test_creating_needs_review_rights_and_valid_input(clean_httpd, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert request(clean_httpd, "POST", "/api/converter/structures", {"structureId": "x", "volume": "RC1"})[0] == 400
+    assert request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 5, "volume": "../x"})[0] == 400
+    assert request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 5, "volume": "NOPE"})[0] == 404
+    monkeypatch.setenv("GALLERY_STUB_ROLE", "read")
+    assert request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 5, "volume": "RC1"})[0] == 403
+
+
+def test_an_unconfigured_server_reports_what_is_missing(tmp_path: Path, converter_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "gallery-volumes" / "RC1").mkdir(parents=True)
+    jobs._JOBS.clear()
+    jobs.OVERRIDES.clear()
+    monkeypatch.delenv("GALLERY_SEGMENTATION_TARGET", raising=False)
+    server = make_server("127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address[:2]
+    try:
+        address = (str(host), int(port))
+        request(address, "POST", "/api/converter/structures", {"structureId": 500, "volume": "RC1"})
+        done = wait_until_done(address)
+        assert done["phase"] == "failed" and "GALLERY_SEGMENTATION_TARGET" in done["errors"][0]
+    finally:
+        server.shutdown()
+        server.server_close()
+        jobs._JOBS.clear()
+
+
+def test_cancel_stops_a_running_build(clean_httpd) -> None:
+    gate = threading.Event()
+    original = jobs.OVERRIDES["make_client"]
+
+    def slow_client():
+        client = original()
+        inner = client.segment_with_retry
+
+        def slow(*args, **kwargs):
+            gate.wait(5)
+            return inner(*args, **kwargs)
+
+        client.segment_with_retry = slow
+        return client
+
+    jobs.OVERRIDES["make_client"] = slow_client
+    request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 500, "volume": "RC1"})
+    time.sleep(0.2)
+    assert request(clean_httpd, "POST", f"/api/volumes/RC1/update-all/cancel?set={SET}", {})[0] == 200
+    gate.set()
+    done = wait_until_done(clean_httpd)
+    assert done["phase"] == "cancelled" and done["refreshed"] == 1
