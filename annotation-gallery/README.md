@@ -82,3 +82,26 @@ viewer, approve and reject are the gallery's own.
 What the approved batch holds (`type_code` 6, plain `POLYGON` control points in mosaic pixels, the source shape's hash, the
 model and the overlap with the old outline) is for a later database writer; none exists yet. Neighbouring annotations are
 not yet sent to the segmentation server as background masks.
+
+## Gold standard review (`/gold/`)
+
+A third mode of the same server for building an evaluation set: for each volume, a seeded random sample of locations (100 by
+default) whose masks a person touches up and approves. Off unless `GALLERY_GOLD_ROOT` is set. It never changes the training set
+or the database: the sampled cards are copied into `<GALLERY_GOLD_ROOT>/gold-<name>/<volume>/` (an ordinary crops folder plus
+`source_masks/`, the masks as drawn, never edited) and `gold.json` records the seed, stratification and source so the draw can
+be audited and re-created.
+
+* **Draw sample**: name, the training set to draw from, locations per volume, optional seed (recorded if left blank) and an
+  optional spread over structure types or section ranges. A location that spans several crop windows (about half of RC1)
+  contributes one window, chosen by the seed among those holding a substantial part of its mask, so large cells are not
+  left out.
+* **Open list**: a `.txt` of location ids (one per line or comma-separated, `#` comments) that extends or replaces a volume's
+  cards. Ids that cannot be used are reported with the reason.
+* **Touch up**: pen retrace (`R`) or the brush and eraser (`B`, hold Shift to erase, Ctrl+Z to undo a stroke, Save mask).
+  Edits are exact to the pixel (a pixel is inside when its centre is).
+* **Approve** pins the mask's SHA-1 with who and when. Editing an approved card withdraws the approval. Rejecting a card
+  leaves it out; **Draw replacement** adds the next location of the seeded order, so replacements are reproducible too.
+* **Download gold**: a zip of the approved masks and images with `manifest.json` (ids, hashes, edited or not, approver, seed,
+  source set) and a list of any approved card whose mask no longer matches its approval.
+
+Setting: `GALLERY_GOLD_ROOT`, the folder gold sets are kept in.

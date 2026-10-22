@@ -926,6 +926,41 @@ button.viewer-act {
   cursor: crosshair;
 }
 
+/* Brush layer, like the retrace layer: above the mask, inert until the brush is on. */
+.viewer-frame canvas.viewer-brush {
+  pointer-events: none;
+  touch-action: none;
+}
+
+.viewer-frame canvas.viewer-brush.active {
+  pointer-events: auto;
+  cursor: none;
+}
+
+.brush-bar {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  z-index: 6;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 6px 12px;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.brush-bar[hidden] { display: none; }
+
+button.viewer-brush-btn.on,
+button.viewer-retrace-btn.on {
+  background: var(--accent);
+  color: #fff;
+}
+
 button.viewer-retrace-btn.on {
   background: var(--accent);
   color: #fff;

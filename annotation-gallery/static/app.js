@@ -235,6 +235,22 @@
     original: null,
   };
 
+  // The open card's mask as pixels: { width, height, inside(x, y) }, or null (no mask, or the split-parts view).
+  function currentMask() {
+    if (!viewer.mask || viewer.parts) {
+      return null;
+    }
+    const width = viewer.mask.naturalWidth || viewer.mask.width;
+    const height = viewer.mask.naturalHeight || viewer.mask.height;
+    const probe = document.createElement("canvas");
+    probe.width = width;
+    probe.height = height;
+    const context = probe.getContext("2d", { willReadFrequently: true });
+    context.drawImage(viewer.mask, 0, 0, width, height);
+    const pixels = context.getImageData(0, 0, width, height).data;
+    return { width, height, inside: (x, y) => pixels[(y * width + x) * 4] > 127 };
+  }
+
   // Pen retrace (retrace.js / retrace_ui.js). It works on the whole-tile view only, never on the split parts.
   const retraceButton = document.getElementById("viewer-retrace-btn");
   const retraceUi = window.RetraceUI
@@ -253,25 +269,21 @@
         setStatus: (text) => {
           els.status.textContent = text;
         },
-        getMask: () => {
-          if (!viewer.mask || viewer.parts) {
-            return null;
-          }
-          const width = viewer.mask.naturalWidth || viewer.mask.width;
-          const height = viewer.mask.naturalHeight || viewer.mask.height;
-          const probe = document.createElement("canvas");
-          probe.width = width;
-          probe.height = height;
-          const context = probe.getContext("2d", { willReadFrequently: true });
-          context.drawImage(viewer.mask, 0, 0, width, height);
-          const pixels = context.getImageData(0, 0, width, height).data;
-          return { width, height, inside: (x, y) => pixels[(y * width + x) * 4] > 127 };
-        },
+        getMask: () => currentMask(),
       })
     : null;
 
   // Converter: the retraced outline replaces the card's proposal (and so the batch); the database is not written.
-  async function saveRetrace(polygon) {
+  function saveRetrace(polygon) {
+    return saveEdit({ rings: [polygon.exterior, ...polygon.holes] }, "Retrace");
+  }
+
+  // Gold: the painted mask replaces the card's mask.
+  function saveBrush(dataUrl) {
+    return saveEdit({ png: dataUrl }, "Painted mask");
+  }
+
+  async function saveEdit(payload, label) {
     const locationId = viewer.locationId;
     const imageKey = viewer.imageKey;
     const volume = state.volume;
@@ -279,11 +291,7 @@
     const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/${editPath}`), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        location_id: Number(locationId),
-        image_key: imageKey,
-        rings: [polygon.exterior, ...polygon.holes],
-      }),
+      body: JSON.stringify({ location_id: Number(locationId), image_key: imageKey, ...payload }),
     });
     const row = viewerRow();
     if (row && state.gold) {
@@ -304,6 +312,9 @@
       return;
     }
     retraceUi.reset();
+    if (brushUi) {
+      brushUi.reset();
+    }
     syncRetraceButton();
     viewer.mask = mask;
     viewer.overlay = composeOverlay(viewer.image, mask, viewer.hue, viewer.visibility);
@@ -312,8 +323,44 @@
     paintViewer();
     placeViewerInfo();
     els.status.textContent = state.gold
-      ? `Retrace saved to the gold card (${result.changed_pixels} px differ from the source mask).${result.unapproved ? " Its approval was withdrawn: approve it again." : ""}`
-      : `Retrace saved to the converter batch (${Math.round(Number(result.iou) * 100)}% overlap with the current outline). The database is not changed.`;
+      ? `${label} saved to the gold card (${result.changed_pixels} px differ from the source mask).${result.unapproved ? " Its approval was withdrawn: approve it again." : ""}`
+      : `${label} saved to the converter batch (${Math.round(Number(result.iou) * 100)}% overlap with the current outline). The database is not changed.`;
+    if (state.gold) {
+      refreshGold(volume, state.trainingSet, () => true).catch(() => {});
+    }
+  }
+
+  const brushButton = document.getElementById("viewer-brush-btn");
+  const brushUi = window.BrushUI && document.getElementById("brush-bar")
+    ? window.BrushUI.create({
+        frame: els.viewerFrame,
+        maskCanvas: els.viewerMask,
+        getHue: () => viewer.hue,
+        setStatus: (text) => {
+          els.status.textContent = text;
+        },
+        getMask: () => currentMask(),
+        onSave: (dataUrl) => saveBrush(dataUrl),
+      })
+    : null;
+
+  function syncBrushButton() {
+    if (brushButton && brushUi) {
+      brushButton.classList.toggle("on", brushUi.active);
+      brushButton.setAttribute("aria-pressed", String(brushUi.active));
+    }
+  }
+
+  function toggleBrush() {
+    if (!brushUi || !state.gold) {
+      return;
+    }
+    if (!brushUi.active && retraceUi && retraceUi.active) {
+      retraceUi.setActive(false);
+      syncRetraceButton();
+    }
+    brushUi.toggle();
+    syncBrushButton();
   }
 
   // Gold: card facts, progress, the export link and whether rejected cards need a replacement.
@@ -475,6 +522,10 @@
 
   function toggleRetrace() {
     if (retraceUi) {
+      if (!retraceUi.active && brushUi && brushUi.active) {
+        brushUi.setActive(false);
+        syncBrushButton();
+      }
       retraceUi.toggle();
       syncRetraceButton();
     }
@@ -2671,6 +2722,13 @@
   }
 
   function closeViewer() {
+    if (brushUi && brushUi.dirty && !window.confirm("Discard the unsaved painting on this mask?")) {
+      return;
+    }
+    if (brushUi) {
+      brushUi.reset();
+      syncBrushButton();
+    }
     if (retraceUi) {
       retraceUi.reset();
       syncRetraceButton();
@@ -2702,6 +2760,10 @@
     viewer.negatives = null;
     viewer.mask = null;
     viewer.original = null;
+    if (brushUi) {
+      brushUi.reset();
+      syncBrushButton();
+    }
     if (retraceUi) {
       retraceUi.reset();
       syncRetraceButton();
@@ -2989,6 +3051,9 @@
   if (retraceButton) {
     retraceButton.addEventListener("click", toggleRetrace);
   }
+  if (brushButton) {
+    brushButton.addEventListener("click", toggleBrush);
+  }
   const retraceOk = document.getElementById("retrace-notice-ok");
   if (retraceOk) {
     retraceOk.addEventListener("click", () => {
@@ -3073,6 +3138,16 @@
     ) {
       event.preventDefault();
       toggleRetrace();
+      return;
+    }
+    if (
+      !els.viewer.hidden
+      && (event.key === "b" || event.key === "B")
+      && !event.ctrlKey && !event.metaKey && !event.altKey
+      && !zoomKeyTarget(event)
+    ) {
+      event.preventDefault();
+      toggleBrush();
       return;
     }
     if (!isSpaceKey(event) || zoomKeyTarget(event)) {
@@ -4043,6 +4118,9 @@
       window.GoldMode.applyChrome(document);
       document.getElementById("gold-draw").hidden = false;
       document.getElementById("gold-list").hidden = false;
+      if (brushButton) {
+        brushButton.hidden = false;
+      }
     }
     const setsPayload = await getJson(
       state.converter ? "/api/training-sets?app=converter" : (state.gold ? "/api/training-sets?app=gold" : "/api/training-sets"),
