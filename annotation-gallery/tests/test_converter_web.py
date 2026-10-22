@@ -397,3 +397,54 @@ def test_the_vikingxml_template_accepts_both_volume_placeholders(monkeypatch: py
     assert seen == ["http://h/RC2/V.xml", "http://h/RC2/V.xml"]
     with pytest.raises(jobs.ConverterNotConfigured):
         jobs.default_volume("RC2", {})
+
+
+# ---- the build picker and the volume preview ---------------------------------------------------------------------
+
+def call_json(httpd, path: str, body=None):
+    status, raw, _ = request(httpd, "POST" if body is not None else "GET", path, body)
+    return status, (json.loads(raw) if raw else None)
+
+
+def test_builds_lists_each_structure_and_volume_with_counts(httpd, built: Path) -> None:
+    key = f"{fixtures.VOLUME}_7_D1_L11"
+    request(httpd, "POST", f"/api/volumes/RC1/approve?set={SET}", {"location_id": 11, "image_key": key})
+    request(httpd, "POST", f"/api/volumes/RC1/ignore?set={SET}", {"location_id": 12, "image_key": f"{fixtures.VOLUME}_7_D1_L12"})
+    status, payload = call_json(httpd, "/api/converter/builds")
+    assert status == 200 and len(payload["builds"]) == 1
+    build = payload["builds"][0]
+    assert (build["set"], build["volume"], build["structureId"]) == (SET, "RC1", 500)
+    assert (build["built"], build["failed"], build["approved"], build["rejected"], build["running"]) == (2, 1, 1, 1, False)
+    assert build["updated"]
+
+
+def test_preview_says_which_volume_has_the_structure(clean_httpd, tmp_path: Path) -> None:
+    (tmp_path / "gallery-volumes" / "RC2").mkdir(parents=True)
+
+    def counts(url: str):
+        # RC1's endpoint knows structure 500, RC2's does not.
+        return {"@odata.count": 7 if "/RC1/" in url else 0, "value": []}
+
+    jobs.OVERRIDES["get_json"] = counts
+    status, payload = call_json(clean_httpd, "/api/converter/preview", {"structureId": 500})
+    assert status == 200 and payload["volumes"] == {"RC1": {"count": 7}, "RC2": {"count": 0}}
+
+
+def test_preview_reports_an_unreachable_volume_without_hiding_the_others(clean_httpd, tmp_path: Path) -> None:
+    (tmp_path / "gallery-volumes" / "RC2").mkdir(parents=True)
+
+    def flaky(url: str):
+        if "/RC2/" in url:
+            raise OSError("connection refused")
+        return {"@odata.count": 3, "value": []}
+
+    jobs.OVERRIDES["get_json"] = flaky
+    payload = call_json(clean_httpd, "/api/converter/preview", {"structureId": 9})[1]
+    assert payload["volumes"]["RC1"] == {"count": 3} and "connection refused" in payload["volumes"]["RC2"]["error"]
+
+
+def test_preview_needs_an_id_and_review_rights(clean_httpd, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert call_json(clean_httpd, "/api/converter/preview", {})[0] == 400
+    assert call_json(clean_httpd, "/api/converter/preview", {"structureId": 0})[0] == 400
+    monkeypatch.setenv("GALLERY_STUB_ROLE", "read")
+    assert call_json(clean_httpd, "/api/converter/preview", {"structureId": 5})[1]["volumes"] == {}

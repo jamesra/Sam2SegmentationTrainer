@@ -8,6 +8,7 @@ holding one crops folder per volume (``RC1/`` and so on, the same layout the gal
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -212,3 +213,20 @@ def apply_edit(crops: Path, location_id: int, image_key: str, rings: Any) -> Dic
         connection.close()
     drop_stale_thumbnails(crops, [image_key])
     return {"ok": True, "location_id": location_id, "iou": ratio, "candidate_wkt": wkt}
+
+
+def build_summary(crops: Path) -> Dict[str, Any]:
+    """Counts for the build picker: cards built and failed, and how many of the built ones are approved or rejected."""
+    rows = card_rows(crops)
+    built = [row for row in rows if row["state"] == "built"]
+    approved = catalog.load_approved(crops)
+    rejected = {int(row["location_id"]) for row in catalog.list_catalog_rows(crops) if row.get("ignored")}
+    built_ids = {int(row["location_id"]) for row in built}
+    stamps = [row["built_at"] for row in rows if row.get("built_at")]
+    return {
+        "built": len(built),
+        "failed": len(rows) - len(built),
+        "approved": len({location for location, _ in approved if location in built_ids}),
+        "rejected": len(rejected & built_ids),
+        "updated": max(stamps) if stamps else None,
+    }

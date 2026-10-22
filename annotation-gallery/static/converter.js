@@ -118,6 +118,82 @@
     return lines;
   }
 
+  /** Words for a build's failure reason, which the server records as "code: detail". */
+  function humanReason(reason) {
+    const text = String(reason || "");
+    const code = text.split(":", 1)[0].trim();
+    const detail = text.includes(":") ? text.slice(text.indexOf(":") + 1).trim() : "";
+    const known = {
+      too_large: "Too big to fit one card at any zoom level",
+      no_object: "The segmentation server found no object here",
+      empty_seed: "There was nothing to start the segmentation from",
+      tile_unavailable: "A tile image was not available",
+      RESOURCE_EXHAUSTED: "Beyond the segmentation server's size limits",
+      UNAVAILABLE: "The segmentation server was not available",
+      DEADLINE_EXCEEDED: "The segmentation server took too long",
+      NOT_FOUND: "The segmentation server did not have a tile it needed",
+      FAILED_PRECONDITION: "The segmentation server could not use this request",
+      INVALID_ARGUMENT: "The segmentation server rejected the request",
+    };
+    if (known[code]) {
+      return known[code];
+    }
+    if (code === "error") {
+      return `Unexpected error: ${detail}`;
+    }
+    return text.replace(/^failed:\s*/, "") || "Unknown reason";
+  }
+
+  /** "RC2 · structure 1968 — 29 of 42 to review" for the build picker. */
+  function buildLabel(build) {
+    const toReview = Math.max(0, build.built - build.approved - build.rejected);
+    const state = build.running ? " (building…)" : "";
+    return `${build.volume} · structure ${build.structureId} — ${toReview} of ${build.built} to review${state}`;
+  }
+
+  /** "42 built · 10 approved · 3 rejected · 29 to review · 3 failed" */
+  function countsLine(build) {
+    if (!build) {
+      return "";
+    }
+    const toReview = Math.max(0, build.built - build.approved - build.rejected);
+    const parts = [`${build.built} built`, `${build.approved} approved`];
+    if (build.rejected) {
+      parts.push(`${build.rejected} rejected`);
+    }
+    parts.push(`${toReview} to review`);
+    if (build.failed) {
+      parts.push(`${build.failed} failed`);
+    }
+    return parts.join(" · ");
+  }
+
+  /** The volume a preview recommends: the one with annotations (the first when several), else "" . */
+  function pickVolume(volumes) {
+    const found = Object.entries(volumes || {}).filter(([, info]) => info && info.count > 0);
+    return found.length ? found[0][0] : "";
+  }
+
+  /** One line under the Structure ID field about what was found where. */
+  function previewLine(volumes, chosen) {
+    const entries = Object.entries(volumes || {});
+    if (!entries.length) {
+      return "You do not have review rights on a volume to build in.";
+    }
+    const found = entries.filter(([, info]) => info && info.count > 0);
+    if (!found.length) {
+      const failed = entries.filter(([, info]) => info && info.error).map(([name]) => name);
+      const where = entries.map(([name]) => name).join(", ");
+      return failed.length
+        ? `No annotations found. Could not check ${failed.join(", ")}.`
+        : `No matching annotations in ${where}. Check the structure ID and the filters below.`;
+    }
+    const pick = found.find(([name]) => name === chosen) || found[0];
+    const others = found.filter(([name]) => name !== pick[0]).map(([name, info]) => `${name} (${info.count})`);
+    const base = `${pick[1].count} annotation${pick[1].count === 1 ? "" : "s"} to convert in ${pick[0]}.`;
+    return others.length ? `${base} The same id also exists in ${others.join(", ")}: check the volume.` : base;
+  }
+
   function batchHref(set, volume) {
     return `/api/volumes/${encodeURIComponent(volume)}/converter/batch?set=${encodeURIComponent(set)}`;
   }
@@ -129,21 +205,35 @@
       heading.textContent = "Annotation converter";
     }
     doc.title = "Annotation converter";
-    const label = doc.querySelector('label[for="training-set"]');
-    if (label) {
-      label.textContent = "Structure";
+    // The build picker in the bar replaces the training set and volume controls, and the gallery-only filters go.
+    for (const id of ["training-set", "volume", "type", "label", "tags", "radius", "export-ignore", "update-all"]) {
+      const element = doc.getElementById(id);
+      const block = element && element.closest(".filter");
+      if (block) {
+        block.hidden = true;
+      }
     }
-    const select = doc.getElementById("training-set");
-    if (select) {
-      select.title = "A structure whose annotations were converted. Each card shows the proposed polygon; the thin line is the current outline.";
+    const names = { approved: "Approved", rejected: "Rejected", unknown: "To review" };
+    for (const input of doc.querySelectorAll("#view-classes input[data-view]")) {
+      const label = input.closest("label");
+      if (label && names[input.dataset.view]) {
+        label.lastChild.textContent = ` ${names[input.dataset.view]}`;
+      }
     }
-    const update = doc.getElementById("update-all");
-    if (update) {
-      update.textContent = "Continue build";
-      update.title = "Build the cards of this structure that are missing, and retry the failed ones. Cards already built are kept.";
+    const show = doc.querySelector("#view-classes") && doc.querySelector("#view-classes").closest(".filter").querySelector("span");
+    if (show) {
+      show.textContent = "Show";
+      show.title = "To review: not approved or rejected yet. Approved cards go into the batch. Rejected cards are left alone.";
+    }
+    const bar = doc.getElementById("converter-bar");
+    if (bar) {
+      bar.hidden = false;
     }
     doc.body.classList.add("converter");
   }
 
-  return { active, onConverterPath, attachCards, edgePixels, outlineCanvas, infoLines, batchHref, applyChrome };
+  return {
+    active, onConverterPath, attachCards, edgePixels, outlineCanvas, infoLines, batchHref, applyChrome,
+    humanReason, buildLabel, countsLine, pickVolume, previewLine,
+  };
 });

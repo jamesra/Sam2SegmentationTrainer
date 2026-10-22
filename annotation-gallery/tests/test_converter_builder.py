@@ -329,3 +329,35 @@ def test_choose_downsample_and_card_origin() -> None:
     with pytest.raises(SegmentationFailed, match="too_large"):
         builder_module.choose_downsample(huge, [1, 2, 4])
     assert builder_module.card_origin(small, 1) == (5000 - 512, 6000 - 512)
+
+
+OLD_FORMAT_XML = """<?xml version="1.0" ?>
+<Volume Name="RC1" host="http://rogue1.test/" path="http://rogue1.test/RABBIT" num_sections="2">
+  <stos GroupName="grid16" controlSection="1" mappedSection="2" path="0002-0001_grid_16.stos" pixelSpacing="16" type="grid"/>
+  <Section name="GABA 1" number="1" path="0001">
+    <Pyramid name="8-bit" path="8-bit"><Level Downsample="1" path="001"/></Pyramid>
+    <Tileset FilePostfix=".png" FilePrefix="0001_" TileXDim="256" TileYDim="256" name="TEM" path="TEM">
+      <Level Downsample="1" GridDimX="4" GridDimY="3" path="001"/>
+      <Level Downsample="2" GridDimX="2" GridDimY="2" path="002"/>
+    </Tileset>
+  </Section>
+</Volume>"""
+
+
+def test_the_older_lowercase_vikingxml_of_rc1_is_read() -> None:
+    volume = parse_viking_xml(OLD_FORMAT_XML, source="http://rogue1.test/RABBIT/rogue1.vikingxml")
+    tileset = volume.select(1, "TEM")
+    assert tileset.tile_x == 256 and tileset.prefix == "0001_" and sorted(tileset.levels) == [1, 2]
+    assert tileset.levels[2].grid_x == 2
+    assert tileset.tile_url(volume.base_url, 1, 3, 2) == "http://rogue1.test/RABBIT/0001/TEM/001/0001_X003_Y002.png"
+
+
+def test_a_volume_specific_vikingxml_address_wins(monkeypatch) -> None:
+    from converter import jobs
+
+    seen = []
+    monkeypatch.setattr(jobs, "load_volume", lambda url: seen.append(url) or "v")
+    env = {"GALLERY_CONVERTER_VIKINGXML": "http://h/<volume>/S.xml", "GALLERY_CONVERTER_VIKINGXML_RC1": "http://odd/RABBIT/r.xml"}
+    jobs.default_volume("RC1", env)
+    jobs.default_volume("RC2", env)
+    assert seen == ["http://odd/RABBIT/r.xml", "http://h/RC2/S.xml"]

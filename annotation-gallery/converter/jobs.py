@@ -70,7 +70,9 @@ def default_volume(volume_name: str, environ: Optional[Dict[str, str]] = None) -
     """The volume's tilesets from its VikingXML: ``GALLERY_CONVERTER_VIKINGXML`` is a URL template with ``{volume}``
     (or ``<volume>``, which survives compose's variable substitution)."""
     mapping = environ if environ is not None else os.environ
-    template = (mapping.get("GALLERY_CONVERTER_VIKINGXML") or "").strip()
+    # One volume can have its own address (RC1's VikingXML is not at the usual place): GALLERY_CONVERTER_VIKINGXML_RC1.
+    specific = "GALLERY_CONVERTER_VIKINGXML_" + "".join(c if c.isalnum() else "_" for c in volume_name.upper())
+    template = (mapping.get(specific) or mapping.get("GALLERY_CONVERTER_VIKINGXML") or "").strip()
     if not template:
         raise ConverterNotConfigured("GALLERY_CONVERTER_VIKINGXML is not set (URL template of the VikingXML, with {volume})")
     return load_volume(template.replace("{volume}", volume_name).replace("<volume>", volume_name))

@@ -933,6 +933,58 @@ button.viewer-act {
   cursor: crosshair;
 }
 
+/* A filter block hidden by a mode (the converter drops the gallery-only ones) must really disappear. */
+.filters .filter[hidden],
+#filters[hidden] { display: none; }
+
+/* The Convert and gold dialogs: one field per line, full width. */
+#build-dialog .import-card,
+#gold-dialog .import-card,
+#gold-list-dialog .import-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: min(520px, 92vw);
+}
+
+#build-dialog input[type="number"],
+#build-dialog select,
+#gold-dialog input,
+#gold-dialog select,
+#gold-list-dialog select { width: 100%; box-sizing: border-box; }
+
+#build-dialog .view-stack { flex-direction: row; flex-wrap: wrap; gap: 6px 16px; }
+#build-dialog .filter-row { display: flex; gap: 8px; }
+#build-dialog .import-actions { margin-top: 8px; }
+
+/* Converter bar: the build picker and the page's main actions, above the filters. */
+.converter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line, #3a3f4b);
+}
+
+.converter-bar[hidden] { display: none; }
+.converter-bar select { min-width: 280px; max-width: 100%; }
+.converter-counts { color: var(--muted); font-size: 13px; }
+
+button.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.failed-list { max-height: 50vh; overflow: auto; font-size: 13px; }
+.failed-list div { padding: 4px 0; border-bottom: 1px solid var(--line, #3a3f4b); }
+.failed-list small { display: block; color: var(--muted); }
+
 /* Brush layer, like the retrace layer: above the mask, inert until the brush is on. */
 .viewer-frame canvas.viewer-brush {
   pointer-events: none;

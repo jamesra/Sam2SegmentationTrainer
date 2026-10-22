@@ -80,6 +80,19 @@ class Tileset:
         return f"{folder}/{self.prefix}X{ix:03d}_Y{iy:03d}{self.postfix}".replace("\\", "/")
 
 
+def _attr(node: ElementTree.Element, *names: str) -> Optional[str]:
+    """An attribute under any of its spellings: newer VikingXML capitalises them (Number, Path), RC1's older file does not."""
+    for name in names:
+        value = node.get(name)
+        if value is not None:
+            return value
+    lowered = {key.lower(): value for key, value in node.attrib.items()}
+    for name in names:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return None
+
+
 def _int(value: Optional[str], default: int = 0) -> int:
     try:
         return int(float(str(value)))
@@ -121,24 +134,25 @@ def parse_viking_xml(text: str, *, source: str, host: Optional[str] = None) -> V
     nodes = sections.findall("Section") if sections is not None else root.findall("Section")
     found: Dict[int, list] = {}
     for section in nodes:
-        number = _int(section.get("Number"), -1)
+        number = _int(_attr(section, "Number", "number"), -1)
         if number < 0:
             continue
         for node in section.findall("Tileset"):
             levels: Dict[int, Level] = {}
             for level in node.findall("Level"):
-                downsample = _int(level.get("Downsample"))
+                downsample = _int(_attr(level, "Downsample", "downsample"))
                 if downsample >= 1:
                     levels[downsample] = Level(
-                        downsample, level.get("path") or level.get("Path") or "",
-                        _int(level.get("GridDimX")), _int(level.get("GridDimY")),
+                        downsample, _attr(level, "path", "Path") or "",
+                        _int(_attr(level, "GridDimX", "griddimx")), _int(_attr(level, "GridDimY", "griddimy")),
                     )
             if levels:
                 found.setdefault(number, []).append(
                     Tileset(
-                        section=number, section_path=section.get("Path") or "", name=node.get("name") or "",
-                        path=node.get("path") or "", tile_x=_int(node.get("TileXDim")), tile_y=_int(node.get("TileYDim")),
-                        prefix=node.get("FilePrefix") or "", postfix=node.get("FilePostfix") or ".png", levels=levels,
+                        section=number, section_path=_attr(section, "Path", "path") or "", name=_attr(node, "name", "Name") or "",
+                        path=_attr(node, "path", "Path") or "", tile_x=_int(_attr(node, "TileXDim", "tilexdim")),
+                        tile_y=_int(_attr(node, "TileYDim", "tileydim")), prefix=_attr(node, "FilePrefix", "fileprefix") or "",
+                        postfix=_attr(node, "FilePostfix", "filepostfix") or ".png", levels=levels,
                     )
                 )
     return Volume(

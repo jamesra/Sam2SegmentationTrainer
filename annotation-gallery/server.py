@@ -64,6 +64,7 @@ from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
 from converter import jobs as converter_jobs
+from converter import odata as odata_module
 from converter import web as converter_web
 from converter.builder import BuildParams
 from gold import draw as gold_draw
@@ -754,6 +755,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_ignore_export(match.group(1))
             return
+        if path == "/api/converter/builds":
+            self._handle_converter_builds()
+            return
         match = re.fullmatch(r"/api/gold/sets/([^/]+)/(progress|export)", path)
         if match:
             self._handle_gold_read(match.group(1), match.group(2), (query.get("volume") or [""])[0])
@@ -821,6 +825,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/gold/sets":
             self._handle_gold_create()
+            return
+        if path == "/api/converter/preview":
+            self._handle_converter_preview()
             return
         match = re.fullmatch(r"/api/gold/sets/([^/]+)/(list|replacements)", path)
         if match:
@@ -1155,6 +1162,67 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json(gold_web.apply_edit(crops, location_id, image_key, rings=body.get("rings"), png=body.get("png")))
         except gold_web.EditRejected as rejected:
             self._send_json({"error": str(rejected)}, status=400)
+
+    def _handle_converter_builds(self) -> None:
+        """Every build the caller may see: one entry per (structure set, volume) with its counts and whether it is running."""
+        root = converter_web.converter_root(env_map())
+        if root is None:
+            self._send_json({"builds": []})
+            return
+        builds = []
+        for set_name in converter_web.list_structure_sets(root):
+            set_dir = root / set_name
+            grants = self._principal_for(set_dir).grants
+            structure_id = int(converter_web.SET_NAME.fullmatch(set_name).group(1))
+            for volume in sorted(grants):
+                crops = set_dir / volume
+                if not crops.is_dir():
+                    continue
+                job = converter_jobs.current_job(set_name, volume)
+                builds.append(
+                    {
+                        "set": set_name, "volume": volume, "structureId": structure_id,
+                        "running": bool(job and job.running), **converter_web.build_summary(crops),
+                    }
+                )
+        builds.sort(key=lambda item: item.get("updated") or "", reverse=True)
+        self._send_json({"builds": builds})
+
+    def _handle_converter_preview(self) -> None:
+        """POST {structureId, typeCodes?, zMin?, zMax?}: how many annotations match in each volume the caller may build in.
+
+        This is what stops a build being started in the wrong volume: the page shows where the structure really is.
+        """
+        if converter_web.converter_root(env_map()) is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            body = self._read_json()
+            structure_id = int(body["structureId"])
+            if structure_id <= 0:
+                raise ValueError("bad id")
+            probe = self._build_params("x", structure_id, body)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "structureId required"}, status=400)
+            return
+        volumes = sorted(v for v, role in self._principal().grants.items() if role == PERMISSION_REVIEW)
+        get_json = converter_jobs.OVERRIDES.get("get_json", odata_module.http_get_json)
+
+        def count(volume: str) -> dict[str, Any]:
+            try:
+                number = odata_module.count_locations(
+                    odata_base(volume), structure_id, get_json=get_json,
+                    type_codes=probe.type_codes, z_min=probe.z_min, z_max=probe.z_max,
+                )
+                return {"count": number}
+            except Exception as error:  # an unreachable endpoint must not hide the other volumes
+                return {"error": str(error)[:200]}
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(volumes)))) as pool:
+            counts = dict(zip(volumes, pool.map(count, volumes)))
+        self._send_json({"structureId": structure_id, "volumes": counts})
 
     def _handle_converter_create(self) -> None:
         """POST {structureId, volume, typeCodes?, zMin?, zMax?, channel?, filter?}: make the structure's set and start building."""

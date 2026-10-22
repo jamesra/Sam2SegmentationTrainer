@@ -1392,6 +1392,10 @@
 
   function sortFields() {
     const fields = SORT_FIELDS.slice();
+    if (state.converter) {
+      // In the converter the "loss" of a card is how far the proposal moved from the current outline (1 - overlap).
+      fields[fields.findIndex(([key]) => key === "loss")] = ["loss", "Change from current outline"];
+    }
     if (state.hasSam2) {
       fields.push(["sam2GtIou", "SAM2 GT IoU"]);
     }
@@ -1654,7 +1658,7 @@
 
   function captionHtml(row) {
     const sam2 = row.sam2GtIou == null ? "" : `<span class="badge">SAM2 ${Number(row.sam2GtIou).toFixed(2)}</span>`;
-    const loss = row.loss == null ? "" : `<span class="badge">loss ${Number(row.loss).toFixed(3)}</span>`;
+    const loss = row.loss == null ? "" : `<span class="badge">${state.converter ? "change" : "loss"} ${Number(row.loss).toFixed(state.converter ? 2 : 3)}</span>`;
     const structureName = row.type_name || "Structure";
     const structureText = row.structure_id == null ? structureName : `${structureName} ${row.structure_id}`;
     const structureHref = sbfsemHref(row);
@@ -2185,6 +2189,18 @@
         batchLink.href = window.ConverterMode.batchHref(trainingSet, volume);
         batchLink.hidden = false;
       }
+      refreshBuilds(trainingSet, volume).catch(() => {});
+      state.convCards = [];
+      try {
+        const all = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/converter/cards`));
+        state.convCards = all.cards || [];
+      } catch {
+        // counts are extra detail
+      }
+      const failed = state.convCards.filter((card) => card.state === "failed");
+      const failedButton = document.getElementById("converter-failed");
+      failedButton.hidden = failed.length === 0;
+      failedButton.textContent = `Failed (${failed.length})`;
     }
     if (state.gold) {
       await refreshGold(volume, trainingSet, isLatest);
@@ -2455,7 +2471,7 @@
       lines.push(row.structure_label);
     }
     if (row.loss != null) {
-      lines.push(`loss ${Number(row.loss).toFixed(3)}`);
+      lines.push(state.converter ? `change ${Number(row.loss).toFixed(2)}` : `loss ${Number(row.loss).toFixed(3)}`);
     }
     if (row.sam2GtIou != null) {
       lines.push(`SAM2 ${Number(row.sam2GtIou).toFixed(2)}`);
@@ -3553,7 +3569,7 @@
   // Every training-set change starts a call, so being the newest is the whole check.
   const volumesLatest = makeLatest();
 
-  async function loadVolumes() {
+  async function loadVolumes(forceVolume) {
     const isLatest = volumesLatest(() => true);
     let me;
     try {
@@ -3576,7 +3592,9 @@
       .join("");
     const names = volumes.map((item) => item.name);
     const preferred = readView().volumes[state.trainingSet];
-    state.volume = names.includes(preferred) ? preferred : (names[0] || "");
+    state.volume = forceVolume && names.includes(forceVolume)
+      ? forceVolume
+      : (names.includes(preferred) ? preferred : (names[0] || ""));
     els.volume.value = state.volume;
     rememberView(true);
     const volumeWrap = els.volume.closest(".filter");
@@ -3837,6 +3855,21 @@
     if (status.set && running && !cancelling && status.headline) {
       headline = status.headline;
     }
+    if (status.set && !running && phase === "failed" && (status.errors || []).length) {
+      // A build that could not run says why on the strip itself, not only under Details.
+      return {
+        title: `Build ${volume}`,
+        line: status.errors[0],
+        tone: "bad",
+        indeterminate: false,
+        max: 1,
+        value: 0,
+        showBar: false,
+        showCancel: false,
+        showDismiss: true,
+        detail: "",
+      };
+    }
     const max = Math.max(1, Number(status.pages) || 1);
     return {
       title: status.set ? (running ? `Building ${volume}` : `Build ${volume}`) : (running ? `Updating ${volume}` : `Update ${volume}`),
@@ -4001,6 +4034,48 @@
     start: document.getElementById("build-start"),
   };
 
+  const buildKey = (build) => `${build.set}|${build.volume}`;
+
+  // The builds the user may see, in the picker in the converter bar. Returns them; refreshes the counts line.
+  async function refreshBuilds(currentSet, currentVolume) {
+    const payload = await getJson("/api/converter/builds");
+    const builds = payload.builds || [];
+    state.builds = builds;
+    const select = document.getElementById("converter-build-select");
+    const keep = select.value;
+    select.innerHTML = builds
+      .map((build) => `<option value="${buildKey(build)}">${window.ConverterMode.buildLabel(build)}</option>`)
+      .join("");
+    const sets = [...new Set(builds.map((build) => build.set))];
+    els.trainingSet.innerHTML = sets.map((name) => `<option value="${name}">${name}</option>`).join("");
+    const wanted = currentSet ? `${currentSet}|${currentVolume}` : keep;
+    if (builds.some((build) => buildKey(build) === wanted)) {
+      select.value = wanted;
+    }
+    const current = builds.find((build) => buildKey(build) === select.value);
+    document.getElementById("converter-counts").textContent = window.ConverterMode.countsLine(current);
+    return builds;
+  }
+
+  function buildSettings(structureId) {
+    return {
+      structureId,
+      typeCodes: [...buildUi.types.querySelectorAll("input:checked")].map((box) => Number(box.value)),
+      zMin: buildUi.zMin.value,
+      zMax: buildUi.zMax.value,
+    };
+  }
+
+  // The Convert dialog. Its volume list comes from the preview, so before an id is typed it lists the volumes the user can review.
+  function openBuildDialog() {
+    const picker = document.getElementById("build-volume");
+    const reviewable = ((state.me && state.me.volumes) || []).filter((item) => item.permission === "review");
+    picker.innerHTML = reviewable.map((item) => `<option value="${item.name}">${item.name}</option>`).join("");
+    buildUi.start.disabled = true;
+    buildUi.dialog.hidden = false;
+    buildUi.structure.focus();
+  }
+
   async function startBuild() {
     const structureId = Number(buildUi.structure.value);
     if (!Number.isInteger(structureId) || structureId <= 0) {
@@ -4009,7 +4084,7 @@
     }
     const body = {
       structureId,
-      volume: state.noStructures ? els.volume.value : state.volume,
+      volume: document.getElementById("build-volume").value,
       typeCodes: [...buildUi.types.querySelectorAll("input:checked")].map((box) => Number(box.value)),
       zMin: buildUi.zMin.value,
       zMax: buildUi.zMax.value,
@@ -4022,13 +4097,15 @@
         body: JSON.stringify(body),
       });
       buildUi.dialog.hidden = true;
-      const setsPayload = await getJson("/api/training-sets?app=converter");
-      els.trainingSet.innerHTML = (setsPayload.sets || []).map((name) => `<option value="${name}">${name}</option>`).join("");
+      document.getElementById("filters").hidden = false;
+      await refreshBuilds();
       state.trainingSet = started.set;
       els.trainingSet.value = started.set;
-      state.noStructures = false;
-      rememberView(true);
-      await loadVolumes();
+      document.getElementById("converter-build-select").value = `${started.set}|${body.volume}`;
+      undoStack.length = 0;
+      closeViewer();
+      rememberView(false);
+      await loadVolumes(body.volume);
       updateUi.wasRunning = true;
       paintUpdate(started);
       updateUi.timer = window.setTimeout(pollUpdate, 500);
@@ -4041,15 +4118,107 @@
 
   const buildButton = document.getElementById("converter-build");
   if (buildButton) {
-    buildButton.addEventListener("click", () => {
-      buildUi.dialog.hidden = false;
-      buildUi.structure.focus();
-    });
+    buildButton.addEventListener("click", () => openBuildDialog());
+  }
+  if (document.getElementById("converter-new")) {
+    document.getElementById("converter-new").addEventListener("click", () => openBuildDialog());
     buildUi.start.addEventListener("click", () => {
       startBuild();
     });
     document.getElementById("build-cancel").addEventListener("click", () => {
       buildUi.dialog.hidden = true;
+    });
+    // Looking up the structure as the id is typed shows which volume it is in and how many annotations match.
+    let previewTimer = 0;
+    let previewSerial = 0;
+    const schedulePreview = () => {
+      window.clearTimeout(previewTimer);
+      buildUi.start.disabled = true;
+      previewTimer = window.setTimeout(async () => {
+        const serial = (previewSerial += 1);
+        const structureId = Number(buildUi.structure.value);
+        const note = document.getElementById("build-preview");
+        if (!Number.isInteger(structureId) || structureId <= 0) {
+          note.textContent = "Enter a structure ID. The volumes you can build in are checked for it.";
+          return;
+        }
+        note.textContent = "Looking for it…";
+        try {
+          const result = await getJson("/api/converter/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildSettings(structureId)),
+          });
+          if (serial !== previewSerial) {
+            return;
+          }
+          const picker = document.getElementById("build-volume");
+          const keep = picker.value;
+          picker.innerHTML = Object.entries(result.volumes).map(([name, info]) => {
+            const text = info.error ? "could not check" : `${info.count} annotation${info.count === 1 ? "" : "s"}`;
+            return `<option value="${name}">${name} — ${text}</option>`;
+          }).join("");
+          const chosen = (result.volumes[keep] && result.volumes[keep].count > 0) ? keep : window.ConverterMode.pickVolume(result.volumes);
+          if (chosen) {
+            picker.value = chosen;
+          }
+          note.textContent = window.ConverterMode.previewLine(result.volumes, picker.value);
+          const info = result.volumes[picker.value];
+          buildUi.start.disabled = !(info && info.count > 0);
+        } catch (error) {
+          if (serial === previewSerial) {
+            document.getElementById("build-preview").textContent = `Could not check: ${error.message}`;
+          }
+        }
+      }, 450);
+    };
+    buildUi.structure.addEventListener("input", schedulePreview);
+    buildUi.types.addEventListener("change", schedulePreview);
+    buildUi.zMin.addEventListener("input", schedulePreview);
+    buildUi.zMax.addEventListener("input", schedulePreview);
+    document.getElementById("build-volume").addEventListener("change", () => {
+      const picked = document.getElementById("build-volume");
+      const match = /(\d+) annotation/.exec(picked.options[picked.selectedIndex] ? picked.options[picked.selectedIndex].text : "");
+      buildUi.start.disabled = !(match && Number(match[1]) > 0);
+    });
+
+    // The bar: pick a build, continue it, see what failed.
+    document.getElementById("converter-build-select").addEventListener("change", (event) => {
+      const [set, volume] = event.target.value.split("|");
+      state.trainingSet = set;
+      els.trainingSet.value = set;
+      undoStack.length = 0;
+      closeViewer();
+      rememberView(false);
+      loadVolumes(volume).catch((error) => {
+        els.status.textContent = error.message;
+      });
+    });
+    document.getElementById("converter-continue").addEventListener("click", () => {
+      document.getElementById("update-all").click();
+    });
+    document.getElementById("converter-failed").addEventListener("click", () => {
+      const failed = (state.convCards || []).filter((card) => card.state === "failed");
+      const list = document.getElementById("failed-list");
+      list.replaceChildren(...failed.map((card) => {
+        const line = document.createElement("div");
+        const link = document.createElement("a");
+        link.href = vikingHref({ location_id: card.location_id });
+        link.textContent = `#${card.location_id}`;
+        const reason = document.createElement("small");
+        reason.textContent = window.ConverterMode.humanReason(card.reason);
+        reason.title = card.reason || "";
+        line.append(link, document.createTextNode(` · Z ${card.z}`), reason);
+        return line;
+      }));
+      document.getElementById("failed-dialog").hidden = false;
+    });
+    document.getElementById("failed-close").addEventListener("click", () => {
+      document.getElementById("failed-dialog").hidden = true;
+    });
+    document.getElementById("failed-retry").addEventListener("click", () => {
+      document.getElementById("failed-dialog").hidden = true;
+      document.getElementById("update-all").click();
     });
   }
 
@@ -4139,22 +4308,26 @@
       els.status.textContent = "No gold set yet. Press Draw sample to make one.";
       return;
     }
-    if (state.converter && !(setsPayload.sets && setsPayload.sets.length)) {
-      // Nothing built yet: offer the volumes the user can review, so the first structure can be built. The volume list
-      // must not load the gallery's own data, so changes are swallowed until a structure exists.
-      state.noStructures = true;
+    if (state.converter) {
       const me = await getJson("/api/me");
-      els.who.textContent = me.displayName || "";
-      const volumes = (me.volumes || []).filter((item) => item.permission === "review");
-      els.volume.innerHTML = volumes.map((item) => `<option value="${item.name}">${item.name}</option>`).join("");
-      els.volume.addEventListener("change", (event) => {
-        if (state.noStructures) {
-          event.stopImmediatePropagation();
-        }
-      }, true);
-      els.status.textContent = volumes.length
-        ? "No structure has been built yet. Choose a volume and press Build structure."
-        : "No structure has been built yet, and you hold no review right on a volume to build one.";
+      els.who.textContent = `${me.displayName} (${state.config.identityMode})`;
+      els.logout.hidden = state.config.identityMode !== "oidc";
+      state.me = me;
+      const builds = await refreshBuilds();
+      if (!builds.length) {
+        // Nothing built yet: the first thing to do is choose a structure, so ask for it straight away.
+        els.status.textContent = "No structure has been converted yet.";
+        document.getElementById("filters").hidden = true;
+        openBuildDialog();
+        return;
+      }
+      const view = readView();
+      const wanted = builds.find((item) => item.set === view.set && item.volume === (view.volumes || {})[view.set]) || builds[0];
+      state.trainingSet = wanted.set;
+      els.trainingSet.value = wanted.set;
+      document.getElementById("converter-build-select").value = buildKey(wanted);
+      rememberView(false);
+      await loadVolumes(wanted.volume);
       return;
     }
     const sets = setsPayload.sets && setsPayload.sets.length ? setsPayload.sets : ["current"];
