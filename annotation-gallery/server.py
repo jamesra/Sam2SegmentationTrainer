@@ -66,6 +66,9 @@ import update_all
 from converter import jobs as converter_jobs
 from converter import web as converter_web
 from converter.builder import BuildParams
+from gold import draw as gold_draw
+from gold import store as gold_store
+from gold import web as gold_web
 from crops_path import crops_dir_for
 from thumbs import ensure_thumbnail, parse_thumb_request, start_thumbnail_watch, thumb_parts_allowed
 
@@ -118,6 +121,8 @@ def resolve_training_set(name: str) -> Path:
     """Return the volume-root folder for one training set. Rejects escape paths."""
     if converter_web.SET_NAME.fullmatch(name):
         return converter_web.resolve_structure_set(converter_web.converter_root(env_map()), name)
+    if gold_store.SET_NAME.fullmatch(name):
+        return gold_store.resolve_set(gold_store.gold_root(env_map()), name)
     if name not in list_training_sets():
         raise FileNotFoundError(name)
     registry = registry_dir()
@@ -679,7 +684,11 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_json({"ok": True})
             return
-        if path in {"/", "/index.html"} or (path in {"/converter", "/converter/"} and converter_web.converter_root(env_map())):
+        if (
+            path in {"/", "/index.html"}
+            or (path in {"/converter", "/converter/"} and converter_web.converter_root(env_map()))
+            or (path in {"/gold", "/gold/"} and gold_store.gold_root(env_map()))
+        ):
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
             return
         if path.startswith("/static/"):
@@ -692,6 +701,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
                     "identityMode": identity_mode(),
                     "vikingUrl": viking_template(),
                     "converter": converter_web.converter_root(env_map()) is not None,
+                    "gold": gold_store.gold_root(env_map()) is not None,
                 }
             )
             return
@@ -706,6 +716,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._clear_session(identity_logout_url())
             return
         if path == "/api/training-sets":
+            if (query.get("app") or [""])[0] == "gold":
+                sets = gold_store.list_sets(gold_store.gold_root(env_map()))
+                self._send_json({"sets": sets, "default": sets[-1] if sets else ""})
+                return
             if (query.get("app") or [""])[0] == "converter":
                 sets = converter_web.list_structure_sets(converter_web.converter_root(env_map()))
                 self._send_json({"sets": sets, "default": sets[-1] if sets else ""})
@@ -739,6 +753,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/volumes/([^/]+)/ignore-list", path)
         if match:
             self._handle_ignore_export(match.group(1))
+            return
+        match = re.fullmatch(r"/api/gold/sets/([^/]+)/(progress|export)", path)
+        if match:
+            self._handle_gold_read(match.group(1), match.group(2), (query.get("volume") or [""])[0])
             return
         match = re.fullmatch(r"/api/volumes/([^/]+)/converter/(cards|batch)", path)
         if match:
@@ -795,6 +813,17 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if path == "/api/converter/structures":
             self._handle_converter_create()
             return
+        if path == "/api/gold/sets":
+            self._handle_gold_create()
+            return
+        match = re.fullmatch(r"/api/gold/sets/([^/]+)/(list|replacements)", path)
+        if match:
+            self._handle_gold_change(match.group(1), match.group(2))
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/gold/edit", path)
+        if match:
+            self._handle_gold_edit(match.group(1))
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/converter/edit", path)
         if match:
             self._handle_converter_edit(match.group(1))
@@ -847,6 +876,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         crops = self._granted_crops(volume)
         if crops is None:
             return
+        in_gold = bool(gold_store.SET_NAME.fullmatch(self._registry().name))
         if action == "ignore":
             ignore_location(crops, location_id, image_key)
         elif action == "restore":
@@ -855,6 +885,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
             approve_window(crops, location_id, image_key)
         else:
             unapprove_window(crops, location_id, image_key)
+        if in_gold:
+            if action == "approve":
+                principal = self._principal()
+                gold_web.record_approval(crops, location_id, principal.display_name or principal.subject or "unknown")
+            else:
+                gold_web.clear_approval(crops, location_id)
         if action in ("ignore", "restore"):
             # A rejected mask stops being a negative for its neighbors, so the whole tile's layers are stale.
             drop_card_masks(crops, location_image_keys(crops, [location_id]))
@@ -962,6 +998,156 @@ class GalleryHandler(BaseHTTPRequestHandler):
         try:
             self._send_json(converter_web.apply_edit(crops, location_id, image_key, body.get("rings")))
         except converter_web.EditRejected as rejected:
+            self._send_json({"error": str(rejected)}, status=400)
+
+    # ---- gold sets ------------------------------------------------------------------------------------------------
+
+    def _gold_set_dir(self, name: str) -> Path | None:
+        try:
+            return gold_store.resolve_set(gold_store.gold_root(env_map()), name)
+        except (FileNotFoundError, ValueError):
+            self._send_json({"error": "not found"}, status=404)
+            return None
+
+    def _gold_source_crops(self, meta: dict[str, Any], volume: str) -> Path:
+        return crops_dir(resolve_training_set(str(meta.get("sourceSet") or "current")), volume)
+
+    def _principal_for(self, set_dir: Path) -> Principal:
+        """The caller's grants against the volumes of one gold set (this request's own ?set= is not that set)."""
+        try:
+            names = list_registry_names(set_dir)
+        except (ValueError, FileNotFoundError):
+            names = []
+        return self._principal_over(names)
+
+    def _review_granted_in(self, set_dir: Path, volume: str) -> bool:
+        role = self._principal_for(set_dir).grants.get(volume)
+        if role is None:
+            self._send_json({"error": "not found"}, status=404)
+        elif role != PERMISSION_REVIEW:
+            self._send_json({"error": "review required"}, status=403)
+        return role == PERMISSION_REVIEW
+
+    def _handle_gold_read(self, name: str, what: str, volume: str) -> None:
+        set_dir = self._gold_set_dir(name)
+        if set_dir is None:
+            return
+        grants = self._principal_for(set_dir).grants
+        meta = gold_store.read_meta(set_dir)
+        if what == "progress":
+            progress = gold_store.progress(set_dir)
+            self._send_json({"set": name, "meta": meta, "progress": {v: p for v, p in progress.items() if v in grants}})
+            return
+        every = list(meta.get("volumes") or {})
+        if volume and (volume not in grants or volume not in every):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        if not volume and any(v not in grants for v in every):
+            self._send_json({"error": "export one volume at a time (volume=...); you hold no grant on all of them"}, status=403)
+            return
+        body = gold_web.export_zip(set_dir, volume or None)
+        suffix = f"-{volume}" if volume else ""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}{suffix}.zip"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_gold_create(self) -> None:
+        """POST {name, sourceSet?, volumes?, n?, seed?, stratify?, band?}: draw a sample from the source set into a new gold set."""
+        root = gold_store.gold_root(env_map())
+        if root is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            body = self._read_json()
+            name = str(body["name"])
+            source_set = str(body.get("sourceSet") or "current")
+            seed = int(body["seed"]) if body.get("seed") not in (None, "") else int.from_bytes(os.urandom(4), "big")
+            count = int(body["n"]) if body.get("n") not in (None, "") else gold_draw.DEFAULT_COUNT
+            stratify = str(body.get("stratify") or "")
+            band = int(body.get("band") or gold_draw.DEFAULT_Z_BAND)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "name is required; n, seed and band are numbers"}, status=400)
+            return
+        if gold_store.SET_NAME.fullmatch(source_set) or converter_web.SET_NAME.fullmatch(source_set):
+            self._send_json({"error": "a gold set is drawn from a training set, not from a gold or converter set"}, status=400)
+            return
+        try:
+            source_registry = resolve_training_set(source_set)
+            grants = self._principal_over(list_registry_names(source_registry)).grants
+        except (FileNotFoundError, ValueError):
+            self._send_json({"error": "unknown source set"}, status=404)
+            return
+        wanted = body.get("volumes")
+        volumes = [str(v) for v in wanted] if isinstance(wanted, list) and wanted else sorted(
+            v for v, role in grants.items() if role == PERMISSION_REVIEW
+        )
+        if not volumes or any(grants.get(v) != PERMISSION_REVIEW for v in volumes):
+            self._send_json({"error": "review rights are needed on every volume in the sample"}, status=403)
+            return
+        try:
+            sources = {v: crops_dir(source_registry, v) for v in volumes}
+            meta = gold_store.create_set(root, name, source_set, sources, n=count, seed=seed, stratify=stratify, band=band)
+        except (gold_store.GoldError, ValueError, FileNotFoundError) as error:
+            self._send_json({"error": str(error)}, status=400)
+            return
+        self._send_json({"ok": True, "set": meta["name"], "meta": meta}, status=201)
+
+    def _handle_gold_change(self, name: str, what: str) -> None:
+        """POST list {volume, text, mode, force?} or replacements {volume, count?}."""
+        set_dir = self._gold_set_dir(name)
+        if set_dir is None:
+            return
+        try:
+            body = self._read_json()
+            volume = str(body["volume"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "volume required"}, status=400)
+            return
+        if not self._review_granted_in(set_dir, volume):
+            return
+        meta = gold_store.read_meta(set_dir)
+        try:
+            source = self._gold_source_crops(meta, volume)
+            if what == "list":
+                ids, bad = gold_draw.parse_id_list(str(body.get("text") or ""))
+                if not ids:
+                    self._send_json({"error": "the list has no location ids", "bad": bad[:20]}, status=400)
+                    return
+                result = gold_store.apply_id_list(
+                    set_dir, volume, source, ids, str(body.get("mode") or "extend"), force=bool(body.get("force"))
+                )
+                result["notIds"] = bad[:50]
+                self._send_json(result)
+                return
+            added = gold_store.draw_replacement(set_dir, volume, source, max(1, min(50, int(body.get("count") or 1))))
+            self._send_json({"ok": True, "added": added})
+        except (gold_store.GoldError, ValueError, FileNotFoundError) as error:
+            self._send_json({"error": str(error)}, status=400)
+
+    def _handle_gold_edit(self, volume: str) -> None:
+        """POST {location_id, image_key, rings | png}: replace a gold card mask (retrace rings or a painted PNG)."""
+        if not self._review_granted(volume):
+            return
+        if not gold_store.SET_NAME.fullmatch(self._registry().name):
+            self._send_json({"error": "not a gold set"}, status=400)
+            return
+        try:
+            body = self._read_json()
+            location_id = int(body["location_id"])
+            image_key = str(body["image_key"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "location_id and image_key required"}, status=400)
+            return
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        try:
+            self._send_json(gold_web.apply_edit(crops, location_id, image_key, rings=body.get("rings"), png=body.get("png")))
+        except gold_web.EditRejected as rejected:
             self._send_json({"error": str(rejected)}, status=400)
 
     def _handle_converter_create(self) -> None:
@@ -1488,6 +1674,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
             names = list_registry_names(self._registry())
         except (ValueError, FileNotFoundError):
             names = []
+        return self._principal_over(names)
+
+    def _principal_over(self, names: list[str]) -> Principal:
+        """The caller with grants limited to ``names`` (the volumes of whichever set the request is about)."""
         mode = identity_mode()
         header = self.headers.get("Authorization") or ""
         if header.lower().startswith("bearer "):

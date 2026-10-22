@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 import catalog
 from converter import contour as contour_module
@@ -143,14 +143,14 @@ def build_prompt(record: odata.LocationRecord, downsample: int) -> Prompt:
 def draw_mask(
     rings: Sequence[Sequence[Tuple[float, float]]], origin: Tuple[int, int], size: int = CARD_SIZE
 ) -> np.ndarray:
-    """Even-odd fill of protocol-space rings into a card's pixels (stored orientation): exterior first, then holes."""
-    image = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(image)
-    for index, ring in enumerate(rings):
-        points = [(x - origin[0] - 0.5, y - origin[1] - 0.5) for x, y in ring]
-        if len(points) >= 3:
-            draw.polygon(points, fill=255 if index == 0 else 0)
-    return np.asarray(image) > 0
+    """Even-odd fill of protocol-space rings into a card's pixels (stored orientation): exterior first, then holes.
+
+    A pixel is set when its centre is inside, so a ring on pixel edges fills exactly its area (see gold/raster.py).
+    """
+    from gold.raster import fill_rings
+
+    shifted = [[(x - origin[0], y - origin[1]) for x, y in ring] for ring in rings]
+    return fill_rings(shifted, size, size)
 
 
 def circle_mask(cx: float, cy: float, radius: float, origin: Tuple[int, int], size: int = CARD_SIZE) -> np.ndarray:
