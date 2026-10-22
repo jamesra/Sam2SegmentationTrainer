@@ -67,12 +67,13 @@ def default_client(environ: Optional[Dict[str, str]] = None) -> SegmentationClie
 
 
 def default_volume(volume_name: str, environ: Optional[Dict[str, str]] = None) -> Volume:
-    """The volume's tilesets from its VikingXML: ``GALLERY_CONVERTER_VIKINGXML`` is a URL template with ``{volume}``."""
+    """The volume's tilesets from its VikingXML: ``GALLERY_CONVERTER_VIKINGXML`` is a URL template with ``{volume}``
+    (or ``<volume>``, which survives compose's variable substitution)."""
     mapping = environ if environ is not None else os.environ
     template = (mapping.get("GALLERY_CONVERTER_VIKINGXML") or "").strip()
     if not template:
         raise ConverterNotConfigured("GALLERY_CONVERTER_VIKINGXML is not set (URL template of the VikingXML, with {volume})")
-    return load_volume(template.replace("{volume}", volume_name))
+    return load_volume(template.replace("{volume}", volume_name).replace("<volume>", volume_name))
 
 
 def tile_cache(environ: Optional[Dict[str, str]] = None) -> TileCache:

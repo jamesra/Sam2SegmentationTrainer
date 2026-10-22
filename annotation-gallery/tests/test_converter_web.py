@@ -387,3 +387,13 @@ def test_editing_a_missing_card_or_without_review_rights(httpd, built: Path, mon
     assert request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 99, "image_key": "nope", "rings": [rect]})[0] == 400
     monkeypatch.setenv("GALLERY_STUB_ROLE", "read")
     assert request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 11, "image_key": "k", "rings": [rect]})[0] == 403
+
+
+def test_the_vikingxml_template_accepts_both_volume_placeholders(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = []
+    monkeypatch.setattr(jobs, "load_volume", lambda url: seen.append(url) or "volume")
+    for template in ("http://h/{volume}/V.xml", "http://h/<volume>/V.xml"):
+        assert jobs.default_volume("RC2", {"GALLERY_CONVERTER_VIKINGXML": template}) == "volume"
+    assert seen == ["http://h/RC2/V.xml", "http://h/RC2/V.xml"]
+    with pytest.raises(jobs.ConverterNotConfigured):
+        jobs.default_volume("RC2", {})
