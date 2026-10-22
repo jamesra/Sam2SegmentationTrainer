@@ -955,6 +955,17 @@ class GalleryHandler(BaseHTTPRequestHandler):
         started_job, _new = update_all.start_job(volume, crops, url, str(source.get("exporter") or "tiled"))
         self._send_json({**update_all.idle_status(crops), **started_job.snapshot()})
 
+    def _volume_source(self, volume: str) -> dict[str, Any]:
+        """The volume's own source record (OData endpoint, where its tiles are) from the gallery's default training data.
+
+        Volumes are not all served from the same place (the SEM ones are other labs' servers), so nothing is guessed from a
+        template when the volume says where it is.
+        """
+        try:
+            return load_source_document(crops_dir(registry_dir(), volume))
+        except (ValueError, FileNotFoundError, OSError):
+            return {}
+
     def _build_params(self, volume: str, structure_id: int, body: dict[str, Any]) -> BuildParams:
         def numbers(key: str) -> tuple[int, ...]:
             return tuple(int(item) for item in body.get(key) or [])
@@ -962,9 +973,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
         def optional_int(key: str) -> int | None:
             return None if body.get(key) in (None, "") else int(body[key])
 
+        source = self._volume_source(volume)
+        tiles = source.get("tiles") if isinstance(source.get("tiles"), dict) else {}
         return BuildParams(
             volume=volume,
-            odata_base=odata_base(volume),
+            odata_base=odata_endpoint(volume, source),
+            viking_xml=(str(tiles.get("vikingXml")).strip() or None) if tiles.get("vikingXml") else None,
+            tile_base=(str(tiles.get("base")).strip() or None) if tiles.get("base") else None,
             structure_id=structure_id,
             type_codes=numbers("typeCodes") or (1, 4, 6, 7),
             z_min=optional_int("zMin"),
@@ -1221,7 +1236,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         def count(volume: str) -> dict[str, Any]:
             try:
                 number = odata_module.count_locations(
-                    odata_base(volume), structure_id, get_json=get_json,
+                    odata_endpoint(volume, self._volume_source(volume)), structure_id, get_json=get_json,
                     type_codes=probe.type_codes, z_min=probe.z_min, z_max=probe.z_max,
                 )
                 return {"count": number}
@@ -1258,7 +1273,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._send_json({"error": "invalid build settings"}, status=400)
             return
-        converter_jobs.write_source(crops, params.odata_base, structure_id)
+        converter_jobs.write_source(crops, params.odata_base, structure_id, params.viking_xml, params.tile_base)
         started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
         self._send_json({**started.snapshot(), "set": set_name}, status=202)
 

@@ -448,3 +448,44 @@ def test_preview_needs_an_id_and_review_rights(clean_httpd, monkeypatch: pytest.
     assert call_json(clean_httpd, "/api/converter/preview", {"structureId": 0})[0] == 400
     monkeypatch.setenv("GALLERY_STUB_ROLE", "read")
     assert call_json(clean_httpd, "/api/converter/preview", {"structureId": 5})[1]["volumes"] == {}
+
+
+# ---- volumes that say where they are -----------------------------------------------------------------------------
+
+def write_volume_source(tmp_path: Path, volume: str = "RC1") -> None:
+    folder = tmp_path / "gallery-volumes" / volume
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "manifest.jsonl").write_text("", encoding="utf-8")  # marks the flat layout, as in every real volume
+    (folder / "source.json").write_text(json.dumps({
+        "kind": "odata", "odata": "https://websvc.codepharm.net/NeitzCPED/OData",
+        "tiles": {"vikingXml": "http://v2223.host.s.uw.edu/Neitz/CPED/cped.xml", "base": "http://v2223.host.s.uw.edu/Neitz/cped"},
+    }), encoding="utf-8")
+
+
+def test_the_preview_asks_each_volume_at_the_address_its_source_record_gives(clean_httpd, tmp_path: Path) -> None:
+    write_volume_source(tmp_path)
+    asked = []
+    jobs.OVERRIDES["get_json"] = lambda url: asked.append(url) or {"@odata.count": 4, "value": []}
+    payload = call_json(clean_httpd, "/api/converter/preview", {"structureId": 7})[1]
+    assert payload["volumes"] == {"RC1": {"count": 4}}
+    assert asked and asked[0].startswith("https://websvc.codepharm.net/NeitzCPED/OData/Locations?")
+
+
+def test_a_build_loads_the_volumes_own_vikingxml_and_remembers_it(clean_httpd, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_volume_source(tmp_path)
+    loaded = []
+    volume = fixtures.parse_viking_xml(fixtures.VIKING_XML, source="x")
+    monkeypatch.setattr(jobs, "load_volume", lambda url, host=None: loaded.append((url, host)) or volume)
+    status, raw, _ = request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 500, "volume": "RC1"})
+    assert status == 202
+    wait_until_done(clean_httpd)
+    assert loaded == [("http://v2223.host.s.uw.edu/Neitz/CPED/cped.xml", "http://v2223.host.s.uw.edu/Neitz/cped")]
+    source = json.loads((Path(jobs.OVERRIDES and tmp_path) / "converter" / SET / "RC1" / "source.json").read_text(encoding="utf-8"))
+    assert source["odata"].endswith("/NeitzCPED/OData") and source["tiles"]["vikingXml"].endswith("cped.xml")
+
+
+def test_a_volume_without_a_source_record_still_uses_the_templates(clean_httpd) -> None:
+    asked = []
+    jobs.OVERRIDES["get_json"] = lambda url: asked.append(url) or {"@odata.count": 1, "value": []}
+    call_json(clean_httpd, "/api/converter/preview", {"structureId": 7})
+    assert asked[0].startswith("https://websvc.codepharm.net/RC1/OData/Locations?")

@@ -78,6 +78,10 @@ class BuildParams:
     threshold: float = 0.5
     retry_failed: bool = False
     rebuild: bool = False
+    # Where the volume's tiles are listed (its VikingXML) and served from, as its source.json records them. Empty: use the
+    # server's template (GALLERY_CONVERTER_VIKINGXML).
+    viking_xml: Optional[str] = None
+    tile_base: Optional[str] = None
 
 
 @dataclass

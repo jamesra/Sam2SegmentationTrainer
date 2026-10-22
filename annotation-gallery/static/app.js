@@ -420,6 +420,7 @@
       els.trainingSet.innerHTML = (sets.sets || []).map((name) => `<option value="${name}">${name}</option>`).join("");
       state.trainingSet = created.set;
       els.trainingSet.value = created.set;
+      document.getElementById("filters").hidden = false;
       rememberView(true);
       els.status.textContent = files.length
         ? `Made ${created.set} from ${files.length} list file(s).${skippedSummary(created.meta)}`
@@ -4324,7 +4325,9 @@
       state.converter ? "/api/training-sets?app=converter" : (state.gold ? "/api/training-sets?app=gold" : "/api/training-sets"),
     );
     if (state.gold && !(setsPayload.sets && setsPayload.sets.length)) {
-      els.status.textContent = "No gold set yet. Press Draw sample to make one.";
+      els.status.textContent = "No gold set yet. Draw a sample, or start from list files.";
+      document.getElementById("filters").hidden = true;
+      document.getElementById("gold-draw").click();
       return;
     }
     if (state.converter) {

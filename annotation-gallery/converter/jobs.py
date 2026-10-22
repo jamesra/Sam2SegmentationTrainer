@@ -176,7 +176,11 @@ class BuildJob:
     def _run(self) -> None:
         try:
             client = self._make_client()
-            volume = self._make_volume(self.volume)
+            if self.params.viking_xml:
+                # The volume's own record of where its tiles are (source.json), not a guess from a template.
+                volume = load_volume(self.params.viking_xml, host=self.params.tile_base or None)
+            else:
+                volume = self._make_volume(self.volume)
             cache = self._make_cache()
             builder = builder_module.Builder(
                 self.params, self.crops, volume, client, cache, get_json=self._get_json, semaphore=streams()
@@ -221,15 +225,17 @@ def start_job(job: BuildJob) -> BuildJob:
     return job
 
 
-def write_source(crops: Path, odata_base: str, structure_id: int) -> None:
+def write_source(
+    crops: Path, odata_base: str, structure_id: int, viking_xml: Optional[str] = None, tile_base: Optional[str] = None
+) -> None:
     """The source document the gallery reads a volume's database name from (the OData URL names it)."""
     crops.mkdir(parents=True, exist_ok=True)
     path = crops / "source.json"
     if not path.is_file():
-        path.write_text(
-            json.dumps({"kind": "converter", "odata": odata_base, "structureId": int(structure_id)}, indent=1),
-            encoding="utf-8",
-        )
+        document: Dict[str, Any] = {"kind": "converter", "odata": odata_base, "structureId": int(structure_id)}
+        if viking_xml:
+            document["tiles"] = {"vikingXml": viking_xml, "base": tile_base or ""}
+        path.write_text(json.dumps(document, indent=1), encoding="utf-8")
 
 
 # Tests replace the pieces a job reaches over the network: {"make_client": ..., "make_volume": ..., "make_cache": ..., "get_json": ...}.
