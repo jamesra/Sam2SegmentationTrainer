@@ -10,7 +10,12 @@
   <header class="bar">
     <div class="title-row">
       <h1>Annotation overlay gallery</h1>
-      <a class="site-link" href="https://tensor.codepharm.net" target="_blank" rel="noopener noreferrer">TensorBoard</a>
+      <nav id="page-links" class="page-links" aria-label="Gallery pages">
+        <a class="site-link" data-page="gallery" href="/" hidden title="Review the training set's annotation masks">Gallery</a>
+        <a class="site-link" data-page="converter" href="/converter/" hidden title="Review the segmentation server's proposed polygons for a structure">Converter</a>
+        <a class="site-link" data-page="gold" href="/gold/" hidden title="Touch up and approve the gold standard sample">Gold review</a>
+        <a class="site-link" href="https://tensor.codepharm.net" target="_blank" rel="noopener noreferrer">TensorBoard</a>
+      </nav>
     </div>
     <p id="filter-summary" class="filter-summary" aria-live="polite" hidden></p>
     <div class="bar-end">

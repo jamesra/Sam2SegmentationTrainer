@@ -4102,6 +4102,15 @@
     });
   });
 
+  /** Shows the header links to the gallery's other pages: each one the server has switched on, except this one. */
+  function showPageLinks() {
+    const current = state.converter ? "converter" : (state.gold ? "gold" : "gallery");
+    const enabled = { gallery: true, converter: Boolean(state.config.converter), gold: Boolean(state.config.gold) };
+    for (const link of document.querySelectorAll("#page-links a[data-page]")) {
+      link.hidden = !enabled[link.dataset.page] || link.dataset.page === current;
+    }
+  }
+
   async function boot() {
     loadOverlayPrefs();
     loadCardSizePref();
@@ -4122,6 +4131,7 @@
         brushButton.hidden = false;
       }
     }
+    showPageLinks();
     const setsPayload = await getJson(
       state.converter ? "/api/training-sets?app=converter" : (state.gold ? "/api/training-sets?app=gold" : "/api/training-sets"),
     );

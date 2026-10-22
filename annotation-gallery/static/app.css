@@ -45,6 +45,13 @@ h1 {
   gap: 16px;
 }
 
+.page-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+}
+
 .site-link {
   color: var(--accent);
   font-size: 13px;

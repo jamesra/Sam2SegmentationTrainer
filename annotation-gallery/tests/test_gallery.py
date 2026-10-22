@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -277,6 +278,21 @@ def test_location_search_filters_and_sort_stacks() -> None:
     assert "SORTS_PER_COLUMN = 5" in js
     assert 'id="sort-add"' in js
     assert "maxSortRows" not in js
+
+
+def test_header_links_the_gallery_pages_to_each_other() -> None:
+    html = (GALLERY_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    nav = html.split('<nav id="page-links"', 1)[1].split("</nav>", 1)[0]
+    # Each page link starts hidden; boot shows the ones the server switched on, other than the page shown now.
+    for page, href in (("gallery", "/"), ("converter", "/converter/"), ("gold", "/gold/")):
+        assert re.search(rf'<a [^>]*data-page="{page}" href="{re.escape(href)}" hidden', nav)
+    assert 'href="https://tensor.codepharm.net"' in nav
+    show = js.split("function showPageLinks()", 1)[1].split("\n  }\n", 1)[0]
+    assert "state.config.converter" in show and "state.config.gold" in show
+    assert "link.dataset.page === current" in show
+    boot = js.split("async function boot()", 1)[1]
+    assert boot.index("showPageLinks();") < boot.index("/api/training-sets")
 
 
 def test_filters_collapse_to_a_summary_bar() -> None:
