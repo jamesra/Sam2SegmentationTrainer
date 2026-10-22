@@ -162,20 +162,30 @@ def parse_viking_xml(text: str, *, source: str, host: Optional[str] = None) -> V
     )
 
 
+RETRIES = 4
+
+
 def default_http_get(url: str, headers: Optional[Mapping[str, str]] = None) -> Tuple[int, Mapping[str, str], bytes]:
+    """GET one URL. A network hiccup (a DNS miss, a reset, a timeout, a 5xx) is retried with a growing wait; a 4xx is returned."""
+    import time
     import urllib.error
     import urllib.request
 
-    request = urllib.request.Request(url, headers={"Accept": "*/*", **(headers or {})})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
-    except urllib.error.HTTPError as error:
-        if error.code < 500:
-            return error.code, {k.lower(): v for k, v in error.headers.items()}, b""
-        raise TileSourceError(f"GET {url} failed: HTTP {error.code}") from error
-    except OSError as error:
-        raise TileSourceError(f"GET {url} failed: {error}") from error
+    last: Optional[Exception] = None
+    for attempt in range(RETRIES):
+        request = urllib.request.Request(url, headers={"Accept": "*/*", **(headers or {})})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
+        except urllib.error.HTTPError as error:
+            if error.code < 500:
+                return error.code, {k.lower(): v for k, v in error.headers.items()}, b""
+            last = error
+        except OSError as error:  # URLError (DNS, refused, reset) and timeouts
+            last = error
+        if attempt < RETRIES - 1:
+            time.sleep(1.5 * (2**attempt))
+    raise TileSourceError(f"GET {url} failed after {RETRIES} tries: {last}")
 
 
 def load_volume(source: str, *, host: Optional[str] = None, http_get: HttpGet = default_http_get) -> Volume:

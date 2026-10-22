@@ -361,3 +361,55 @@ def test_a_volume_specific_vikingxml_address_wins(monkeypatch) -> None:
     jobs.default_volume("RC1", env)
     jobs.default_volume("RC2", env)
     assert seen == ["http://odd/RABBIT/r.xml", "http://h/RC2/S.xml"]
+
+
+def test_a_network_hiccup_is_retried_and_a_404_is_not(monkeypatch) -> None:
+    import io
+    import urllib.error
+    import urllib.request
+
+    from converter import tilesource
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    calls = []
+
+    class Reply:
+        status = 200
+        headers = {"ETag": '"x"'}
+
+        def read(self):
+            return b"data"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def flaky(request, timeout=None):
+        calls.append(request.full_url)
+        if len(calls) < 3:
+            raise urllib.error.URLError("[Errno -5] No address associated with hostname")
+        return Reply()
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    assert tilesource.default_http_get("http://h/t.png")[0] == 200 and len(calls) == 3
+
+    calls.clear()
+
+    def missing(request, timeout=None):
+        calls.append(1)
+        raise urllib.error.HTTPError(request.full_url, 404, "nf", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(urllib.request, "urlopen", missing)
+    assert tilesource.default_http_get("http://h/t.png")[0] == 404 and len(calls) == 1
+
+    def down(request, timeout=None):
+        calls.append(1)
+        raise urllib.error.URLError("refused")
+
+    calls.clear()
+    monkeypatch.setattr(urllib.request, "urlopen", down)
+    with pytest.raises(tilesource.TileSourceError, match="after 4 tries"):
+        tilesource.default_http_get("http://h/t.png")
+    assert len(calls) == 4
