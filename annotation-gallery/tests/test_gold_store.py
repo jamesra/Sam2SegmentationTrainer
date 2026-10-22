@@ -273,3 +273,32 @@ def test_listing_and_resolving_sets(tmp_path: Path) -> None:
     for bad in ("gold-zzz", "gold-../a", "current"):
         with pytest.raises(FileNotFoundError):
             store.resolve_set(root, bad)
+
+
+def test_a_set_can_be_made_from_given_lists_and_reports_unusable_ids(tmp_path: Path) -> None:
+    sources = {"RC1": make_source(tmp_path / "src" / "RC1", locations=30, split=(3,), rejected=(9,)), "RC2": make_source(tmp_path / "src" / "RC2", locations=20)}
+    meta = store.create_set_from_lists(tmp_path / "gold", "gold_v1", "v3", sources, {"RC1": [5, 3, 9, 777, 5], "RC2": [1, 2]}, note="valsets")
+    assert meta["fromLists"] is True and meta["note"] == "valsets" and meta["name"] == "gold-gold_v1"
+    assert meta["volumes"]["RC1"]["used"] == [5, 3] and meta["volumes"]["RC1"]["multiWindow"] == 1
+    assert meta["volumes"]["RC1"]["skipped"] == {"notInSource": [777], "rejected": [9]}
+    assert meta["volumes"]["RC2"]["used"] == [1, 2] and "skipped" not in meta["volumes"]["RC2"]
+    rows = catalog.list_catalog_rows(tmp_path / "gold" / "gold-gold_v1" / "RC1")
+    assert sorted(r["location_id"] for r in rows) == [3, 5]
+
+
+def test_lists_need_ids_known_volumes_and_a_new_name(tmp_path: Path) -> None:
+    sources = {"RC1": make_source(tmp_path / "src" / "RC1", locations=10)}
+    with pytest.raises(store.GoldError, match="no location ids"):
+        store.create_set_from_lists(tmp_path / "gold", "a", "v3", sources, {"RC1": []})
+    with pytest.raises(store.GoldError, match="no source volume"):
+        store.create_set_from_lists(tmp_path / "gold", "a", "v3", sources, {"XX": [1]})
+    store.create_set_from_lists(tmp_path / "gold", "a", "v3", sources, {"RC1": [1]})
+    with pytest.raises(store.GoldError, match="already exists"):
+        store.create_set_from_lists(tmp_path / "gold", "a", "v3", sources, {"RC1": [1]})
+
+
+def test_a_list_made_set_has_no_replacement_order(tmp_path: Path) -> None:
+    source = make_source(tmp_path / "src" / "RC1", locations=10)
+    store.create_set_from_lists(tmp_path / "gold", "a", "v3", {"RC1": source}, {"RC1": [1, 2]})
+    with pytest.raises(store.GoldError, match="made from a list"):
+        store.draw_replacement(tmp_path / "gold" / "gold-a", "RC1", source, 1)

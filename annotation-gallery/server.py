@@ -1094,7 +1094,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (FileNotFoundError, ValueError):
             self._send_json({"error": "unknown source set"}, status=404)
             return
-        wanted = body.get("volumes")
+        lists = body.get("lists")
+        wanted = list(lists) if isinstance(lists, dict) and lists else body.get("volumes")
         volumes = [str(v) for v in wanted] if isinstance(wanted, list) and wanted else sorted(
             v for v, role in grants.items() if role == PERMISSION_REVIEW
         )
@@ -1103,7 +1104,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         try:
             sources = {v: crops_dir(source_registry, v) for v in volumes}
-            meta = gold_store.create_set(root, name, source_set, sources, n=count, seed=seed, stratify=stratify, band=band)
+            if isinstance(lists, dict) and lists:
+                parsed: dict[str, list[int]] = {}
+                for volume, text in lists.items():
+                    ids, bad = gold_draw.parse_id_list(str(text))
+                    if bad:
+                        raise gold_store.GoldError(f"{volume}: not location ids: {' '.join(bad[:5])}")
+                    parsed[str(volume)] = ids
+                meta = gold_store.create_set_from_lists(root, name, source_set, sources, parsed, note=str(body.get("note") or ""))
+            else:
+                meta = gold_store.create_set(root, name, source_set, sources, n=count, seed=seed, stratify=stratify, band=band)
         except (gold_store.GoldError, ValueError, FileNotFoundError) as error:
             self._send_json({"error": str(error)}, status=400)
             return

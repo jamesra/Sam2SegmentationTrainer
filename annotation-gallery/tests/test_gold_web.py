@@ -311,3 +311,28 @@ def test_the_gallery_and_its_catalog_are_untouched_by_a_draw(httpd, env: Path) -
     row = cards_of(httpd)[0]
     call(httpd, "POST", "/api/volumes/RC1/ignore?set=gold-g1", {"location_id": row["location_id"], "image_key": row["image_key"]})
     assert [(r["location_id"], r["ignored"]) for r in catalog.list_catalog_rows(source)] == before
+
+
+def test_a_set_can_start_from_uploaded_list_files(httpd, env: Path) -> None:
+    status, payload = call(httpd, "POST", "/api/gold/sets", {"name": "gold_v1", "lists": {"RC1": "3 5, 7\n# note\n9999", "RC2": "1,2"}})
+    assert status == 201 and payload["set"] == "gold-gold_v1"
+    volumes = payload["meta"]["volumes"]
+    assert volumes["RC1"]["used"] == [3, 5, 7] and volumes["RC1"]["skipped"] == {"notInSource": [9999]}
+    assert volumes["RC2"]["used"] == [1, 2] and payload["meta"]["fromLists"] is True
+    assert sorted(r["location_id"] for r in cards_of(httpd, "gold_v1")) == [3, 5, 7]
+    # The set is a normal gold set: it can be edited and approved.
+    row = cards_of(httpd, "gold_v1")[0]
+    assert call(httpd, "POST", "/api/volumes/RC1/approve?set=gold-gold_v1", {"location_id": row["location_id"], "image_key": row["image_key"]})[0] == 200
+
+
+def test_list_files_with_junk_or_unknown_volumes_are_refused(httpd) -> None:
+    status, answer = call(httpd, "POST", "/api/gold/sets", {"name": "x1", "lists": {"RC1": "12 abc"}})
+    assert status == 400 and "abc" in answer["error"]
+    assert call(httpd, "POST", "/api/gold/sets", {"name": "x2", "lists": {"NOPE": "1"}})[0] == 403
+    assert call(httpd, "POST", "/api/gold/sets", {"name": "x3", "lists": {"RC1": "# nothing"}})[0] == 400
+
+
+def test_replacements_are_refused_for_a_list_set(httpd) -> None:
+    call(httpd, "POST", "/api/gold/sets", {"name": "gold_v1", "lists": {"RC1": "3 5"}})
+    status, answer = call(httpd, "POST", "/api/gold/sets/gold-gold_v1/replacements", {"volume": "RC1"})
+    assert status == 400 and "made from a list" in answer["error"]

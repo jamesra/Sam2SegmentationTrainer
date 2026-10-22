@@ -394,7 +394,13 @@
   };
 
   async function goldCreate() {
+    const files = [...document.getElementById("gold-lists").files];
+    const lists = {};
+    for (const file of files) {
+      lists[file.name.replace(/\.[^.]*$/, "")] = await file.text();
+    }
     const body = {
+      ...(files.length ? { lists } : {}),
       name: document.getElementById("gold-name").value.trim(),
       sourceSet: document.getElementById("gold-source").value || "current",
       n: document.getElementById("gold-n").value,
@@ -415,13 +421,26 @@
       state.trainingSet = created.set;
       els.trainingSet.value = created.set;
       rememberView(true);
-      els.status.textContent = `Drew ${created.set} with seed ${created.meta.seed}.`;
+      els.status.textContent = files.length
+        ? `Made ${created.set} from ${files.length} list file(s).${skippedSummary(created.meta)}`
+        : `Drew ${created.set} with seed ${created.meta.seed}.`;
       await loadVolumes();
     } catch (error) {
       els.status.textContent = error.message;
     } finally {
       button.disabled = false;
     }
+  }
+
+  // A short note of ids a list could not use ("RC1: 2 not in source"), or nothing.
+  function skippedSummary(meta) {
+    const parts = [];
+    for (const [volume, info] of Object.entries(meta.volumes || {})) {
+      for (const [why, ids] of Object.entries(info.skipped || {})) {
+        parts.push(`${volume}: ${ids.length} ${why}`);
+      }
+    }
+    return parts.length ? ` Not used: ${parts.join("; ")}.` : "";
   }
 
   async function goldApplyList() {

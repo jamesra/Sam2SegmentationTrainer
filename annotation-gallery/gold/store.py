@@ -242,6 +242,67 @@ def create_set(
     return meta
 
 
+def create_set_from_lists(
+    root: Path,
+    name: str,
+    source_set: str,
+    sources: Dict[str, Path],
+    lists: Dict[str, Sequence[int]],
+    *,
+    note: str = "",
+) -> Dict[str, Any]:
+    """Make a gold set from given location ids per volume (for example the review lists ``sam2-em-valsets sample`` wrote).
+
+    Nothing is drawn: the ids are the sample. Ids that cannot be used are reported per volume with the reason. A location with
+    several crop windows contributes one (chosen as in a random draw, with seed 0). Replacement draws are not available for
+    such a set, since there is no seeded order behind it.
+    """
+    full = set_name(name)
+    set_dir = root / full
+    if set_dir.exists():
+        raise GoldError(f"{full} already exists")
+    if not lists or not any(lists.values()):
+        raise GoldError("the lists have no location ids")
+    unknown = sorted(set(lists) - set(sources))
+    if unknown:
+        raise GoldError(f"no source volume for: {', '.join(unknown)}")
+    meta: Dict[str, Any] = {
+        "name": full, "sourceSet": source_set, "seed": 0, "n": max(len(ids) for ids in lists.values()), "stratify": "",
+        "band": draw.DEFAULT_Z_BAND, "drawnAt": now(), "fromLists": True, "note": note, "volumes": {},
+    }
+    try:
+        for volume, ids in sorted(lists.items()):
+            source_crops = sources[volume]
+            pool = _source_pool(source_crops)
+            rejected = {int(r["location_id"]) for r in catalog.list_catalog_rows(source_crops) if r.get("ignored")}
+            crops = volume_crops(set_dir, volume)
+            crops.mkdir(parents=True, exist_ok=True)
+            added: List[int] = []
+            skipped: Dict[str, List[int]] = {"notInSource": [], "rejected": [], "noMask": []}
+            for location_id in dict.fromkeys(int(i) for i in ids):
+                if location_id in pool.rows:
+                    copy_card(source_crops, crops, window_for(pool, source_crops, 0, location_id))
+                    added.append(location_id)
+                elif location_id in pool.no_mask:
+                    skipped["noMask"].append(location_id)
+                elif location_id in rejected:
+                    skipped["rejected"].append(location_id)
+                else:
+                    skipped["notInSource"].append(location_id)
+            meta["volumes"][volume] = {
+                "fingerprint": draw.fingerprint(pool.ids), "poolSize": len(pool.ids), "drawn": len(added), "short": 0,
+                "multiWindow": len([i for i in added if i in set(pool.multi)]), "used": added,
+            }
+            left_out = {key: value for key, value in skipped.items() if value}
+            if left_out:
+                meta["volumes"][volume]["skipped"] = left_out
+        write_meta(set_dir, meta)
+    except BaseException:
+        shutil.rmtree(set_dir, ignore_errors=True)
+        raise
+    return meta
+
+
 def _volume_meta(meta: Dict[str, Any], volume: str) -> Dict[str, Any]:
     volumes = meta.get("volumes") or {}
     if volume not in volumes:
@@ -296,6 +357,8 @@ def apply_id_list(
 def draw_replacement(set_dir: Path, volume: str, source_crops: Path, count: int = 1) -> List[int]:
     """Add the next ``count`` unused ids of the set's seeded order (for rejected cards). Same seed, same replacements."""
     meta = read_meta(set_dir)
+    if meta.get("fromLists"):
+        raise GoldError("this set was made from a list, so there is no seeded order to draw replacements from; add ids with Open list")
     info = _volume_meta(meta, volume)
     pool = _source_pool(source_crops)
     if draw.fingerprint(pool.ids) != info.get("fingerprint"):
