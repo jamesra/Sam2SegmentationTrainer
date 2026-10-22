@@ -758,6 +758,12 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_gold_read(match.group(1), match.group(2), (query.get("volume") or [""])[0])
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/gold/cards", path)
+        if match:
+            crops = self._granted_crops(match.group(1))
+            if crops is not None:
+                self._send_json({"cards": gold_store.cards(crops)})
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/converter/(cards|batch)", path)
         if match:
             self._handle_converter_read(match.group(1), match.group(2))

@@ -28,7 +28,9 @@
   // Last training set, and the volume last opened inside each set.
   const VIEW_KEY = "galleryView";
   // The converter page (/converter/) remembers its own view, so it never overwrites the gallery's.
-  const VIEW_STORAGE_KEY = window.ConverterMode && window.ConverterMode.onConverterPath(location.pathname) ? "converterView" : VIEW_KEY;
+  const VIEW_STORAGE_KEY = window.ConverterMode && window.ConverterMode.onConverterPath(location.pathname)
+    ? "converterView"
+    : (window.GoldMode && window.GoldMode.onGoldPath(location.pathname) ? "goldView" : VIEW_KEY);
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
   const CACHE_MAX = 80;
 
@@ -39,6 +41,9 @@
     trainingSet: "current",
     // True on /converter/ when the server has the converter switched on (see converter.js).
     converter: false,
+    // True on /gold/ when the server has gold sets switched on (see gold.js).
+    gold: false,
+    goldProgress: null,
     noStructures: false,
     rows: [],
     permission: "read",
@@ -237,9 +242,9 @@
         frame: els.viewerFrame,
         maskCanvas: els.viewerMask,
         getHue: () => viewer.hue,
-        persists: () => state.converter,
+        persists: () => state.converter || state.gold,
         onChange: (polygon) => {
-          if (state.converter) {
+          if (state.converter || state.gold) {
             saveRetrace(polygon).catch((error) => {
               els.status.textContent = error.message;
             });
@@ -270,7 +275,8 @@
     const locationId = viewer.locationId;
     const imageKey = viewer.imageKey;
     const volume = state.volume;
-    const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/converter/edit`), {
+    const editPath = state.gold ? "gold/edit" : "converter/edit";
+    const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/${editPath}`), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -280,7 +286,12 @@
       }),
     });
     const row = viewerRow();
-    if (row) {
+    if (row && state.gold) {
+      row.gold = { ...(row.gold || {}), edited: result.edited ? 1 : 0, changed_pixels: result.changed_pixels, approved_by: null };
+      if (result.unapproved) {
+        row.approved = 0;
+      }
+    } else if (row) {
       row.loss = 1 - Number(result.iou);
       row.conv = { ...(row.conv || {}), iou: result.iou, reason: "retraced" };
     }
@@ -300,7 +311,159 @@
     resetVisibleCards();
     paintViewer();
     placeViewerInfo();
-    els.status.textContent = `Retrace saved to the converter batch (${Math.round(Number(result.iou) * 100)}% overlap with the current outline). The database is not changed.`;
+    els.status.textContent = state.gold
+      ? `Retrace saved to the gold card (${result.changed_pixels} px differ from the source mask).${result.unapproved ? " Its approval was withdrawn: approve it again." : ""}`
+      : `Retrace saved to the converter batch (${Math.round(Number(result.iou) * 100)}% overlap with the current outline). The database is not changed.`;
+  }
+
+  // Gold: card facts, progress, the export link and whether rejected cards need a replacement.
+  async function refreshGold(volume, trainingSet, isLatest) {
+    try {
+      const [cards, progress] = await Promise.all([
+        getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/gold/cards`)),
+        getJson(`/api/gold/sets/${encodeURIComponent(trainingSet)}/progress`),
+      ]);
+      if (!isLatest()) {
+        return;
+      }
+      window.GoldMode.attachCards(state.rows, cards.cards);
+      state.goldProgress = (progress.progress || {})[volume] || null;
+    } catch {
+      state.goldProgress = null;
+    }
+    document.getElementById("gold-progress").textContent = window.GoldMode.progressLine(volume, state.goldProgress);
+    const link = document.getElementById("gold-export");
+    link.href = window.GoldMode.exportHref(trainingSet, volume);
+    link.hidden = false;
+    document.getElementById("gold-replace").hidden = !window.GoldMode.needsReplacement(state.goldProgress);
+  }
+
+  // Gold dialogs: draw a sample, open a list of ids, draw replacements.
+  const goldUi = {
+    dialog: document.getElementById("gold-dialog"),
+    listDialog: document.getElementById("gold-list-dialog"),
+    file: document.getElementById("gold-list-file"),
+    listText: "",
+  };
+
+  async function goldCreate() {
+    const body = {
+      name: document.getElementById("gold-name").value.trim(),
+      sourceSet: document.getElementById("gold-source").value || "current",
+      n: document.getElementById("gold-n").value,
+      seed: document.getElementById("gold-seed").value,
+      stratify: document.getElementById("gold-stratify").value,
+    };
+    const button = document.getElementById("gold-start");
+    button.disabled = true;
+    try {
+      const created = await getJson("/api/gold/sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      goldUi.dialog.hidden = true;
+      const sets = await getJson("/api/training-sets?app=gold");
+      els.trainingSet.innerHTML = (sets.sets || []).map((name) => `<option value="${name}">${name}</option>`).join("");
+      state.trainingSet = created.set;
+      els.trainingSet.value = created.set;
+      rememberView(true);
+      els.status.textContent = `Drew ${created.set} with seed ${created.meta.seed}.`;
+      await loadVolumes();
+    } catch (error) {
+      els.status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function goldApplyList() {
+    const mode = document.getElementById("gold-list-mode").value;
+    const send = (force) => getJson(`/api/gold/sets/${encodeURIComponent(state.trainingSet)}/list`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ volume: state.volume, text: goldUi.listText, mode, force }),
+    });
+    let result;
+    try {
+      try {
+        result = await send(false);
+      } catch (error) {
+        if (!/approved/.test(error.message) || !window.confirm(`${error.message}. Replace anyway?`)) {
+          throw error;
+        }
+        result = await send(true);
+      }
+    } catch (error) {
+      els.status.textContent = error.message;
+      return;
+    }
+    goldUi.listDialog.hidden = true;
+    const skipped = Object.entries(result.skipped || {}).map(([why, ids]) => `${ids.length} ${why}`);
+    els.status.textContent = `Added ${result.added.length} location(s); now ${result.cards} cards.${skipped.length ? ` Not used: ${skipped.join(", ")}.` : ""}${(result.notIds || []).length ? ` Ignored text: ${result.notIds.join(" ")}.` : ""}`;
+    await loadCatalog(false, true);
+  }
+
+  async function goldReplacements() {
+    const missing = state.goldProgress ? state.goldProgress.target - state.goldProgress.cards : 1;
+    try {
+      const result = await getJson(`/api/gold/sets/${encodeURIComponent(state.trainingSet)}/replacements`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ volume: state.volume, count: Math.max(1, missing) }),
+      });
+      els.status.textContent = `Added ${result.added.length} replacement location(s) from the seeded order.`;
+      await loadCatalog(false, true);
+    } catch (error) {
+      els.status.textContent = error.message;
+    }
+  }
+
+  if (document.getElementById("gold-draw")) {
+    document.getElementById("gold-draw").addEventListener("click", async () => {
+      try {
+        const sets = await getJson("/api/training-sets");
+        document.getElementById("gold-source").innerHTML = (sets.sets || ["current"])
+          .map((name) => `<option value="${name}"${name === "current" ? " selected" : ""}>${name}</option>`)
+          .join("");
+      } catch {
+        document.getElementById("gold-source").innerHTML = '<option value="current">current</option>';
+      }
+      goldUi.dialog.hidden = false;
+      document.getElementById("gold-name").focus();
+    });
+    document.getElementById("gold-start").addEventListener("click", () => {
+      goldCreate();
+    });
+    document.getElementById("gold-cancel").addEventListener("click", () => {
+      goldUi.dialog.hidden = true;
+    });
+    document.getElementById("gold-list").addEventListener("click", () => {
+      if (!state.volume) {
+        els.status.textContent = "Open a gold set and pick a volume first.";
+        return;
+      }
+      goldUi.file.value = "";
+      goldUi.file.click();
+    });
+    goldUi.file.addEventListener("change", async () => {
+      const file = goldUi.file.files && goldUi.file.files[0];
+      if (!file) {
+        return;
+      }
+      goldUi.listText = await file.text();
+      document.getElementById("gold-list-file-name").textContent = `${file.name} for ${state.volume}`;
+      goldUi.listDialog.hidden = false;
+    });
+    document.getElementById("gold-list-start").addEventListener("click", () => {
+      goldApplyList();
+    });
+    document.getElementById("gold-list-cancel").addEventListener("click", () => {
+      goldUi.listDialog.hidden = true;
+    });
+    document.getElementById("gold-replace").addEventListener("click", () => {
+      goldReplacements();
+    });
   }
 
   function syncRetraceButton() {
@@ -1972,6 +2135,12 @@
         batchLink.hidden = false;
       }
     }
+    if (state.gold) {
+      await refreshGold(volume, trainingSet, isLatest);
+      if (!isLatest()) {
+        return;
+      }
+    }
     indexCatalog();
     if (!preserveViewer && viewer.locationId && !state.rows.some((row) => String(row.location_id) === viewer.locationId && visibleClasses().has(reviewClass(row)))) {
       closeViewer();
@@ -2242,6 +2411,9 @@
     }
     if (state.converter && row.conv) {
       lines.push(...window.ConverterMode.infoLines(row.conv));
+    }
+    if (state.gold && row.gold) {
+      lines.push(...window.GoldMode.infoLines(row.gold));
     }
     if (viewer.negatives) {
       const count = viewer.negatives.count;
@@ -3866,7 +4038,19 @@
       window.ConverterMode.applyChrome(document);
       document.getElementById("converter-build").hidden = false;
     }
-    const setsPayload = await getJson(state.converter ? "/api/training-sets?app=converter" : "/api/training-sets");
+    state.gold = Boolean(window.GoldMode && window.GoldMode.active(location.pathname, state.config));
+    if (state.gold) {
+      window.GoldMode.applyChrome(document);
+      document.getElementById("gold-draw").hidden = false;
+      document.getElementById("gold-list").hidden = false;
+    }
+    const setsPayload = await getJson(
+      state.converter ? "/api/training-sets?app=converter" : (state.gold ? "/api/training-sets?app=gold" : "/api/training-sets"),
+    );
+    if (state.gold && !(setsPayload.sets && setsPayload.sets.length)) {
+      els.status.textContent = "No gold set yet. Press Draw sample to make one.";
+      return;
+    }
     if (state.converter && !(setsPayload.sets && setsPayload.sets.length)) {
       // Nothing built yet: offer the volumes the user can review, so the first structure can be built. The volume list
       // must not load the gallery's own data, so changes are swallowed until a structure exists.
@@ -3889,7 +4073,7 @@
     const rememberedSet = readView().set;
     state.trainingSet = sets.includes(rememberedSet)
       ? rememberedSet
-      : (state.converter ? setsPayload.default || sets[0] : (sets.includes("current") ? "current" : sets[0]));
+      : ((state.converter || state.gold) ? setsPayload.default || sets[0] : (sets.includes("current") ? "current" : sets[0]));
     els.trainingSet.innerHTML = sets
       .map((name) => `<option value="${name}">${name}</option>`)
       .join("");
