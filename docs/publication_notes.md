@@ -53,7 +53,12 @@ All defined in `docs/depth_relative_trust.md`:
   rule; 5% of area would not (the outer 0.05 R of a disc is 9.75% of its area).
 - **2026-10-25 Retire `circle_pull_through`.** The synthetic circle across the target's edge stood in for a carried
   circle; real carried circles and polygons replace it (with the next run; removing a family changes the prompt
-  layout).
+  layout). Its v5 record (training only; it has no validation family): drawn for 8.3% of variants (configured 5%),
+  70,302 in epoch 5 with 237 (0.3%) falling back to `circle_seed`; the hardest family by training loss, median 0.50,
+  0.30, 0.29, 0.26, 0.24, 0.23 over epochs 0-5 (TensorBoard `train/loss_by_prompt`, sampled points), 1.3-1.5x
+  `circle_seed` throughout, about 1.1x `circle_annotator` after epoch 0. It was still improving, and it is v5's only
+  training on circles that cross the cell's edge, so retiring it depends on the export giving carried circles to
+  enough targets (v5 link coverage was low: 619 of 40,998 RPC1 and 581 of 13,024 RPC2 locations had a linked outline).
 - **2026-10-25 A real carried circle always replaces the simulated circle seeds** for a target that has one passing the
   overlap rule; validation keeps the simulated families everywhere for comparability.
 - **2026-10-25 Carried shapes need at least 60% of their area on the target**, the rule `adjacent_poly_seed` used; the
