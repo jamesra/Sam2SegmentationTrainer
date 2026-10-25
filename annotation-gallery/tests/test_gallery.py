@@ -1460,3 +1460,69 @@ def test_missing_crops_dir_is_404(
 
     monkeypatch.setattr("server.crops_dir", gone)
     assert _call(httpd, route, "RC2", "review") == (404, {"error": "not found"})
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def test_odata_read_retries_a_failed_connection(monkeypatch):
+    import server
+    from urllib.error import URLError
+
+    calls = []
+
+    def flaky(request, timeout):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            raise URLError(OSError(-5, "No address associated with hostname"))
+        return _FakeResponse(b'{"ID": 7}')
+
+    monkeypatch.setattr(server, "urlopen", flaky)
+    monkeypatch.setattr(server, "ODATA_RETRY_DELAY_SECONDS", 0)
+    assert server.fetch_odata_location("https://example.test/RPC2/OData", 7) == {"ID": 7}
+    assert len(calls) == 2
+
+
+def test_odata_read_gives_up_after_the_last_attempt(monkeypatch):
+    import server
+    from urllib.error import URLError
+
+    calls = []
+
+    def down(request, timeout):
+        calls.append(1)
+        raise URLError(OSError(-5, "No address associated with hostname"))
+
+    monkeypatch.setattr(server, "urlopen", down)
+    monkeypatch.setattr(server, "ODATA_RETRY_DELAY_SECONDS", 0)
+    with pytest.raises(URLError):
+        server.fetch_odata_location("https://example.test/RPC2/OData", 7)
+    assert len(calls) == server.ODATA_ATTEMPTS
+
+
+def test_odata_read_does_not_retry_an_http_error(monkeypatch):
+    import server
+    from urllib.error import HTTPError
+
+    calls = []
+
+    def missing(request, timeout):
+        calls.append(1)
+        raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(server, "urlopen", missing)
+    monkeypatch.setattr(server, "ODATA_RETRY_DELAY_SECONDS", 0)
+    with pytest.raises(HTTPError):
+        server.fetch_odata_location("https://example.test/RPC2/OData", 7)
+    assert len(calls) == 1

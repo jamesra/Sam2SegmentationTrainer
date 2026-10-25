@@ -211,6 +211,32 @@ def structure_ids_for_tag_pattern(
     return ids
 
 
+ODATA_ATTEMPTS = 3
+ODATA_RETRY_DELAY_SECONDS = 1.0
+
+
+def _read_odata_json(url: str) -> Any:
+    """GET *url* as JSON, retrying connection-level failures.
+
+    The first DNS lookup from the container after a quiet spell can fail once (Docker Desktop's
+    resolver, "No address associated with hostname") and succeed on the next try. HTTP error
+    statuses are real answers from the service and are raised at once.
+    """
+    for attempt in range(1, ODATA_ATTEMPTS + 1):
+        request = Request(url, headers={"Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError:
+            raise
+        except URLError as exc:
+            print(f"annotation-gallery OData request failed (attempt {attempt}/{ODATA_ATTEMPTS}): {url}: {exc}",
+                  file=sys.stderr, flush=True)
+            if attempt == ODATA_ATTEMPTS:
+                raise
+            time.sleep(ODATA_RETRY_DELAY_SECONDS)
+
+
 def fetch_odata_location(base_url: str, location_id: int) -> dict[str, Any]:
     """Read one location's MosaicShape and LastModified from an OData service root."""
     query = urlencode(
@@ -221,9 +247,7 @@ def fetch_odata_location(base_url: str, location_id: int) -> dict[str, Any]:
         safe="(),$=",
     )
     url = f"{base_url.rstrip('/')}/Locations({int(location_id)})?{query}"
-    request = Request(url, headers={"Accept": "application/json"})
-    with urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = _read_odata_json(url)
     if not isinstance(payload, dict) or "ID" not in payload:
         raise ValueError("OData location response has no ID")
     return payload
@@ -236,9 +260,7 @@ def _odata_values(url: str, *, pages: int = 40) -> list[dict[str, Any]]:
     for _ in range(pages):
         if not next_url:
             break
-        request = Request(next_url, headers={"Accept": "application/json"})
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = _read_odata_json(next_url)
         rows.extend(item for item in (payload.get("value") or []) if isinstance(item, dict))
         next_url = payload.get("@odata.nextLink")
     return rows
