@@ -43,7 +43,9 @@ target's carried circles where it already reads the target:
 ```json
 {"location_id": 102, "z": 205, "structure_id": 77, "structure_label": "BC", "has_mask": true,
  "centroid": [x, y], "area": 1234.5, "linked": [[103, 206]], "polygons": [...],
- "linked_circles": [{"location_id": 101, "z": 204, "center": [dx, dy], "radius": r, "overlap": 0.83}]}
+ "linked_circles": [{"location_id": 101, "z": 204, "center": [dx, dy], "radius": r, "overlap": 0.83,
+                     "provenance": {"source_center": [x, y], "source_radius": r0,
+                                    "source_modified": "2026-10-12T14:03:22Z", "mapping": "9f2c41d0a7e3"}}]}
 ```
 
 - `linked` keeps its meaning: polygon locations whose outlines are lines of the same file. Circles have no outline
@@ -57,8 +59,17 @@ target's carried circles where it already reads the target:
   its overlap; the trainer filters.
 - One circle linked to polygons on both sides (z - 1 and z + 1) appears in both polygons' arrays.
 - Same structure only, `|dz| <= LINK_MAX_DZ`, both ends in the export. A polygon with no linked circle gets `[]`.
-- Where the carry came from (stos group, correction set provenance, residual convention) is per volume, so it goes in
-  the export report, not on every circle.
+- `provenance`: what the carried values were made from, kept apart so it is never read as the prompt. The trainer
+  ignores it; the exporter uses it to keep the carried circles current (below).
+  - `source_center`, `source_radius`: the circle as it is in its own section, mosaic pixels at downsample 1, absolute
+    (the location's `X, Y` and its true `Radius`).
+  - `source_modified`: the circle location's `LastModified`, so an edit that keeps the same position and radius (or a
+    re-save) is still seen.
+  - `mapping`: a thumbprint of the carry from section `z` to the polygon's section: the stos group's name and the
+    digests of the two sections' stos transforms, the correction set's manifest id and the digests of the two sections'
+    vfields, the residual convention, and the carry code's version. The same pair of sections always gives the same
+    thumbprint until one of those inputs changes.
+- The stos group, correction set and convention are also summarised per volume in the export report.
 
 ### The carry, done at export
 
@@ -75,6 +86,22 @@ For each pair, map five points, the centre and the east, north, west and south r
 `center` is the mapped centre. `radius` is the true radius times the mean of `|mapped rim - mapped centre| / radius`
 over the four rim points. A circle is exported only when its centre and all four rim points map; one that fails at any
 point lies at the edge of a transform's coverage, is left out and is counted in the export report.
+
+### Keeping carried circles current
+
+`shapes.jsonl` is rebuilt on every run (`-Update`, `-Repair`, `-Cleanup`), but the carry need not be recomputed for
+every circle. For each linked circle the exporter compares the stored `provenance` with the current one and carries
+again only when:
+
+- the circle changed: its `source_center`, `source_radius` or `source_modified` differs from the circle record now;
+- the carry changed: the `mapping` thumbprint for its pair of sections differs, because the correction service
+  published a new set, a stos transform was re-registered, the convention changed, or the carry code was improved;
+- the polygon changed, which changes `overlap` (and, if its section's transform changed, `mapping` already says so);
+  `overlap` is cheap, so it is recomputed for every circle on every run.
+
+Unchanged circles keep their stored `center`, `radius` and `provenance`. The export report counts circles carried
+again per reason, so a new correction set shows up as "mapping changed" on the sections it touched. A thumbprint
+computed once per section pair per run keeps the check cheap.
 
 ### Overlap, recorded for the trainer's filter
 
@@ -122,7 +149,9 @@ distribution, and the production-equality check above.
 Five-point carry and mean-scale radius on a synthetic grid transform and vfield; a circle whose rim partly fails to map
 is left out; the overlap value (a disc fully inside, half inside, and a polygon with a hole under the disc); the
 `linked_circles` array on the right polygon line, in the centroid-relative frame; link resolution circle <-> polygon
-(same structure, dz limit, both directions); `shapes.jsonl` is rebuilt by `-Update` without restitching crops.
+(same structure, dz limit, both directions); `shapes.jsonl` is rebuilt by `-Update` without restitching crops; the
+`mapping` thumbprint is stable for unchanged inputs and changes with each of its inputs; an `-Update` carries again
+exactly the circles whose source or mapping changed and keeps the rest.
 
 ## 2. Trainer
 
