@@ -177,4 +177,5 @@ robust to oversized circles and drifted carries.
 ## Reference
 
 Hildebrand T., Rüegsegger P. (1997). A new method for the model-independent assessment of thickness in
-three-dimensional images. *Journal of Microscopy* 185(1), 67-75.
+three-dimensional images. *Journal of Microscopy* 185(1), 67-75. Full entry and how it is used:
+`docs/publication_notes.md`.

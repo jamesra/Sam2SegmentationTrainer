@@ -112,7 +112,7 @@ the cell. It is computed exactly (shapely intersection of the disc and the polyg
 bounding box).
 
 Nothing is dropped for overlap at export. The trainer keeps a circle only when `overlap >= 0.60`
-(`prompt.adjacent_circle.overlap_min`, the `adjacent_poly_seed` and `circle_pull_through` value), so the threshold can
+(`prompt.adjacent_circle.overlap_min`, the `adjacent_poly_seed` value), so the threshold can
 change without a re-export. The export report shows the overlap distribution per volume, so the share a carry loses to
 drift is visible before training.
 
@@ -196,7 +196,7 @@ exactly the circles whose source or mapping changed and keeps the rest.
 - Encoded with the tapered seed trust (section 3); plus the circle's centre as a foreground point when the centre lies
   inside the cell, as for the other circle seeds.
 - **A real carried circle always wins over a simulated one.** When the target has at least one linked circle that
-  passes the overlap rule, the simulated circle families (`circle_seed`, `circle_annotator`, `circle_pull_through`)
+  passes the overlap rule, the simulated circle families (`circle_seed`, `circle_annotator`)
   are not drawn for that sample, and their combined share goes to `adjacent_circle_seed`. A target with several passing
   circles (z +/- 1, z +/- 2) may use a different one for each of its circle variants, drawn without replacement like
   the families. The simulated families remain only where no real carried circle exists. Validation keeps the simulated
@@ -220,15 +220,22 @@ exactly the circles whose source or mapping changed and keeps the rest.
   the variant is drawn again.
 - **Production** keeps every island as its own prompt and returns one mask per island, so a branching process comes
   back as several masks; the client merges or de-duplicates overlapping results.
-- The target mask is never part of a prompt (no union of the carried shape with the target): that would teach copying,
-  and production has no target mask.
+- The target mask is never part of a prompt: that would teach copying, and production has no target mask.
 - No simulated circle is derived from a linked polygon.
 
 ### Validation family `adjacent_circle`
 
 Real carried circles, scored like `circle_mask` (core recall, leak, merge rate, spill, fragmentation), split by
-volume and by carried-centre depth, so the production workflow has its own curve. Kept separate from the synthetic
-`circle_pull_through`.
+volume and by carried-centre depth, so the production workflow has its own curve.
+
+### Retired: `circle_pull_through`
+
+The synthetic circle drawn across the target's own edge (5%, `prompt.prob_circle_pull_through`,
+`prompt.circle_pull_through.*`) stood in for a circle carried from another section. Real carried circles and carried
+polygons replace it, so it is removed from the training mix and the config; its share goes to `adjacent_circle_seed`
+and `adjacent_poly_seed` where a target has a passing carried shape, and to `circle_seed` and `circle_annotator`
+elsewhere. Removing a family changes the prompt layout, which the resume check refuses, so this lands with the next
+run (the v7 model), not in a running one. `docs/circle_annotator_spec.md` and `README.md` drop its section then.
 
 ### Does the model match the object to the circle's size?
 
@@ -252,7 +259,7 @@ It should learn to, but only as far as training shows it, so it is measured rath
 ## 3. Prompt encoding v7: tapered circle seeds
 
 Today a circle seed is a disc encoded with the edge curve `+SEED_LOGIT * c(d)`. v7 encodes every foreground circle
-seed (`circle_seed`, `circle_annotator`, `circle_pull_through`, `adjacent_circle_seed`) and every carried polygon
+seed (`circle_seed`, `circle_annotator`, `adjacent_circle_seed`) and every carried polygon
 (`adjacent_poly_seed`) by a depth-relative trust instead: `+SEED_LOGIT * w(rho)` with `rho = 1 - d / D`, `d` a pixel's
 distance from the shape's edge and `D` the shape's maximum depth; `w = 1` for `rho <= full_frac` (0.5) and a
 half-cosine to 0 at `zero_frac = circle_diameter_scale` (0.95). For a circle of TRUE radius `R`, `d = R - |p - c|` and
@@ -283,8 +290,10 @@ Other polygon seeds (`subset_seed`), corrections and painted masks keep `c(d)`.
 
 1. Eval-only taper comparison on v5.4 (in progress) -> decide v7 parameters.
 2. Exporter: links that include circles, `linked_circles` on `shapes.jsonl`, production-equality check, report.
-3. Trainer: v7 encoding, `adjacent_circle_seed`, oversize augmentation, `adjacent_circle` and `circle_oversize`
-   validation, overview images (`scripts/make_prompt_overview.py --families adjacent_circle_seed`).
+3. Trainer: v7 encoding (depth-relative trust with local thickness and islands), `adjacent_circle_seed`, the
+   depth-tapered `adjacent_poly_seed` from `linked_polygons`, oversize augmentation, `circle_pull_through` retired,
+   `adjacent_circle` and `circle_oversize` validation, the size map and wrong-object rate, overview images
+   (`scripts/make_prompt_overview.py --families adjacent_circle_seed,adjacent_poly_seed`).
 4. Train the next model on v7.
 5. Proto, server v7 encoder, Viking clients; then the carry in auto-segment.
 
