@@ -7,7 +7,7 @@ family later" note in `circle_annotator_spec.md` ("Not in this change").
 
 In production an annotator often marks a cell as a circle on one section and a polygon on the next. Viking can carry
 the circle to the adjacent section: its centre goes through the section correction service, and auto-segment should
-then segment the cell there from the carried circle. For non-terminal circle annotations that would add the
+then segment the cell there from the carried circle. For circles linked onward to other sections that would add the
 neighbouring sections' outlines automatically.
 
 v5 never trained on that prompt:
@@ -22,37 +22,43 @@ v5 never trained on that prompt:
 
 ## Design summary
 
-1. The exporter writes, per volume, every circle that is linked to a polygon within `LINK_MAX_DZ` (2) sections, already
-   carried into the polygon's section: centre and radius in the polygon section's mosaic pixels.
+1. The exporter writes, on each polygon's `shapes.jsonl` line, every circle linked to it within `LINK_MAX_DZ` (2)
+   sections, already carried into the polygon's section, with the share of the carried disc on the polygon.
 2. The trainer adds an `adjacent_circle_seed` prompt family that uses those circles where they land, encoded with the
    radius-relative tapered seed trust (new prompt encoding, see below), and an `adjacent_circle` validation family.
 3. The server builds the same tapered seed from a circle the client sends (proto change, to follow the user's
-   instructions), and Viking's auto-segment carries non-terminal circles to adjacent sections.
+   instructions), and Viking's auto-segment carries linked circles to adjacent sections.
 
 ## 1. Export (nornir `segmentationtraining`)
 
 ### What is exported
 
-Only circles linked to a polygon, not every circle (about 2M circles exist; only the linked ones are prompts).
+Only circles linked to a polygon, not every circle (about 2M circles exist; only the linked ones are prompts). The link
+is all that matters: a circle linked to a polygon within `LINK_MAX_DZ` (2) sections continues that process into the
+polygon's section, so no carry runs past the end of a process and no terminal flag is needed.
 
-A new file `{Output}/adjacent_circles.jsonl`, one line per (circle, linked polygon) pair:
+They go on the polygon's own `shapes.jsonl` line, as a new `linked_circles` array beside `linked`, so the trainer finds a
+target's carried circles where it already reads the target:
 
 ```json
-{"circle_location_id": 101, "circle_z": 204, "polygon_location_id": 102, "polygon_z": 205,
- "structure_id": 77, "terminal": false,
- "source": {"center": [x, y], "radius": r},
- "carried": {"center": [x, y], "radius": r, "rim_mapped": 4},
- "transform": {"stos_group": "SliceToVolume1", "correction_set": "<manifest provenance id>", "convention": "+n-t"}}
+{"location_id": 102, "z": 205, "structure_id": 77, "structure_label": "BC", "has_mask": true,
+ "centroid": [x, y], "area": 1234.5, "linked": [[103, 206]], "polygons": [...],
+ "linked_circles": [{"location_id": 101, "z": 204, "center": [dx, dy], "radius": r, "overlap": 0.83}]}
 ```
 
-- `source`: the circle in its own section's mosaic pixels at downsample 1, centre from the location's `X, Y` and the
-  true radius (`Radius`; never scaled by the exporter, as for `circle_annotations.json`).
-- `carried`: the same circle in the *polygon's* section mosaic pixels at downsample 1, so the trainer draws it in the
-  polygon's crops with no transform of its own (the crop key gives the crop origin).
-- `terminal`: the circle location's Viking terminal flag, so production-like subsets (non-terminal circles) can be
-  selected; training uses every linked circle.
-- One circle linked to two polygons (z - 1 and z + 1) gives two lines.
-- Same structure only, `|dz| <= LINK_MAX_DZ`, both ends in the export.
+- `linked` keeps its meaning: polygon locations whose outlines are lines of the same file. Circles have no outline
+  line, so they are not mixed into it (a consumer that looks a `linked` id up as an outline would break on a circle).
+- `center`: the carried circle's centre in the polygon's section, relative to the polygon's `centroid` like the
+  polygon's own points (mosaic pixels at downsample 1), so circle and outline share one frame and the trainer draws the
+  circle in the polygon's crops with no transform of its own.
+- `radius`: the carried TRUE radius (the drawn `Radius` carried by the five-point mean scale; never scaled by
+  `circle_diameter_scale`, as for `circle_annotations.json`).
+- `overlap`: the share of the carried disc's area inside the polygon (below). Every linked circle is exported whatever
+  its overlap; the trainer filters.
+- One circle linked to polygons on both sides (z - 1 and z + 1) appears in both polygons' arrays.
+- Same structure only, `|dz| <= LINK_MAX_DZ`, both ends in the export. A polygon with no linked circle gets `[]`.
+- Where the carry came from (stos group, correction set provenance, residual convention) is per volume, so it goes in
+  the export report, not on every circle.
 
 ### The carry, done at export
 
@@ -66,25 +72,22 @@ For each pair, map five points, the centre and the east, north, west and south r
    carries a location to the adjacent section;
 3. corrected volume -> polygon mosaic (`polygon_z`), through the inverse of the polygon section's transform.
 
-`carried.center` is the mapped centre. `carried.radius` is the true radius times the mean of
-`|mapped rim - mapped centre| / radius` over the rim points that mapped (`rim_mapped` says how many). A pair whose centre
-does not map, or whose rim maps for no point, is not written and is counted in the export report.
+`center` is the mapped centre. `radius` is the true radius times the mean of `|mapped rim - mapped centre| / radius`
+over the four rim points. A circle is exported only when its centre and all four rim points map; one that fails at any
+point lies at the edge of a transform's coverage, is left out and is counted in the export report.
 
-### Overlap rule: at least 60% of the carried circle on the polygon
+### Overlap, recorded for the trainer's filter
 
-A pair is written only when at least 60% (`OVERLAP_MIN`, the `adjacent_poly_seed` and `circle_pull_through` value) of
-the carried disc's area lies inside the polygon. The disc is the carried circle at its carried TRUE radius (not scaled
-by `circle_diameter_scale`), the polygon is the whole target outline in its own mosaic pixels with its holes, not a
-crop of it, so the decision is the same for every crop of the cell. The exporter computes it exactly (shapely
-intersection of the disc and the polygon, or a fine raster of the disc's bounding box) and records it as
-`carried.overlap` on each line:
+On every linked circle the exporter records `overlap`, the share of the carried disc's area inside the polygon. The
+disc is the carried circle at its carried TRUE radius (not scaled by `circle_diameter_scale`); the polygon is the whole
+target outline in its own mosaic pixels with its holes, not a crop of it, so the value is the same for every crop of
+the cell. It is computed exactly (shapely intersection of the disc and the polygon, or a fine raster of the disc's
+bounding box).
 
-```json
-"carried": {"center": [x, y], "radius": r, "rim_mapped": 4, "overlap": 0.83}
-```
-
-Pairs below the threshold are excluded from the file and counted in the export report, with their overlap
-distribution, so the share a carry loses to drift is visible per volume.
+Nothing is dropped for overlap at export. The trainer keeps a circle only when `overlap >= 0.60`
+(`prompt.adjacent_circle.overlap_min`, the `adjacent_poly_seed` and `circle_pull_through` value), so the threshold can
+change without a re-export. The export report shows the overlap distribution per volume, so the share a carry loses to
+drift is visible before training.
 
 The trainer's `data/projection.py` already implements steps 1-3 for outlines (grid stos only; groups where every section
 maps straight to one reference section, so RC2, RPC1, RPC2 `SliceToVolume1`; RC1's chained `grid16` is reported and
@@ -109,31 +112,30 @@ of its 15% share). If links are being lost (filtering, structure mismatch, dz li
 
 ### Export report
 
-Per volume: circle-polygon pairs found, written, skipped (no map, unsupported stos group, missing correction set,
-overlap below 60%), the overlap distribution of written and excluded pairs, the carried-centre distance to the
+Per volume: circle-polygon links found, circles written, skipped (centre or a rim point does not map, unsupported stos
+group, missing correction set), the overlap distribution and the share at or above 0.60, the carried-centre distance to the
 polygon's centroid and the carried centre's depth in the polygon (median, quartiles), radius / inscribed-radius
 distribution, and the production-equality check above.
 
 ### Tests (nornir)
 
-Five-point carry and mean-scale radius on a synthetic grid transform and vfield; a pair whose rim partly fails to map;
-the overlap rule (a disc at 0.59 and at 0.61 of its area inside, a polygon with a hole under the disc); link resolution
-circle <-> polygon (same structure, dz limit, both directions); the file is rebuilt by `-Update` without restitching
-crops, like `shapes.jsonl`.
+Five-point carry and mean-scale radius on a synthetic grid transform and vfield; a circle whose rim partly fails to map
+is left out; the overlap value (a disc fully inside, half inside, and a polygon with a hole under the disc); the
+`linked_circles` array on the right polygon line, in the centroid-relative frame; link resolution circle <-> polygon
+(same structure, dz limit, both directions); `shapes.jsonl` is rebuilt by `-Update` without restitching crops.
 
 ## 2. Trainer
 
 ### Prompt family `adjacent_circle_seed`
 
-- Loaded per volume by `build_tile_context` from `adjacent_circles.jsonl`; no projection at load time (the file is
-  already in the target's mosaic pixels).
+- Loaded per volume by `build_tile_context` from the `linked_circles` arrays of `shapes.jsonl`; no projection at load
+  time (each circle is already in its polygon's section, relative to the polygon's centroid).
 - Drawn for a sample whose target polygon has at least one carried circle (generator `[seed, epoch, index, k, 6]`,
   one circle when there are several). Elsewhere its share moves to the other circle families, like
   `adjacent_poly_seed`.
 - The circle is used where it lands, at its carried radius, not clipped and not re-centred: drift is the point.
-- Only pairs with at least 60% of the carried disc on the polygon reach the trainer (the export's overlap rule). The
-  dataset checks `carried.overlap >= prompt.adjacent_circle.overlap_min` (0.60) again on load, so an older or
-  hand-made file cannot slip a looser pair in; a pair that fails is dropped and counted in
+- Kept only when `overlap >= prompt.adjacent_circle.overlap_min` (0.60): the export records every linked circle's
+  overlap and the trainer applies the threshold on load, counting the circles below it in
   `train/prompt_fallback/adjacent_circle_seed`. The rule is on the whole cell, so a circle that passes is used in every
   crop of it, even one where little of the disc falls in the tile.
 - Encoded with the tapered seed trust (section 3); plus the circle's centre as a foreground point when the centre lies
@@ -167,13 +169,13 @@ overlap rule and the area-average reduction are unchanged. Polygon seeds, correc
 - Proto: the client sends a circle seed as a circle (centre and true radius), so the server can build `w(rho)`; the
   exact message comes from the user's proto instructions. Clients stop rasterizing circle seeds and never scale them.
 - Server: v7 encoder for circle seeds; v6 path unchanged for models that declare it.
-- Viking: auto-segment carries non-terminal circles to the adjacent section (centre through the correction service,
+- Viking: auto-segment carries linked circles to the adjacent section (centre through the correction service,
   radius by the five-point mean scale) and requests a segmentation from the carried circle, once a v7 model is served.
 
 ## Order
 
 1. Eval-only taper comparison on v5.4 (in progress) -> decide v7 parameters.
-2. Exporter: links that include circles, `adjacent_circles.jsonl`, production-equality check, report.
+2. Exporter: links that include circles, `linked_circles` on `shapes.jsonl`, production-equality check, report.
 3. Trainer: v7 encoding, `adjacent_circle_seed`, oversize augmentation, `adjacent_circle` and `circle_oversize`
    validation, overview images (`scripts/make_prompt_overview.py --families adjacent_circle_seed`).
 4. Train the next model on v7.
