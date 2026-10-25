@@ -164,7 +164,9 @@ of its 15% share). If links are being lost (filtering, structure mismatch, dz li
 ### Export report
 
 Per volume: circle-polygon links found, circles written, skipped (centre or a rim point does not map, unsupported stos
-group, missing correction set), the overlap distribution and the share at or above 0.60, the carried-centre distance to the
+group, missing correction set), the overlap distribution and the share at or above 0.60, the **size map** (carried
+circle radius over the target polygon's maximum depth, and for carried polygons their maximum depth over the target's:
+`docs/depth_relative_trust.md`, section 9; the oversized circles stand out here before any training), the carried-centre distance to the
 polygon's centroid and the carried centre's depth in the polygon (median, quartiles), radius / inscribed-radius
 distribution, and the production-equality check above.
 
@@ -206,11 +208,20 @@ exactly the circles whose source or mapping changed and keeps the rest.
 ### `adjacent_poly_seed`: carried at export, depth-tapered
 
 - Read from `linked_polygons` (no load-time projection), kept when `overlap >= 0.60` like a carried circle.
-- Encoded with the same depth-relative trust as circle seeds (section 3) instead of today's U(0, 10) px erosion: full
-  trust deeper than half the carried polygon's maximum depth, a cosine fall to 0 at `circle_diameter_scale` (0.95) of the
-  way to the edge, nothing in the outer 5% of depth. Only the main body is used: of the parts deeper than half the
-  maximum depth, the largest connected one and the falling zone joined to it; smaller islands (a second lobe through a
-  narrow neck, a thin process) give no prompt.
+- Encoded with the same depth-relative trust as circle seeds (section 3) instead of today's U(0, 10) px erosion, with
+  depth normalised by **local thickness** (`docs/depth_relative_trust.md`, section 4): each part of the carried polygon
+  is trusted relative to its own width, so a thin branch keeps a core of its own instead of being erased by a large
+  body's depth. A circle is unchanged by this (its local and global depths are equal).
+- The trusted cores split the carried polygon into **islands** (section 5), each with the falling zone nearest to it;
+  islands smaller than a minimum core area (outline noise) are dropped.
+- **Training** prompts a target with the islands that lie on it (trust-weighted overlap at least 0.60, section 6). A
+  carried polygon linked to two targets (a process that branches between sections) prompts each target with its own
+  island, so the model is trained to find a smaller branch as well as the main body. If no island lies on the target,
+  the variant is drawn again.
+- **Production** keeps every island as its own prompt and returns one mask per island, so a branching process comes
+  back as several masks; the client merges or de-duplicates overlapping results.
+- The target mask is never part of a prompt (no union of the carried shape with the target): that would teach copying,
+  and production has no target mask.
 - No simulated circle is derived from a linked polygon.
 
 ### Validation family `adjacent_circle`
@@ -246,9 +257,11 @@ seed (`circle_seed`, `circle_annotator`, `circle_pull_through`, `adjacent_circle
 distance from the shape's edge and `D` the shape's maximum depth; `w = 1` for `rho <= full_frac` (0.5) and a
 half-cosine to 0 at `zero_frac = circle_diameter_scale` (0.95). For a circle of TRUE radius `R`, `d = R - |p - c|` and
 `D = R`, so `rho = |p - c| / R`: exactly `circle_trust()` used positively, computed analytically. For a polygon it comes
-from the distance transform, keeping only the main body (the largest part deeper than `full_frac`, with the falling
-zone joined to it). Negatives, the overlap rule and the area-average reduction are unchanged. Other polygon seeds
-(`subset_seed`), corrections and painted masks keep `c(d)`.
+from the distance transform with `D` the local thickness, split into islands (see the `adjacent_poly_seed` section).
+The equations, the circle special case and the island and overlap rules are written out in
+`docs/depth_relative_trust.md`. The excluded outer band is 5% of the (local) depth, not of the area: that is what makes
+the polygon rule reduce to the circle rule. Negatives, the overlap rule and the area-average reduction are unchanged.
+Other polygon seeds (`subset_seed`), corrections and painted masks keep `c(d)`.
 
 - New `PROMPT_ENCODING_VERSION` (`edge-confidence-v7`), recorded in the export metadata with the seed trust's
   `full_frac` and `zero_frac`; the server implements v7 beside v6 and picks by the model's manifest, so v5.4 keeps v6.
