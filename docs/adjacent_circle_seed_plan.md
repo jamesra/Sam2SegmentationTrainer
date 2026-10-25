@@ -128,6 +128,30 @@ empirically on linked pairs (`mask_refinement_plan.md`, section 3.1). The export
 (the correction service's own carry, `GrpcSectionCorrectionService`), and the export report must show, on a sample of
 pairs, that the exported carried centre equals the one Viking computes for the same circle.
 
+### Linked polygons carried the same way
+
+A polygon linked to the target polygon within `LINK_MAX_DZ` sections is carried at export through exactly the same
+pipeline as a circle (stos group, published residual correction, inverse of the target section's transform), every
+ring point mapped, and stored on the target's line beside `linked_circles`:
+
+```json
+"linked_polygons": [{"location_id": 103, "z": 206, "polygons": [[[[dx, dy], ...], ...]], "overlap": 0.91,
+                     "provenance": {"source_centroid": [x, y], "source_area": a0,
+                                    "source_modified": "2026-10-11T09:12:40Z", "mapping": "9f2c41d0a7e3"}}]
+```
+
+- `polygons`: the carried rings, relative to the target's `centroid` like the target's own points.
+- `overlap`: the share of the carried polygon's area inside the target polygon (whole cell, holes included); the
+  trainer filters at 0.60, as for circles.
+- `provenance`: as for circles; the source polygon's centroid, area and `LastModified` stand for "the polygon was
+  edited", and `mapping` is the same section-pair thumbprint, so a new correction set re-carries polygons and circles
+  together.
+- A point that fails to map leaves the whole polygon out (counted in the report).
+- `linked` stays as it is (the ids of linked polygons on their own lines); `linked_polygons` is the carried copy.
+
+This replaces the trainer's load-time projection (`data/projection.py`, which becomes the shared carry code the
+exporter calls), so adjacent polygons and carried circles cannot disagree.
+
 ### Links
 
 `shapes.py` builds `linked` only between polygon locations it exports, so a circle-polygon link is dropped today. The
@@ -179,6 +203,16 @@ exactly the circles whose source or mapping changed and keeps the rest.
 - The realised share then follows the data (how many targets have a passing linked circle); the epoch log reports it
   with the per-family counts.
 
+### `adjacent_poly_seed`: carried at export, depth-tapered
+
+- Read from `linked_polygons` (no load-time projection), kept when `overlap >= 0.60` like a carried circle.
+- Encoded with the same depth-relative trust as circle seeds (section 3) instead of today's U(0, 10) px erosion: full
+  trust deeper than half the carried polygon's maximum depth, a cosine fall to 0 at `circle_diameter_scale` (0.95) of the
+  way to the edge, nothing in the outer 5% of depth. Only the main body is used: of the parts deeper than half the
+  maximum depth, the largest connected one and the falling zone joined to it; smaller islands (a second lobe through a
+  narrow neck, a thin process) give no prompt.
+- No simulated circle is derived from a linked polygon.
+
 ### Validation family `adjacent_circle`
 
 Real carried circles, scored like `circle_mask` (core recall, leak, merge rate, spill, fragmentation), split by
@@ -207,10 +241,14 @@ It should learn to, but only as far as training shows it, so it is measured rath
 ## 3. Prompt encoding v7: tapered circle seeds
 
 Today a circle seed is a disc encoded with the edge curve `+SEED_LOGIT * c(d)`. v7 encodes every foreground circle
-seed (`circle_seed`, `circle_annotator`, `circle_pull_through`, `adjacent_circle_seed`) by its radius instead:
-`+SEED_LOGIT * w(rho)`, `rho = |p - c| / R` with `R` the TRUE radius, `w = 1` for `rho <= full_frac` (0.5) and a
-half-cosine to 0 at `zero_frac = circle_diameter_scale` (0.95): `circle_trust()` used positively. Negatives, the
-overlap rule and the area-average reduction are unchanged. Polygon seeds, corrections and painted masks keep `c(d)`.
+seed (`circle_seed`, `circle_annotator`, `circle_pull_through`, `adjacent_circle_seed`) and every carried polygon
+(`adjacent_poly_seed`) by a depth-relative trust instead: `+SEED_LOGIT * w(rho)` with `rho = 1 - d / D`, `d` a pixel's
+distance from the shape's edge and `D` the shape's maximum depth; `w = 1` for `rho <= full_frac` (0.5) and a
+half-cosine to 0 at `zero_frac = circle_diameter_scale` (0.95). For a circle of TRUE radius `R`, `d = R - |p - c|` and
+`D = R`, so `rho = |p - c| / R`: exactly `circle_trust()` used positively, computed analytically. For a polygon it comes
+from the distance transform, keeping only the main body (the largest part deeper than `full_frac`, with the falling
+zone joined to it). Negatives, the overlap rule and the area-average reduction are unchanged. Other polygon seeds
+(`subset_seed`), corrections and painted masks keep `c(d)`.
 
 - New `PROMPT_ENCODING_VERSION` (`edge-confidence-v7`), recorded in the export metadata with the seed trust's
   `full_frac` and `zero_frac`; the server implements v7 beside v6 and picks by the model's manifest, so v5.4 keeps v6.
