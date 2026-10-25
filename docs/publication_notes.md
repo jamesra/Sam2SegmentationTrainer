@@ -67,6 +67,20 @@ All defined in `docs/depth_relative_trust.md`:
   traced polygon (accurate radius) and annotator circles, whose radii are unreliable, were only negatives, so only the
   negatives were tapered (v6, Oct 15). In production the seed is the annotator's circle, often oversized; the eval-only
   comparison on v5.4 is `docs/circle_seed_trust_eval.md`.
+- **2026-10-25 Taper measured on v5.4 (inference only): helps oversized circles, costs recall on accurate ones; do not
+  serve it on v5.4, train v7 with it.** Full v5 validation split, 26,494 samples per family, plain disc (edge
+  confidence) vs tapered seed (`full_frac` 0.5, `zero_frac` 0.95), same model (`serve_epoch4.pt`):
+  - `circle_oversize` (inscribed x 1.2-2): IoU 0.763 to 0.797, spill 0.166 to 0.131 (-21%), fragmentation 0.173 to
+    0.116 (-33%), merge rate 0.56% to 0.48%, core recall 0.977 to 0.979.
+  - `circle_mask` (inscribed x 0.95): IoU 0.895 to 0.895, spill 0.032 to 0.025, core recall 0.979 to 0.972, share of
+    samples at the core-recall target 70.7% to 64.8%.
+  - `circle_annotator` (annotator-like, smaller than inscribed): IoU 0.877 to 0.871, core recall 0.966 to 0.947, at the
+    target 61.1% to 55.5%, spill 0.030 to 0.023.
+  The baseline itself shows the problem: an oversized circle drops v5.4 from IoU 0.895 to 0.763, with 5x the spill and
+  28x the merge rate of an accurate circle. A model trained on full discs reads the taper's weaker rim as "smaller
+  object", so it shrinks every mask: good for oversized circles, a loss of recall for accurate and small ones. Training
+  with the taper (v7) and the oversize augmentation should keep the spill reduction without the recall loss; that is the
+  next measurement. Results: `/outputs/eval_v5.4_circle_seed_{edge,taper}`, `eval_v5.4_circle_seed_compare.txt`.
 - **2026-10-25 Oversize augmentation and `circle_oversize` validation.** The annotator-like jitter only draws circles
   smaller than the inscribed one (`scale_range` 0.45-1.0 of depth), so training never showed an oversized circle; about
   10% of circle seeds scaled 1.2-2x, kept modest so the size cue survives.

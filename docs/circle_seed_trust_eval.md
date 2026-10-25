@@ -85,3 +85,21 @@ to a differently encoded seed at inference: a fair test of whether the taper lim
 (`circle_oversize`, and `circle_annotator`), and a check of how much it costs on accurate circles (`circle_mask`). A
 gain here argues for training with the taper; a loss on `circle_mask` may only mean the model has not learned it. The
 taper would need its own encoding version and server support before any model trained with it is served.
+
+## Result: v5.4, 2026-10-25
+
+Full v5 split (27,959 samples, 26,494 per circle family), `serve_epoch4.pt`, `val.batch_size=2`, plain disc (`off`)
+against the tapered seed (`on`, `full_frac` 0.5, `zero_frac` 0.95). Output: `/outputs/eval_v5.4_circle_seed_edge`,
+`/outputs/eval_v5.4_circle_seed_taper`, comparison `/outputs/eval_v5.4_circle_seed_compare.txt`.
+
+| Family | IoU off / on | core recall off / on | at target off / on | spill off / on | merge off / on | frag off / on |
+| --- | --- | --- | --- | --- | --- | --- |
+| `circle_mask` | 0.895 / 0.895 | 0.979 / 0.972 | 70.7% / 64.8% | 0.032 / 0.025 | 0.02% / 0.02% | 0.061 / 0.057 |
+| `circle_annotator` | 0.877 / 0.871 | 0.966 / 0.947 | 61.1% / 55.5% | 0.030 / 0.023 | 0.01% / 0.00% | 0.061 / 0.064 |
+| `circle_oversize` | 0.763 / 0.797 | 0.977 / 0.979 | 80.9% / 78.8% | 0.166 / 0.131 | 0.56% / 0.48% | 0.173 / 0.116 |
+
+The with_neg and no_neg splits move the same way. Reading: v5.4 was trained on full-strength discs, so the taper's
+weaker rim reads as a smaller object and every mask shrinks. That removes a fifth of the spill and a third of the
+fragmentation for oversized circles but costs core recall on accurate and small ones. The taper is not served on v5.4;
+it is the training encoding for v7, where the model learns what the taper means (`docs/adjacent_circle_seed_plan.md`,
+section 3).
