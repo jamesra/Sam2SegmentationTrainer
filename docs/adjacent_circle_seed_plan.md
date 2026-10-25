@@ -169,13 +169,40 @@ exactly the circles whose source or mapping changed and keeps the rest.
   crop of it, even one where little of the disc falls in the tile.
 - Encoded with the tapered seed trust (section 3); plus the circle's centre as a foreground point when the centre lies
   inside the cell, as for the other circle seeds.
-- Starting share 10-15%, taken from `circle_seed` and `circle_annotator`; check the realised share in the epoch log.
+- **A real carried circle always wins over a simulated one.** When the target has at least one linked circle that
+  passes the overlap rule, the simulated circle families (`circle_seed`, `circle_annotator`, `circle_pull_through`)
+  are not drawn for that sample, and their combined share goes to `adjacent_circle_seed`. A target with several passing
+  circles (z +/- 1, z +/- 2) may use a different one for each of its circle variants, drawn without replacement like
+  the families. The simulated families remain only where no real carried circle exists. Validation keeps the simulated
+  families on every sample, so their curves stay comparable across epochs and models, and adds `adjacent_circle` where
+  a real circle exists.
+- The realised share then follows the data (how many targets have a passing linked circle); the epoch log reports it
+  with the per-family counts.
 
 ### Validation family `adjacent_circle`
 
 Real carried circles, scored like `circle_mask` (core recall, leak, merge rate, spill, fragmentation), split by
 volume and by carried-centre depth, so the production workflow has its own curve. Kept separate from the synthetic
 `circle_pull_through`.
+
+### Does the model match the object to the circle's size?
+
+It should learn to, but only as far as training shows it, so it is measured rather than assumed:
+
+- The seed reaches SAM2 as a dense `mask_input` that the trained `mask_downscaling` network reads, extent included,
+  and every training seed is paired with the cell it lies in, so the model learns to prefer the object whose extent
+  agrees with the prompt.
+- The tapered seed's fully trusted core (`rho <= full_frac`) says "at least this much is object". A thin process cannot
+  fill the core of a circle drawn on a soma, so where a circle overlaps a large soma and a small process the core
+  favours the soma and only the fading rim can reach the process. An annotated neighbour also arrives as a negative,
+  which rules it out directly.
+- The oversize augmentation (1.2-2x) and real carried circles (radius / inscribed median 0.87, wide spread) teach
+  that the object can be smaller than the circle, which weakens the size cue. Keep the oversize share modest (about
+  10%) and let the core carry the size.
+- Measure it: split every circle family's metrics by the circle's radius over the target's inscribed radius, and count
+  a **wrong-object** outcome (the result misses the target's core but covers most of another annotated profile under
+  the circle), which merge rate and spill only partly catch. A model that maps a soma circle to a small process shows
+  up there, by size ratio.
 
 ## 3. Prompt encoding v7: tapered circle seeds
 
