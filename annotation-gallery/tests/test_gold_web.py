@@ -336,3 +336,51 @@ def test_replacements_are_refused_for_a_list_set(httpd) -> None:
     call(httpd, "POST", "/api/gold/sets", {"name": "gold_v1", "lists": {"RC1": "3 5"}})
     status, answer = call(httpd, "POST", "/api/gold/sets/gold-gold_v1/replacements", {"volume": "RC1"})
     assert status == 400 and "made from a list" in answer["error"]
+
+
+def test_refresh_redraws_a_card_from_odata_discarding_edits_and_approval(httpd, env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    import refresh
+
+    draw_set(httpd)
+    row = cards_of(httpd)[0]
+    key, location_id = row["image_key"], row["location_id"]
+    crops = env / "gold-g1" / "RC1"
+    redrawn = np.zeros((16, 16), dtype=bool)
+    redrawn[2:6, 3:9] = True
+
+    def mask_job_for_crop(output, location, image_key, polygons, **window):
+        assert (location, image_key) == (location_id, key) and (window["width"], window["height"]) == (16, 16)
+        return types.SimpleNamespace(mask_path=str(Path(output) / "masks" / f"{image_key}_{location}.png"))
+
+    def run_mask_jobs(jobs, workers):
+        for job in jobs:
+            Path(job.mask_path).parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(redrawn.astype(np.uint8) * 255).save(job.mask_path)
+
+    support = types.SimpleNamespace(
+        location_from_odata_entity=lambda entity, include_off_edge: types.SimpleNamespace(wkt="POLYGON", type_code="x"),
+        parse_wkt_polygons=lambda wkt: ["ring"],
+        hydrate_polygons=lambda polygons, type_code: polygons,
+        mask_job_for_crop=mask_job_for_crop,
+        run_mask_jobs=run_mask_jobs,
+    )
+    monkeypatch.setattr(refresh, "nornir_buildmanager_root", lambda: Path("/nornir"))
+    monkeypatch.setattr("server.nornir_buildmanager_root", lambda: Path("/nornir"))
+    monkeypatch.setattr(refresh, "load_add_support", lambda root: support)
+    monkeypatch.setattr("server.fetch_odata_location", lambda url, location: {"ID": location})
+
+    rect = [[2, 2], [9, 2], [9, 9], [2, 9], [2, 2]]
+    call(httpd, "POST", "/api/volumes/RC1/gold/edit?set=gold-g1", {"location_id": location_id, "image_key": key, "rings": [rect]})
+    call(httpd, "POST", "/api/volumes/RC1/approve?set=gold-g1", {"location_id": location_id, "image_key": key})
+
+    status, answer = call(httpd, "POST", "/api/volumes/RC1/refresh-location?set=gold-g1", {"location_id": location_id})
+
+    assert status == 200 and answer["imageKeys"] == [key]
+    for folder in ("masks", "source_masks"):
+        assert ((np.asarray(Image.open(crops / folder / f"{key}_{location_id}.png")) > 127) == redrawn).all()
+    card = {c["location_id"]: c for c in store.cards(crops)}[location_id]
+    assert card["edited"] == 0 and card["changed_pixels"] == 0 and card["approved_by"] is None and card["approved_sha1"] is None
+    assert card["mask_sha1"] == card["source_mask_sha1"] == store.sha1_of(crops / "masks" / f"{key}_{location_id}.png")
+    assert (location_id, key) not in catalog.load_approved(crops)

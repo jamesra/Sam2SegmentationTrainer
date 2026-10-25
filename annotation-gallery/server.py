@@ -1579,11 +1579,14 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"OData lookup failed: {exc}"}, status=502)
             return
         try:
-            keys = refresh_location(crops, entity, exporter)
+            if gold_store.SET_NAME.fullmatch(self._registry().name):
+                keys = gold_web.refresh_card(crops, location_id, entity)
+            else:
+                keys = refresh_location(crops, entity, exporter)
         except RefreshUnavailable as exc:
             self._send_json({"error": str(exc)}, status=503)
             return
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, gold_web.EditRejected) as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
         drop_stale_thumbnails(crops, keys)

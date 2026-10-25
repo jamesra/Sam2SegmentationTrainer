@@ -116,6 +116,78 @@ def apply_edit(crops: Path, location_id: int, image_key: str, *, rings: Any = No
     }
 
 
+def refresh_card(crops: Path, location_id: int, entity: Dict[str, Any]) -> List[str]:
+    """Redraw a card's mask from the location's current OData outline and discard its edits.
+
+    A gold card has no per-image annotation json for nornir's refresh to find its crop window by, so the window
+    comes from the card's image key and the mask is rasterized into a scratch folder. The result replaces both the
+    working mask and the ``source_masks/`` original, the card goes back to unedited, and an approval it held is
+    withdrawn, as an edit does. Returns the card's image key.
+    """
+    import tempfile
+
+    from refresh import (
+        _KEY_WINDOW, RefreshUnavailable, drop_stale_thumbnails, load_add_support, nornir_buildmanager_root,
+    )
+
+    card = {item["location_id"]: item for item in store.cards(crops)}.get(int(location_id))
+    if card is None:
+        raise EditRejected("no such card")
+    image_key = str(card["image_key"])
+    window = _KEY_WINDOW.match(image_key)
+    image_path = next((path for path in (crops / "images" / f"{image_key}.png", crops / "images" / f"{image_key}.jpg")
+                       if path.is_file()), None)
+    if window is None or image_path is None:
+        raise EditRejected("the card's crop image is missing")
+    root = nornir_buildmanager_root()
+    if root is None:
+        raise RefreshUnavailable("Mask refresh needs the nornir-buildmanager mount. No masks were changed.")
+    try:
+        support = load_add_support(root)
+    except ImportError as exc:
+        raise RefreshUnavailable(f"Mask refresh could not import nornir-buildmanager from the mount. ({exc})") from exc
+    record = support.location_from_odata_entity(entity, include_off_edge=True)
+    if record is None:
+        raise ValueError("OData location has no mask geometry")
+    polygons = support.hydrate_polygons(support.parse_wkt_polygons(record.wkt), record.type_code)
+    if not polygons:
+        raise ValueError("OData location has no mask geometry")
+    downsample = float(int(window["d"]))
+    with Image.open(image_path) as picture:
+        width, height = picture.size
+    with tempfile.TemporaryDirectory() as scratch:
+        job = support.mask_job_for_crop(
+            Path(scratch), int(location_id), image_key, polygons,
+            origin_x=int(window["x0"]) * downsample, origin_y=int(window["y0"]) * downsample,
+            downsample=downsample, width=width, height=height,
+        )
+        if job is None:
+            raise ValueError("the location's outline no longer falls inside this card's crop")
+        support.run_mask_jobs([job], workers=1)
+        drawn = Path(job.mask_path)
+        if not drawn.is_file():
+            raise ValueError("the mask could not be redrawn")
+        mask = _read_mask(drawn)
+    mask_name = f"{image_key}_{int(location_id)}.png"
+    _write_mask(crops / "masks" / mask_name, mask)
+    _write_mask(crops / "source_masks" / mask_name, mask)
+    digest = store.sha1_of(crops / "masks" / mask_name)
+    if (int(location_id), image_key) in catalog.load_approved(crops):
+        catalog.unapprove_window(crops, int(location_id), image_key)
+    connection = store._connect(crops)
+    try:
+        connection.execute(
+            "UPDATE gold_cards SET edited = 0, changed_pixels = 0, mask_sha1 = ?, source_mask_sha1 = ?, approved_by = NULL, "
+            "approved_at = NULL, approved_sha1 = NULL WHERE location_id = ?",
+            [digest, digest, int(location_id)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    drop_stale_thumbnails(crops, [image_key])
+    return [image_key]
+
+
 def record_approval(crops: Path, location_id: int, who: str) -> Optional[Dict[str, Any]]:
     """Pin an approval to the card's current mask: who, when, and the mask's hash."""
     cards = {card["location_id"]: card for card in store.cards(crops)}
