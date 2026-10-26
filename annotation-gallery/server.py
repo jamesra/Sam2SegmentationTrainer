@@ -67,6 +67,8 @@ from converter import jobs as converter_jobs
 from converter import odata as odata_module
 from converter import web as converter_web
 from converter.builder import BuildParams
+from converter.tilesource import load_volume as load_viking_volume
+import score as score_module
 from gold import draw as gold_draw
 from gold import store as gold_store
 from gold import web as gold_web
@@ -1644,7 +1646,39 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
         drop_stale_thumbnails(crops, keys)
-        self._send_json({"ok": True, "location_id": location_id, "imageKeys": keys})
+        score = self._score_refreshed(volume, crops, entity)
+        self._send_json({"ok": True, "location_id": location_id, "imageKeys": keys, "score": score})
+
+    def _score_refreshed(self, volume: str, crops: Path, entity: dict[str, Any]) -> dict[str, Any] | None:
+        """Score the refreshed location with the current model (see score.py) and store it as the card's SAM2 badge.
+
+        Uses the converter's segmentation server (``GALLERY_SEGMENTATION_TARGET``) and the volume's tiles. A failure
+        is returned as ``{"error": ...}``; the refresh itself has already succeeded. ``GALLERY_SCORE_ON_REFRESH=0``
+        turns this off (None).
+        """
+        if os.environ.get("GALLERY_SCORE_ON_REFRESH", "1").strip().lower() in ("0", "false", "no", "off"):
+            return None
+        source = self._volume_source(volume)
+        tiles = source.get("tiles") if isinstance(source.get("tiles"), dict) else {}
+        viking_xml = (str(tiles.get("vikingXml")).strip() or None) if tiles.get("vikingXml") else None
+        tile_base = (str(tiles.get("base")).strip() or None) if tiles.get("base") else None
+        make_volume = converter_jobs.OVERRIDES.get("make_volume", converter_jobs.default_volume)
+        if viking_xml:
+            def load_volume() -> Any:
+                return load_viking_volume(viking_xml, host=tile_base)
+        else:
+            def load_volume() -> Any:
+                return make_volume(volume)
+        return score_module.score_after_refresh(
+            crops,
+            volume,
+            entity,
+            make_client=converter_jobs.OVERRIDES.get("make_client", converter_jobs.default_client),
+            load_volume=load_volume,
+            volume_key=viking_xml or volume,
+            make_cache=converter_jobs.OVERRIDES.get("make_cache", converter_jobs.tile_cache),
+            semaphore=converter_jobs.streams(),
+        )
 
     def _handle_import_location(self, volume: str) -> None:
         """Look a location id up in OData and, when the volume has the crop images, import it."""

@@ -1724,7 +1724,19 @@
   }
 
   function captionHtml(row) {
-    const sam2 = row.sam2GtIou == null ? "" : `<span class="badge">SAM2 ${Number(row.sam2GtIou).toFixed(2)}</span>`;
+    // score.py stores "v5.4 at D16" when a large object had to be scored whole at a coarser level than its crops.
+    const coarse = /\bat D(\d+)$/.exec(row.sam2Checkpoint || "");
+    const sam2Title = [
+      "SAM2 from a seed circle: IoU with this mask",
+      row.sam2Checkpoint ? `model ${row.sam2Checkpoint}` : "",
+      coarse ? `too large for one card at its own level, so scored whole at D${coarse[1]}, coarser than the model `
+        + "trained on: large objects score lower here than in training" : "",
+      row.sam2PredIou != null ? `model's own estimate ${Number(row.sam2PredIou).toFixed(2)}` : "",
+      row.sam2ScoredAt ? `scored ${row.sam2ScoredAt}` : "",
+    ].filter(Boolean).join("; ");
+    const sam2 = row.sam2GtIou == null
+      ? ""
+      : `<span class="badge" title="${sam2Title}">SAM2 ${Number(row.sam2GtIou).toFixed(2)}${coarse ? ` · D${coarse[1]}` : ""}</span>`;
     const loss = row.loss == null ? "" : `<span class="badge">${state.converter ? "change" : "loss"} ${Number(row.loss).toFixed(state.converter ? 2 : 3)}</span>`;
     const structureName = row.type_name || "Structure";
     const structureText = row.structure_id == null ? structureName : `${structureName} ${row.structure_id}`;
@@ -3877,6 +3889,44 @@
     });
   }
 
+  // The refresh also scores the location with the current segmentation model (score.py on the server). Its numbers go
+  // on the location's rows and captions at once, without reloading the catalog.
+  function applyRefreshScore(locationId, score) {
+    if (!score || score.error || score.sam2GtIou == null) {
+      return;
+    }
+    const id = String(locationId);
+    for (const row of state.rows) {
+      if (String(row.location_id) === id) {
+        row.sam2GtIou = score.sam2GtIou;
+        row.sam2PredIou = score.sam2PredIou;
+        row.sam2Checkpoint = score.sam2Checkpoint;
+        row.sam2ScoredAt = score.sam2ScoredAt;
+      }
+    }
+    state.hasSam2 = true;
+    els.grid.querySelectorAll(`article.card[data-id="${id}"]`).forEach((card) => {
+      const row = state.rows.find(
+        (item) => String(item.location_id) === id && (item.image_key || "") === (card.dataset.key || "")
+      );
+      const caption = card.querySelector(".meta-row > div");
+      if (row && caption) {
+        caption.innerHTML = captionHtml(row);
+      }
+    });
+  }
+
+  function refreshScoreText(score) {
+    if (!score) {
+      return "";
+    }
+    if (score.error) {
+      return ` Not scored: ${score.error}`;
+    }
+    const model = score.sam2Checkpoint ? ` (${score.sam2Checkpoint})` : "";
+    return ` SAM2 ${Number(score.sam2GtIou).toFixed(2)}${model}.`;
+  }
+
   async function refreshLocation(locationId) {
     const id = Number(locationId);
     if (refreshMarks.get(id) === "busy") {
@@ -3895,10 +3945,11 @@
       layerEpoch += 1;
       setRefreshMark(id, "done");
       repaintLocation(id);
+      applyRefreshScore(id, result.score);
       const count = (result.imageKeys || []).length;
-      els.status.textContent = count
+      els.status.textContent = (count
         ? `Refreshed ${count} crop mask${count === 1 ? "" : "s"}.`
-        : "No existing crop for that location.";
+        : "No existing crop for that location.") + refreshScoreText(result.score);
       if (!els.viewer.hidden && String(openId) === String(locationId)) {
         const row = state.rows.find((item) =>
           String(item.location_id) === String(openId) && (item.image_key || "") === (openKey || "")
