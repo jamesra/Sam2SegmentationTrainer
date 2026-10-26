@@ -14,6 +14,7 @@ loads it when it reads or edits a matching file. After adding or editing a `.cur
 | Rule | Applies to |
 |------|-----------|
 | `.cursor/rules/sam2-pin.mdc` | `docker/Dockerfile` and SAM2 integration (pin `SAM2_GIT_SHA`; tell James when upstream `main` is newer, never unpin silently) |
+| `.cursor/rules/circle-centre-xy.mdc` | Circle annotations in the converter, gallery and exporter: centre is OData `X`, `Y`, never the first point or any average of the `CIRCULARSTRING` ring; `Radius` is mosaic-only. |
 | `.cursor/rules/naming-conventions.mdc` | Naming or exporting training sets (`v#.#`) and models (`v<VERSION>.<EPOCH>`), their metadata sidecars (`training_set.json`, `<stem>.model.json` with an operator `description`), `scripts/WSL/**`, `export_serve.py`, `model_manifest.py`, `data_record.py`. Sets and models have separate version numbers; say which one you mean. |
 
 ## Skills (`.cursor/skills/<name>/SKILL.md`)
