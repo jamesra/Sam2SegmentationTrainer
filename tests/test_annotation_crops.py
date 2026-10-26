@@ -52,6 +52,64 @@ def test_location_scores_legacy_rows_keep_empty_image_key(tmp_path: Path) -> Non
     connection.close()
 
 
+def _scores(connection: sqlite3.Connection, table: str = "location_scores") -> list[tuple]:
+    return connection.execute(
+        f"SELECT location_id, image_key, epoch, score FROM {table} ORDER BY location_id, image_key, epoch"
+    ).fetchall()
+
+
+def test_a_new_run_supersedes_an_older_runs_later_epochs(tmp_path: Path) -> None:
+    connection = sqlite3.connect(tmp_path / "annotation_crops.sqlite")
+    ensure_location_scores_schema(connection)
+    # An older run reached epoch 11 on window K of location 7, and epoch 3 on window L.
+    for epoch in range(12):
+        connection.execute("INSERT INTO location_scores VALUES (7, 'K', ?, ?)", [epoch, 1.0 + epoch])
+    connection.execute("INSERT INTO location_scores VALUES (7, 'L', 3, 9.0)")
+
+    # A new run writes epoch 0 then 1 for window K.
+    connection.execute("INSERT OR REPLACE INTO location_scores VALUES (7, 'K', 0, 0.5)")
+    connection.execute("INSERT OR REPLACE INTO location_scores VALUES (7, 'K', 1, 0.4)")
+
+    assert _scores(connection) == [(7, "K", 0, 0.5), (7, "K", 1, 0.4), (7, "L", 3, 9.0)], "only window K changes"
+    moved = _scores(connection, "location_scores_superseded")
+    assert [row[2] for row in moved] == list(range(1, 12)), "the older run's epochs 1-11 are kept, not lost"
+    assert all(row[1] == "K" for row in moved)
+    stamps = connection.execute("SELECT DISTINCT superseded_at FROM location_scores_superseded").fetchall()
+    assert stamps and all(stamp[0].endswith("Z") for stamp in stamps)
+    connection.close()
+
+
+def test_one_run_writing_epochs_in_order_supersedes_nothing(tmp_path: Path) -> None:
+    connection = sqlite3.connect(tmp_path / "annotation_crops.sqlite")
+    ensure_location_scores_schema(connection)
+    for epoch in range(4):
+        connection.execute("INSERT OR REPLACE INTO location_scores VALUES (7, 'K', ?, ?)", [epoch, float(epoch)])
+    # The same window twice in one epoch keeps the later score.
+    connection.execute("INSERT OR REPLACE INTO location_scores VALUES (7, 'K', 3, 0.25)")
+
+    assert _scores(connection) == [(7, "K", 0, 0.0), (7, "K", 1, 1.0), (7, "K", 2, 2.0), (7, "K", 3, 0.25)]
+    assert _scores(connection, "location_scores_superseded") == []
+    connection.close()
+
+
+def test_the_schema_can_be_ensured_again_and_after_the_legacy_migration(tmp_path: Path) -> None:
+    connection = sqlite3.connect(tmp_path / "annotation_crops.sqlite")
+    connection.execute(
+        "CREATE TABLE location_scores (location_id INTEGER NOT NULL, epoch INTEGER NOT NULL, score REAL NOT NULL, "
+        "PRIMARY KEY (location_id, epoch))"
+    )
+    connection.execute("INSERT INTO location_scores VALUES (7, 5, 0.5)")
+    ensure_location_scores_schema(connection)
+    ensure_location_scores_schema(connection)
+
+    connection.execute("INSERT INTO location_scores VALUES (7, '', 0, 0.1)")
+    assert _scores(connection) == [(7, "", 0, 0.1)], "the migrated table has the trigger too"
+    assert _scores(connection, "location_scores_superseded") == [(7, "", 5, 0.5)]
+    triggers = connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()[0]
+    assert triggers == 1
+    connection.close()
+
+
 def test_rle_round_trip_and_bbox() -> None:
     mask = np.zeros((3, 4), dtype=np.uint8)
     mask[1, 2] = 5
