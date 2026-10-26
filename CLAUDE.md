@@ -4,9 +4,12 @@ The rules and skills for this repo are authored for Cursor and live in `.cursor/
 truth; this file links to them instead of copying them, so edits in `.cursor/` apply to both tools.
 User-level rules are imported from `~/.claude/CLAUDE.md` (which links `~/.cursor/rules`).
 
-## Path-scoped rules (read the file before editing anything matching its globs)
+## Path-scoped rules (loaded automatically from `.claude/rules/`)
 
-The `.mdc` frontmatter `globs:` line says which paths each rule covers.
+Each `.cursor/rules/*.mdc` rule with `globs:` is mirrored into `.claude/rules/<name>.md` with a `paths:` list, so Claude
+loads it when it reads or edits a matching file. After adding or editing a `.cursor/rules` `.mdc` file, rerun
+`python .claude/sync_claude_rules.py` and commit the result; never edit `.claude/rules/` by hand
+(`python .claude/sync_claude_rules.py --check` reports drift). The table is an index.
 
 | Rule | Applies to |
 |------|-----------|
