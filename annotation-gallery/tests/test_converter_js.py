@@ -120,3 +120,15 @@ def test_the_preview_picks_the_volume_that_has_the_structure_and_warns_about_amb
     assert "Could not check RC1" in got[7]
     assert got[8].startswith("3 annotations to convert in RC1.") and "also exists in RC2 (9)" in got[8]
     assert "review rights" in got[9]
+
+
+@needs_node
+def test_the_delete_warning_names_what_is_lost() -> None:
+    text = _run(
+        "return C.deleteWarning({structureId: 410, volume: 'RC1', built: 57, failed: 5, approved: 3, rejected: 1});"
+    )
+    assert "structure 410 of RC1" in text and "57 built cards" in text and "5 failure records" in text
+    assert "3 approved and 1 rejected cards" in text and "cannot be undone" in text
+    plain = _run("return C.deleteWarning({structureId: 7, volume: 'RC2', built: 1, failed: 0, approved: 0, rejected: 0});")
+    assert "1 built card," in plain and "approved" not in plain
+    assert _run("return C.deleteWarning(null);") == ""

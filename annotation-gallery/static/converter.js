@@ -168,6 +168,22 @@
     return parts.join(" · ");
   }
 
+  /** What deleting a build throws away, for the confirmation: counts of the work that would be lost. */
+  function deleteWarning(build) {
+    if (!build) {
+      return "";
+    }
+    const lost = [`${build.built} built card${build.built === 1 ? "" : "s"}`];
+    if (build.failed) {
+      lost.push(`${build.failed} failure record${build.failed === 1 ? "" : "s"}`);
+    }
+    const marks = (build.approved || 0) + (build.rejected || 0);
+    const review = marks
+      ? ` ${build.approved} approved and ${build.rejected} rejected card${marks === 1 ? "" : "s"} will lose that review, and the approved batch will be gone.`
+      : "";
+    return `This permanently deletes structure ${build.structureId} of ${build.volume}: ${lost.join(" and ")}, their images and masks.${review} It cannot be undone.`;
+  }
+
   /** The volume a preview recommends: the one with annotations (the first when several), else "" . */
   function pickVolume(volumes) {
     const found = Object.entries(volumes || {}).filter(([, info]) => info && info.count > 0);
@@ -234,6 +250,6 @@
 
   return {
     active, onConverterPath, attachCards, edgePixels, outlineCanvas, infoLines, batchHref, applyChrome,
-    humanReason, buildLabel, countsLine, pickVolume, previewLine,
+    humanReason, buildLabel, countsLine, deleteWarning, pickVolume, previewLine,
   };
 });

@@ -207,3 +207,18 @@ def test_viewer_wires_the_negative_overlay() -> None:
     assert "viewer.negatives = null" in js.split("function blankViewer", 1)[1].split("}", 1)[0]
     assert 'event.key === "n"' in js and "toggleNegatives()" in js
     assert "<small>Negatives</small>" in html
+
+
+def test_the_converters_existing_annotation_is_drawn_as_a_region(crops: Path) -> None:
+    _png(crops / "original" / f"{KEY}_1.png", slice(10, 14), slice(10, 14))
+    data, count = negative_bitmask(crops, KEY, 1)
+    pixels = _decode(data)
+    assert count == 3
+    assert pixels[11, 11] == 255 and pixels[3, 3] == 255
+    assert pixels[20, 20] == 0
+
+
+def test_an_empty_or_missing_original_adds_nothing(crops: Path) -> None:
+    assert negative_bitmask(crops, KEY, 1)[1] == 2
+    _png(crops / "original" / f"{KEY}_1.png", slice(0, 0), slice(0, 0))
+    assert negative_bitmask(crops, KEY, 1)[1] == 2

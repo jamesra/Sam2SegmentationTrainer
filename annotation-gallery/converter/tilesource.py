@@ -20,6 +20,7 @@ import os
 import re
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Mapping, Optional, Tuple
@@ -163,6 +164,7 @@ def parse_viking_xml(text: str, *, source: str, host: Optional[str] = None) -> V
 
 
 RETRIES = 4
+PREFETCH_WORKERS = 8
 
 
 def default_http_get(url: str, headers: Optional[Mapping[str, str]] = None) -> Tuple[int, Mapping[str, str], bytes]:
@@ -215,6 +217,21 @@ class TileCache:
             return None, None
         digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
         return self._folder / f"{digest}.png", self._folder / f"{digest}.etag"
+
+    def prefetch(self, urls, workers: int = PREFETCH_WORKERS) -> None:
+        """Fetch ``urls`` concurrently into the caches. A failure is left for the later ``fetch`` of that URL to raise."""
+        pending = [url for url in dict.fromkeys(urls) if url not in self._memory]
+        if len(pending) < 2:
+            return
+
+        def one(url: str) -> None:
+            try:
+                self.fetch(url)
+            except Exception:  # reported again, in order, by the caller's own fetch
+                pass
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
+            list(pool.map(one, pending))
 
     def fetch(self, url: str) -> Optional[np.ndarray]:
         """The tile as 8-bit gray, or None when the server has no such tile (404)."""
@@ -281,6 +298,13 @@ class SectionTiles:
         """Pixels ``[x0, x0+width) x [y0, y0+height)`` of the stitched level, stored orientation (row 0 = lowest y)."""
         tx, ty = self.tileset.tile_x, self.tileset.tile_y
         canvas = np.zeros((height, width), dtype=np.uint8)
+        # A cold region needs a dozen or more tiles; fetched one by one over a slow link they can outlast the
+        # segmentation server's wait for our answer, so they are fetched together (then served from the cache below).
+        self.cache.prefetch([
+            self.tileset.tile_url(self.volume.base_url, self.downsample, ix, iy)
+            for iy in range(max(y0 // ty, 0), (y0 + height - 1) // ty + 1)
+            for ix in range(max(x0 // tx, 0), (x0 + width - 1) // tx + 1)
+        ])
         for iy in range(y0 // ty, (y0 + height - 1) // ty + 1):
             for ix in range(x0 // tx, (x0 + width - 1) // tx + 1):
                 if ix < 0 or iy < 0:

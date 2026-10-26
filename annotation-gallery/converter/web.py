@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,6 +55,21 @@ def resolve_structure_set(root: Optional[Path], name: str) -> Path:
     return path
 
 
+def delete_build(root: Optional[Path], set_name: str, volume: str) -> None:
+    """Remove one build (a structure in one volume): its cards, masks, catalog, review marks and source record. The
+    structure's folder goes too once no volume is left in it. The annotations in the database are not touched.
+
+    Raises ``FileNotFoundError`` when there is no such build. Callers must not delete a build that is still running."""
+    set_dir = resolve_structure_set(root, set_name)
+    crops = set_dir / volume
+    if not crops.is_dir():
+        raise FileNotFoundError(f"{set_name}/{volume}")
+    crops.resolve().relative_to(set_dir.resolve())
+    shutil.rmtree(crops)
+    if not any(set_dir.iterdir()):
+        set_dir.rmdir()
+
+
 def is_converter_crops(crops: Path) -> bool:
     return (catalog.sqlite_path(crops)).is_file() and _has_cards(crops)
 
@@ -83,6 +99,19 @@ def card_rows(crops: Path) -> List[Dict[str, Any]]:
     finally:
         connection.close()
     return [dict(row) for row in rows]
+
+
+def link_rows(crops: Path) -> List[List[int]]:
+    """The structure's location links as ``[a, b]`` pairs; empty when the build predates link storage."""
+    if not catalog.sqlite_path(crops).is_file():
+        return []
+    connection = catalog.connect(crops)
+    try:
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'converter_links'").fetchone() is None:
+            return []
+        return [[int(row[0]), int(row[1])] for row in connection.execute("SELECT a, b FROM converter_links ORDER BY a, b")]
+    finally:
+        connection.close()
 
 
 def failed_rows(crops: Path) -> List[Dict[str, Any]]:

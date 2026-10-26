@@ -144,6 +144,12 @@ def test_cancelling_hides_the_button_and_says_the_run_is_finishing() -> None:
 
 
 @needs_node
+def test_a_status_that_counts_locations_says_location_not_page() -> None:
+    view = _views({"s": {**RUNNING, "unit": "location", "page": 67, "pages": 1100}})["s"]
+    assert "location 67 of 1,100" in view["line"] and "page" not in view["line"]
+
+
+@needs_node
 def test_a_finished_run_shows_its_result_with_a_tone_and_can_be_dismissed() -> None:
     views = _views({
         "done": {**RUNNING, "running": False, "phase": "done", "page": 41},

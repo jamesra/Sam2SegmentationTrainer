@@ -1031,6 +1031,8 @@ button.viewer-retrace-btn.on {
   pointer-events: none;
 }
 
+.viewer-cues .viewer-cue { pointer-events: auto; cursor: pointer; }
+
 .viewer-cues[hidden] { display: none; }
 
 .viewer-cue {

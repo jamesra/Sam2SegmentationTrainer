@@ -124,8 +124,11 @@ def test_etag_revalidation_uses_304(tmp_path: Path, volume) -> None:
 
 # ---- OData -------------------------------------------------------------------------------------------------------
 
-def _entity(location_id: int, type_code: int, wkt: str, radius=None, z=7, structure=500) -> Dict[str, Any]:
+def _entity(location_id: int, type_code: int, wkt: str, radius=None, z=7, structure=500, center=None) -> Dict[str, Any]:
+    if center is None and wkt.startswith("POINT"):
+        center = tuple(float(v) for v in wkt[wkt.index("(") + 1:wkt.index(")")].split())
     return {
+        "X": center[0] if center else None, "Y": center[1] if center else None,
         "ID": location_id, "ParentID": structure, "TypeCode": type_code, "Z": z, "OffEdge": False, "MosaicShape": wkt,
         "LastModified": "2026-10-01T00:00:00Z", "Radius": radius,
         "Parent": {"ID": structure, "Label": "cell 5", "TypeID": 1, "Type": {"ID": 1, "Name": "Cell"}},
@@ -134,7 +137,7 @@ def _entity(location_id: int, type_code: int, wkt: str, radius=None, z=7, struct
 
 def test_filter_text_and_url() -> None:
     text = odata.filter_text(500, type_codes=(1, 6), z_min=3, z_max=9)
-    assert text == "ParentID eq 500 and (TypeCode eq 1 or TypeCode eq 6) and Z ge 3 and Z le 9 and OffEdge eq false"
+    assert text == "ParentID eq 500 and (TypeCode eq 1 or TypeCode eq 6) and Z ge 3 and Z le 9"
     url = odata.locations_url("http://host/odata/RC1/", text)
     assert url.startswith("http://host/odata/RC1/Locations?$filter=") and "$top" not in url and "$count=true" in url
 
@@ -187,7 +190,8 @@ class FakeSegmenter:
         inside = self.truth_for(location_id)(X, Y, self.grow)
         logits = np.where(inside, 6.0, -6.0).astype(np.float32)
         return SegmentResult(
-            logits=logits, scale=4.0, logits_x=0, logits_y=0, origin_x=int(xs0), origin_y=int(ys0), frame_height=size,
+            # logits_origin is the top-left pixel of sample (0, 0): the top pixel row of the window, Y up.
+            logits=logits, scale=4.0, origin_x=int(xs0), origin_y=int(ys0 + size * 4 - 1),
             score=0.9, request_id=request_id, threshold=threshold,
         )
 
@@ -322,13 +326,25 @@ def test_cancel_stops_before_the_next_location(tmp_path: Path, volume, cache) ->
 
 def test_choose_downsample_and_card_origin() -> None:
     small = odata.record_from_entity(_entity(1, 1, "POINT (5000 6000)", radius=100))
-    assert builder_module.choose_downsample(small, [1, 2, 4]) == 1
+    assert builder_module.choose_downsample(odata.bounds(small), [1, 2, 4]) == 1
     big = odata.record_from_entity(_entity(2, 4, "POLYGON ((0 0, 3000 0, 3000 3000, 0 3000, 0 0))"))
-    assert builder_module.choose_downsample(big, [1, 2, 4]) == 4
+    assert builder_module.choose_downsample(odata.bounds(big), [1, 2, 4]) == 4
     huge = odata.record_from_entity(_entity(3, 4, "POLYGON ((0 0, 9000 0, 9000 9000, 0 9000, 0 0))"))
     with pytest.raises(SegmentationFailed, match="too_large"):
-        builder_module.choose_downsample(huge, [1, 2, 4])
-    assert builder_module.card_origin(small, 1) == (5000 - 512, 6000 - 512)
+        builder_module.choose_downsample(odata.bounds(huge), [1, 2, 4])
+    assert builder_module.card_origin(odata.bounds(small), 1) == (5000 - 512, 6000 - 512)
+
+
+def test_the_card_is_centred_on_the_annotation_and_the_proposal_together(tmp_path: Path, volume, cache) -> None:
+    # A small annotation whose proposal reaches 200 px to its right: a window centred on the annotation alone
+    # (origin_x 888) would put the proposal's far edge nearer the card edge than the annotation's.
+    entities = [_entity(14, 1, "POINT (1400 1600)", radius=30)]
+    proposal = lambda _id: (lambda X, Y, grow: (X - 1600) ** 2 + (Y - 1600) ** 2 <= 30 ** 2)
+    _make(tmp_path, volume, cache, FakeSegmenter(proposal, grow=0.0), entities).run()
+    connection = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite")
+    origin_x = connection.execute("SELECT origin_x FROM converter_cards").fetchone()[0]
+    # Union spans x 1370..1630, centred 1500.
+    assert abs(origin_x - (1500 - 512)) <= 4
 
 
 OLD_FORMAT_XML = """<?xml version="1.0" ?>
@@ -413,3 +429,34 @@ def test_a_network_hiccup_is_retried_and_a_404_is_not(monkeypatch) -> None:
     with pytest.raises(tilesource.TileSourceError, match="after 4 tries"):
         tilesource.default_http_get("http://h/t.png")
     assert len(calls) == 4
+
+
+def test_a_circles_centre_is_its_x_y_not_a_point_of_its_rim_ring() -> None:
+    # Location 175934 of RC1 as OData returns it: the ring starts at the rightmost rim point (centre x + radius).
+    ring = "CURVEPOLYGON (CIRCULARSTRING (90374.96249806066 75593.728178269783, 90339.857386245509 75628.833290084935, 90374.96249806066 75593.728178269783))"
+    record = odata.record_from_entity(_entity(175934, 1, ring, radius=35.105111815147481, center=(90339.857386245509, 75593.728178269783)))
+    assert record is not None and record.center == (90339.857386245509, 75593.728178269783)
+    assert odata.record_from_entity(_entity(7, 1, ring, radius=35.1)) is None  # no X, Y: not guessed from the ring
+
+
+def test_location_links_are_stored_once_each_and_replaced_on_every_run(tmp_path: Path, volume, cache) -> None:
+    from converter import web as converter_web
+
+    links = [{"A": 12, "B": 11}, {"A": 11, "B": 12}, {"A": 11, "B": 13}, {"A": 14, "B": 14}]
+    entities = [_entity(11, 1, "POINT (1400 1600)", radius=80)]
+
+    def get_json(url: str):
+        if "StructureLocationLinks(StructureID=500)" in url:
+            return {"value": links}
+        if "$top=1" in url:
+            return {"@odata.count": len(entities), "value": entities[:1]}
+        return {"value": entities}
+
+    params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500)
+    segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json).run()
+    assert converter_web.link_rows(tmp_path / "crops") == [[11, 12], [11, 13]]
+
+    links[:] = [{"A": 11, "B": 15}]
+    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json).run()
+    assert converter_web.link_rows(tmp_path / "crops") == [[11, 15]]

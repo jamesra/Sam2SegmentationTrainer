@@ -183,6 +183,22 @@ def tag_tokens(raw: str | None) -> list[str]:
     return [item.strip() for item in text.split(";") if item.strip()]
 
 
+def compile_tag_pattern(pattern: str) -> re.Pattern[str]:
+    """The tag pattern as a case-insensitive regular expression.
+
+    A pattern that is not a valid regular expression but uses ``*`` or ``?``, such as ``*CLS*``, is read as a
+    wildcard pattern instead (``*`` any run of characters, ``?`` one character, anything else literal). Raises
+    ``re.error`` for any other invalid pattern.
+    """
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        if "*" not in pattern and "?" not in pattern:
+            raise
+        wildcard = "".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pattern)
+        return re.compile(wildcard, re.IGNORECASE)
+
+
 def structure_ids_for_tag_pattern(
     structures: list[dict[str, Any]],
     types: list[dict[str, Any]],
@@ -190,9 +206,10 @@ def structure_ids_for_tag_pattern(
 ) -> list[int]:
     """Structure IDs whose own tags, or their type's tags, match *pattern*.
 
-    *pattern* is a regular expression. A plain word matches that tag as a substring.
+    *pattern* is a regular expression (see ``compile_tag_pattern`` for the wildcard fallback). A plain word matches
+    that tag as a substring.
     """
-    compiled = re.compile(pattern, re.IGNORECASE)
+    compiled = compile_tag_pattern(pattern)
     matched_types = {
         int(item["ID"])
         for item in types
@@ -241,7 +258,7 @@ def fetch_odata_location(base_url: str, location_id: int) -> dict[str, Any]:
     """Read one location's MosaicShape and LastModified from an OData service root."""
     query = urlencode(
         {
-            "$select": "ID,ParentID,TypeCode,Z,OffEdge,MosaicShape,LastModified,Radius",
+            "$select": "ID,ParentID,TypeCode,Z,X,Y,OffEdge,MosaicShape,LastModified,Radius",
             "$expand": "Parent($select=ID,TypeID,Label;$expand=Type($select=ID,Name,ParentID))",
         },
         safe="(),$=",
@@ -845,6 +862,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if path == "/api/converter/structures":
             self._handle_converter_create()
             return
+        if path == "/api/converter/delete":
+            self._handle_converter_delete()
+            return
         if path == "/api/gold/sets":
             self._handle_gold_create()
             return
@@ -1271,6 +1291,40 @@ class GalleryHandler(BaseHTTPRequestHandler):
             counts = dict(zip(volumes, pool.map(count, volumes)))
         self._send_json({"structureId": structure_id, "volumes": counts})
 
+    def _handle_converter_delete(self) -> None:
+        """POST {set, volume}: delete one build and everything kept for it. Refused while it is building (409)."""
+        root = converter_web.converter_root(env_map())
+        if root is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            body = self._read_json()
+            set_name = str(body["set"])
+            volume = str(body["volume"])
+            if not converter_web.SET_NAME.fullmatch(set_name) or not VOLUME_NAME.fullmatch(volume):
+                raise ValueError("bad name")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "set and volume required"}, status=400)
+            return
+        try:
+            set_dir = converter_web.resolve_structure_set(root, set_name)
+        except (FileNotFoundError, ValueError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        if not self._review_granted_in(set_dir, volume):
+            return
+        job = converter_jobs.current_job(set_name, volume)
+        if job is not None and job.running:
+            self._send_json({"error": "this build is running; cancel it first"}, status=409)
+            return
+        try:
+            converter_web.delete_build(root, set_name, volume)
+        except (FileNotFoundError, ValueError):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        converter_jobs.forget_job(set_name, volume)
+        self._send_json({"deleted": {"set": set_name, "volume": volume}})
+
     def _handle_converter_create(self) -> None:
         """POST {structureId, volume, typeCodes?, zMin?, zMax?, channel?, filter?}: make the structure's set and start building."""
         root = converter_web.converter_root(env_map())
@@ -1640,7 +1694,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if crops is None:
             return
         if what == "cards":
-            self._send_json({"cards": converter_web.card_rows(crops)})
+            self._send_json({"cards": converter_web.card_rows(crops), "links": converter_web.link_rows(crops)})
             return
         body = converter_web.batch_jsonl(crops)
         self.send_response(200)
@@ -1679,7 +1733,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"structureIds": []})
             return
         try:
-            re.compile(text)
+            compile_tag_pattern(text)
         except re.error as exc:
             self._send_json({"error": f"invalid tag pattern: {exc}"}, status=400)
             return

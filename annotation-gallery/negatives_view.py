@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 
 import crops_path  # noqa: F401
+import numpy as np
 from PIL import Image, PngImagePlugin
 
 from annotation_crops.negatives import (
@@ -37,6 +38,30 @@ CACHE_DIR = "cache"
 def cache_path(crops: Path, image_key: str, location_id: int) -> Path:
     """Where the bitmask for ``(image_key, location_id)`` is cached."""
     return crops / CACHE_DIR / f"neg_{image_key}_{location_id}.png"
+
+
+def original_mask_path(crops: Path, image_key: str, location_id: int) -> Path:
+    """The converter's current-outline mask of a location (the annotation as it is in the database). Gallery
+    volumes have none; there the file does not exist and nothing changes."""
+    return crops / "original" / f"{image_key}_{int(location_id)}.png"
+
+
+def _with_original(bitmask, crops: Path, image_key: str, location_id: int):
+    """``bitmask`` (0/255) with the converter's existing annotation added, and how many regions that adds (0 or 1).
+
+    The existing annotation is drawn the way the other annotations are, so a reviewer sees it against the proposal:
+    where only it covers is red, where both do is yellow."""
+    path = original_mask_path(crops, image_key, location_id)
+    try:
+        with Image.open(path) as image:
+            original = np.asarray(image.convert("L"))
+    except (OSError, ValueError):
+        return bitmask, 0
+    if original.shape != bitmask.shape:
+        original = np.asarray(Image.fromarray(original).resize(bitmask.shape[::-1], Image.Resampling.NEAREST))
+    if not (original > 127).any():
+        return bitmask, 0
+    return np.where(original > 127, 255, bitmask).astype("uint8"), 1
 
 
 def _mtime_ns(path: Path) -> int:
@@ -96,6 +121,7 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     sources = [
         crops / "images" / f"{image_key}.json",
         circle_file_path(crops),
+        original_mask_path(crops, image_key, location_id),
         *(masks / f"{image_key}_{other}.png" for other in ids if other != location_id),
     ]
     newest = max(_mtime_ns(source) for source in sources)
@@ -108,8 +134,10 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     regions = collect_negative_regions(image_key, location_id, ids, circles, masks, shape)
     canvas = stamp_negative_regions(regions, shape)
     bitmask = (canvas < 0).astype("uint8") * 255
+    bitmask, added = _with_original(bitmask, crops, image_key, location_id)
+    count = len(regions) + added
     info = PngImagePlugin.PngInfo()
-    info.add_text(COUNT_FIELD, str(len(regions)))
+    info.add_text(COUNT_FIELD, str(count))
     buffer = io.BytesIO()
     Image.fromarray(bitmask, mode="L").save(buffer, format="PNG", pnginfo=info, optimize=True)
     data = buffer.getvalue()
@@ -124,4 +152,4 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
         pass
     finally:
         temporary.unlink(missing_ok=True)
-    return data, len(regions)
+    return data, count

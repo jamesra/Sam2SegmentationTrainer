@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS converter_cards (
     PRIMARY KEY (location_id, image_key)
 )
 """
+LINKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS converter_links (
+    a INTEGER NOT NULL,
+    b INTEGER NOT NULL,
+    PRIMARY KEY (a, b)
+)
+"""
 BUILT, FAILED = "built", "failed"
 
 
@@ -109,20 +116,38 @@ def image_key(volume: str, record: odata.LocationRecord, downsample: int) -> str
     return f"{volume}_{record.z}_D{downsample}_L{record.id}"
 
 
-def choose_downsample(record: odata.LocationRecord, levels: Sequence[int]) -> int:
-    """The finest level at which the shape plus a margin fits one card; raises ``SegmentationFailed`` when none does."""
-    min_x, min_y, max_x, max_y = odata.bounds(record)
+Bounds = Tuple[float, float, float, float]
+
+
+def choose_downsample(bounds: Bounds, levels: Sequence[int], at_least: int = 1) -> int:
+    """The finest level (``at_least`` or coarser) at which mosaic ``bounds`` plus a margin fit one card.
+
+    Raises ``SegmentationFailed`` when none does.
+    """
+    min_x, min_y, max_x, max_y = bounds
     extent = max(max_x - min_x, max_y - min_y)
     for level in sorted(levels):
-        if extent / level + 2 * MARGIN <= CARD_SIZE:
+        if level >= at_least and extent / level + 2 * MARGIN <= CARD_SIZE:
             return level
     raise SegmentationFailed(f"too_large: the shape is {extent:.0f} mosaic pixels across and no tileset level fits it in {CARD_SIZE}")
 
 
-def card_origin(record: odata.LocationRecord, downsample: int) -> Tuple[int, int]:
-    min_x, min_y, max_x, max_y = odata.bounds(record)
+def card_origin(bounds: Bounds, downsample: int) -> Tuple[int, int]:
+    """Origin, in level pixels, of the card window centred on mosaic ``bounds``."""
+    min_x, min_y, max_x, max_y = bounds
     cx, cy = (min_x + max_x) / 2 / downsample, (min_y + max_y) / 2 / downsample
     return int(math.floor(cx - CARD_SIZE / 2)), int(math.floor(cy - CARD_SIZE / 2))
+
+
+def union_bounds(a: Bounds, b: Bounds) -> Bounds:
+    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+
+def shape_bounds(shape: contour_module.Contour, downsample: int) -> Bounds:
+    """Mosaic-pixel bounds of a proposed outline (its exterior; holes lie inside it)."""
+    xs = [x for x, _ in shape.exterior]
+    ys = [y for _, y in shape.exterior]
+    return min(xs) * downsample, min(ys) * downsample, max(xs) * downsample, max(ys) * downsample
 
 
 def _scaled(rings: Sequence[Sequence[Tuple[float, float]]], downsample: int) -> List[List[Tuple[float, float]]]:
@@ -221,7 +246,23 @@ class Builder:
     def _connect(self) -> sqlite3.Connection:
         connection = catalog.connect(self.crops)
         connection.execute(SCHEMA)
+        connection.execute(LINKS_SCHEMA)
         return connection
+
+    def _store_links(self) -> None:
+        """Replace the stored location links with the structure's current ones. A failed read keeps the stored links."""
+        try:
+            links = sorted(set(odata.iter_links(self.params.odata_base, self.params.structure_id, get_json=self.get_json)))
+        except (ValueError, OSError, KeyError) as error:
+            LOGGER.warning("location links of structure %s not read: %s", self.params.structure_id, error)
+            return
+        connection = self._connect()
+        try:
+            connection.execute("DELETE FROM converter_links")
+            connection.executemany("INSERT INTO converter_links (a, b) VALUES (?, ?)", links)
+            connection.commit()
+        finally:
+            connection.close()
 
     def _existing(self, connection: sqlite3.Connection, location_id: int) -> Optional[sqlite3.Row]:
         return connection.execute(
@@ -269,29 +310,25 @@ class Builder:
 
     def build_one(self, record: odata.LocationRecord) -> Dict[str, Any]:
         """Build one card and commit it. Returns its row; raises ``SegmentationFailed`` for a recorded failure."""
-        downsample = choose_downsample(record, self._levels(record.z))
-        section = self._section(record.z, downsample)
-        origin = card_origin(record, downsample)
+        levels = self._levels(record.z)
+        record_bounds = odata.bounds(record)
+        downsample = choose_downsample(record_bounds, levels)
+        while True:
+            section = self._section(record.z, downsample)
+            shape = self._segment(record, section, downsample)
+            # The card must hold the proposal as well as the annotation: the proposal can reach past the annotation,
+            # and a window centred on the annotation alone would crop it.
+            bounds = union_bounds(record_bounds, shape_bounds(shape, downsample))
+            try:
+                fitted = choose_downsample(bounds, levels, at_least=downsample)
+            except SegmentationFailed:
+                # No level holds the whole proposal; keep the annotation's card rather than fail the location.
+                bounds, fitted = record_bounds, downsample
+            if fitted == downsample:
+                break
+            downsample = fitted
+        origin = card_origin(bounds, downsample)
         key = image_key(self.params.volume, record, downsample)
-        prompt = build_prompt(record, downsample)
-
-        identity = TileIdentity(
-            volume=self.params.volume, section=record.z, channel=section.tileset.channel,
-            transform=section.tileset.name or "mosaic", downsample=downsample,
-        )
-        if self.semaphore is not None:
-            self.semaphore.acquire()
-        try:
-            result = self.client.segment_with_retry(
-                identity, prompt, section.protocol_tile, self._no_neighbours,
-                threshold=self.params.threshold, request_id=record.id & 0xFFFFFFFF,
-            )
-        finally:
-            if self.semaphore is not None:
-                self.semaphore.release()
-        shape = contour_module.contour_from_result(result)
-        if shape is None:
-            raise SegmentationFailed("no_object: the mask is empty at the threshold")
 
         original = original_mask(record, downsample, origin)
         candidate = draw_mask([shape.exterior] + list(shape.holes), origin)
@@ -325,10 +362,32 @@ class Builder:
         self._commit_card(record, row, int(candidate.sum()))
         return row
 
+    def _segment(self, record: odata.LocationRecord, section: SectionTiles, downsample: int) -> contour_module.Contour:
+        """The server's proposed outline for a location at one level, in that level's pixels."""
+        identity = TileIdentity(
+            volume=self.params.volume, section=record.z, channel=section.tileset.channel,
+            transform=section.tileset.name or "mosaic", downsample=downsample,
+        )
+        prompt = build_prompt(record, downsample)
+        if self.semaphore is not None:
+            self.semaphore.acquire()
+        try:
+            result = self.client.segment_with_retry(
+                identity, prompt, section.protocol_tile, self._no_neighbours,
+                threshold=self.params.threshold, request_id=record.id & 0xFFFFFFFF,
+            )
+        finally:
+            if self.semaphore is not None:
+                self.semaphore.release()
+        shape = contour_module.contour_from_result(result)
+        if shape is None:
+            raise SegmentationFailed("no_object: the mask is empty at the threshold")
+        return shape
+
     @staticmethod
-    def _no_neighbours(row: int, col: int) -> np.ndarray:
-        """Neighbouring annotations are not asked for yet: every tile is answered as having none."""
-        return np.zeros((1024, 1024), dtype=bool)
+    def _no_neighbours(cells: Sequence[Tuple[int, int]]) -> List[Any]:
+        """Neighbouring annotations are not looked up yet: every cell is answered as having no background shapes."""
+        return []
 
     def _record_failure(self, record: odata.LocationRecord, reason: str) -> None:
         row = {
@@ -366,6 +425,7 @@ class Builder:
             summary.total = odata.count_locations(self.params.odata_base, self.params.structure_id, get_json=self.get_json, **filters)
         except (ValueError, OSError):
             summary.total = 0
+        self._store_links()
         for record in odata.iter_locations(self.params.odata_base, self.params.structure_id, get_json=self.get_json, **filters):
             if cancel is not None and cancel.is_set():
                 summary.cancelled = True

@@ -1,8 +1,8 @@
 """Logits to polygon, the way Viking's SegmentationMaskPolygonizer does it: smooth, contour at the iso level, take the
 largest ring as the exterior, keep real holes, and thin the vertices without making the ring cross itself.
 
-The logit grid is contoured *before* it is scaled (the server asks clients for that: RESPONSE_CONTENT_NO_UPSCALE), then the
-vertices are multiplied by the logit scale and mapped into mosaic pixels, X right, Y up.
+The logit grid is contoured at its native resolution (the server sends only that: SegmentResult.logits), then the
+vertices are multiplied by the logit scale and placed from logits_origin into mosaic pixels, X right, Y up.
 """
 
 from __future__ import annotations
@@ -152,8 +152,10 @@ def contour_from_result(
     def to_mosaic(ring: Ring) -> Ring:
         column = ring[:, 0] - PAD
         row = ring[:, 1] - PAD
-        x = result.origin_x + result.logits_x + (column + 0.5) * result.scale
-        y = result.origin_y + result.frame_height_pixels - (result.logits_y + (row + 0.5) * result.scale)
+        # Sample (i, j)'s centre is (origin_x + (i + 0.5) * scale, origin_y + 1 - (j + 0.5) * scale): the origin is the
+        # top-left pixel of sample (0, 0), Y up, and rows run down from it (see seg_client.sample_centres).
+        x = result.origin_x + (column + 0.5) * result.scale
+        y = result.origin_y + 1 - (row + 0.5) * result.scale
         return np.column_stack([x, y])
 
     mosaic = [to_mosaic(ring) for ring in rings]

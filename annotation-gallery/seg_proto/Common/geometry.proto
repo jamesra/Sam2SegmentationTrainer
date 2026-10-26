@@ -1,0 +1,151 @@
+syntax = "proto3";
+
+option csharp_namespace = "Viking.gRPC.Geometry.V1";
+
+package viking.geometry.v1;
+
+// Geometry shared by every Viking service: annotation shapes, the frames their numbers are in, and the integer types
+// for grids, pixel positions and sizes. Coordinates are doubles; integer types are only for things that are integers
+// (grid cells, pixel and sample counts).
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Coordinates and frames
+
+// A point or vector. X right, Y up unless the field using it says otherwise.
+message Vector2 {
+  double x = 1;
+  double y = 2;
+}
+
+// Which coordinate system a shape's numbers are in.
+enum CoordinateSpace {
+  // Not set. Refused wherever a space is required.
+  COORDINATE_SPACE_UNSPECIFIED = 0;
+  // A section's assembled mosaic image, before any slice-to-volume registration (stos) warps it.
+  COORDINATE_SPACE_MOSAIC = 1;
+  // The registered volume: the section after its slice-to-volume transform.
+  COORDINATE_SPACE_VOLUME = 2;
+}
+
+// The frame a shape's numbers are in, where the message carrying the shape does not imply one.
+message Frame {
+  CoordinateSpace space = 1;
+  // The section (z) the coordinates belong to.
+  int64 section = 2;
+  // Pixels of the space per coordinate unit. 0 or 1 is full resolution.
+  double downsample = 3;
+}
+
+// Axis-aligned bounds: x_min <= x <= x_max, y_min <= y <= y_max.
+message Rectangle {
+  double x_min = 1;
+  double y_min = 2;
+  double x_max = 3;
+  double y_max = 4;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Integer types: one per concept, so a field reads as what it is
+
+// A cell of a grid: row counts along Y, column along X, from the grid's origin.
+message GridCell {
+  int32 row = 1;
+  int32 col = 2;
+}
+
+// A count of pixels or samples along each axis.
+message IntSize {
+  int32 width = 1;
+  int32 height = 2;
+}
+
+// An integer pixel position. The field using it states the frame (Y up in mosaic or volume pixels, or Y down in an
+// image).
+message IntPoint {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+// One 1024 x 1024 tile grid: what every cell of it shares. A tile is a TileGrid and a GridCell. Row and column are
+// floor(position / (1024 * downsample)) in `space`, from the origin (0, 0); row increases with Y. The grid is part of
+// every tile's cache identity, so `channel` names everything besides the other fields that changes the render.
+message TileGrid {
+  // VikingXML volume name.
+  string volume = 1;
+  int32 section = 2;
+  // Channel name, plus a bracketed suffix for anything else drawn into the capture. A bare channel name is a plain
+  // greyscale view.
+  string channel = 3;
+  // "<volume transform>|<section tile transform>": the StosGroup (empty in mosaic space) and the .mosaic the pyramid is
+  // placed with.
+  string transform = 4;
+  int32 downsample = 5;
+  // MOSAIC or VOLUME; UNSPECIFIED is refused.
+  CoordinateSpace space = 6;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Shapes: every annotation geometry
+
+// A closed ring. The first vertex is not repeated at the end; orientation is not significant.
+message Ring {
+  repeated Vector2 points = 1;
+}
+
+enum CurveMethod {
+  // No fit: straight segments between the points.
+  CURVE_METHOD_NONE = 0;
+  // Centripetal Catmull-Rom through the control points (Viking Geometry/CurveFitting/CatmullRom.cs, FitCurve).
+  CURVE_METHOD_CATMULL_ROM = 1;
+}
+
+// How a curved outline is drawn from its control points, so every consumer draws the same outline.
+message CurveFit {
+  CurveMethod method = 1;
+  // Points added between consecutive control points. Ignored for CURVE_METHOD_NONE.
+  uint32 interpolations = 2;
+}
+
+// A circle. The centre is the annotation's position, never a point of its outline; the radius is the TRUE radius in
+// the frame. Between frames (mosaic and volume, or one section and another) the radius is carried by the five-point
+// mean scale: the mean of |map(c + R e_k) - map(c)| / R over the four axis rim points, times R. Never copied.
+message Circle {
+  Vector2 center = 1;
+  double radius = 2;
+}
+
+// An ellipse: centre, semi-axes, and the major axis's angle from +X, counter-clockwise, in radians.
+message Ellipse {
+  Vector2 center = 1;
+  double semi_major = 2;
+  double semi_minor = 3;
+  double rotation = 4;
+}
+
+// A line drawn with a width. Open without a fit: a polyline. Open with a fit: an open curve. Closed with a fit: a closed
+// curve. `width` is in the frame's units and is carried between frames by the same mean scale as a circle's radius.
+message Line {
+  repeated Vector2 points = 1;
+  bool closed = 2;
+  double width = 3;
+  CurveFit fit = 4;
+}
+
+// A polygon with holes. Without a fit its rings are straight segments; with a fit each ring's points are control
+// points, each ring fitted closed (a curve polygon).
+message Polygon {
+  Ring exterior = 1;
+  repeated Ring holes = 2;
+  CurveFit fit = 3;
+}
+
+// One shape. An annotation's type follows from the case, Line.closed and the fit; nothing else states it.
+message Shape {
+  oneof kind {
+    Vector2 point = 1;
+    Circle circle = 2;
+    Ellipse ellipse = 3;
+    Line line = 4;
+    Polygon polygon = 5;
+  }
+}

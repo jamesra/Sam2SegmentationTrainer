@@ -49,6 +49,9 @@
     permission: "read",
     hasSam2: false,
     sorts: [{ key: "z", desc: false }],
+    // The converter's location links ([a, b] pairs) and a counter that changes when the layout must be redone.
+    convLinks: [],
+    layoutEpoch: 0,
     tagIds: null,
     filterNote: "",
     cropSize: 1024,
@@ -123,17 +126,22 @@
     return hashed;
   }
 
+  // What a cell's ring and tone belong to: its process in the process layout, else its location.
+  function cellGroup(cell) {
+    return cell.group != null && cell.group >= 0 ? 1e12 + cell.group : Number(cell.row.location_id);
+  }
+
   function assignLinkHues(cells) {
     const at = new Map();
     for (const cell of cells) {
-      at.set(`${cell.gr},${cell.gc}`, Number(cell.row.location_id));
+      at.set(`${cell.gr},${cell.gc}`, cellGroup(cell));
     }
     const neighbors = new Map();
     const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
     const order = [];
     const seen = new Set();
     for (const cell of cells) {
-      const id = Number(cell.row.location_id);
+      const id = cellGroup(cell);
       if (!neighbors.has(id)) {
         neighbors.set(id, new Set());
       }
@@ -159,7 +167,7 @@
       assigned.set(id, linkToneIndex(id, used));
     }
     for (const cell of cells) {
-      const tone = LINK_TONES[assigned.get(Number(cell.row.location_id))];
+      const tone = LINK_TONES[assigned.get(cellGroup(cell))];
       cell.linkH = tone[0];
       cell.linkS = tone[1];
       cell.linkL = tone[2];
@@ -170,10 +178,10 @@
   function assignJoins(cells) {
     const at = new Map();
     for (const cell of cells) {
-      at.set(`${cell.gr},${cell.gc}`, Number(cell.row.location_id));
+      at.set(`${cell.gr},${cell.gc}`, cellGroup(cell));
     }
     for (const cell of cells) {
-      const id = Number(cell.row.location_id);
+      const id = cellGroup(cell);
       cell.joinN = at.get(`${cell.gr - 1},${cell.gc}`) === id;
       cell.joinE = at.get(`${cell.gr},${cell.gc + 1}`) === id;
       cell.joinS = at.get(`${cell.gr + 1},${cell.gc}`) === id;
@@ -1410,9 +1418,18 @@
     ["loss", "Loss"],
   ];
 
+  // The converter's default order: cards laid out by how their locations are linked (static/process_layout.js).
+  // It is exclusive: it replaces every other sort, and every other sort replaces it.
+  const LAYOUT_SORT = "layout";
+
+  function layoutActive() {
+    return Boolean(state.converter) && state.sorts.length > 0 && state.sorts[0].key === LAYOUT_SORT;
+  }
+
   function sortFields() {
     const fields = SORT_FIELDS.slice();
     if (state.converter) {
+      fields.unshift([LAYOUT_SORT, "Process / branch"]);
       // In the converter the "loss" of a card is how far the proposal moved from the current outline (1 - overlap).
       fields[fields.findIndex(([key]) => key === "loss")] = ["loss", "Change from current outline"];
     }
@@ -1452,10 +1469,36 @@
   // Five sorts share a column with the add button. A sixth sort opens the next column.
   const SORTS_PER_COLUMN = 5;
 
+  // The filters do not apply to the process layout, which always lays out every card: switch them off while it is on.
+  function syncLayoutLock() {
+    const locked = layoutActive();
+    els.filters.querySelectorAll("input, select, button").forEach((control) => {
+      if (control.closest("#sort-filter")) {
+        return;
+      }
+      if (locked) {
+        if (!control.disabled) {
+          control.disabled = true;
+          control.dataset.layoutLocked = "1";
+        }
+      } else if (control.dataset.layoutLocked) {
+        control.disabled = false;
+        delete control.dataset.layoutLocked;
+      }
+    });
+    els.filters.classList.toggle("layout-locked", locked);
+  }
+
   function renderSortStack() {
     const fields = sortFields();
+    syncLayoutLock();
+    if (layoutActive()) {
+      const options = fields.map(([value, label]) => `<option value="${value}"${value === LAYOUT_SORT ? " selected" : ""}>${label}</option>`).join("");
+      els.sortStack.innerHTML = `<div class="sort-column"><div class="sort-row"><select data-index="0" aria-label="Sort by">${options}</select></div></div>`;
+      return;
+    }
     const used = new Set(state.sorts.map((item) => item.key));
-    const canAdd = state.sorts.length < fields.length;
+    const canAdd = state.sorts.length < fields.filter(([value]) => value !== LAYOUT_SORT).length;
     const columns = [];
     for (let start = 0; start < state.sorts.length; start += SORTS_PER_COLUMN) {
       columns.push(state.sorts.slice(start, start + SORTS_PER_COLUMN));
@@ -1468,7 +1511,7 @@
       const rows = group.map((criterion, offset) => {
         const index = base + offset;
         const options = fields.map(([value, label]) => {
-          const taken = used.has(value) && value !== criterion.key;
+          const taken = value !== LAYOUT_SORT && used.has(value) && value !== criterion.key;
           return `<option value="${value}"${value === criterion.key ? " selected" : ""}${taken ? " disabled" : ""}>${label}</option>`;
         }).join("");
         const remove = state.sorts.length > 1
@@ -1520,6 +1563,10 @@
   }
 
   function filtered() {
+    if (layoutActive()) {
+      state.filterNote = "";
+      return state.rows.slice().sort(compareSort);
+    }
     state.filterNote = state.filterNote.startsWith("tag") ? state.filterNote : "";
     const type = els.type.value.trim().toLowerCase();
     const label = els.label.value.trim().toLowerCase();
@@ -1821,6 +1868,7 @@
       els.locate.value,
       views.join(""),
       state.sorts.map((item) => `${item.key}:${item.desc ? 1 : 0}`).join(","),
+      layoutActive() ? state.layoutEpoch : "",
       state.cropSize || 0,
     ].join("\n");
   }
@@ -1979,10 +2027,14 @@
 
   function layoutCards(cards) {
     const cardPx = cardPixelSize();
-    const columns = columnCount(els.grid.clientWidth);
+    const columns = viewColumnCount();
     const packed = packMemo.packed;
     const from = packMemo.repackFrom;
-    if (!packed || packed.columns !== columns || from === 0) {
+    if (layoutActive()) {
+      if (!packed || packed.viewColumns !== columns || from != null) {
+        packMemo.packed = packProcesses(cards, columns);
+      }
+    } else if (!packed || packed.columns !== columns || from === 0) {
       packMemo.packed = packGrid(cards, columns, null);
     } else if (from != null) {
       packMemo.packed = packGrid(cards, columns, {
@@ -2002,6 +2054,36 @@
       rowOffsets.push((index + 1) * baseHeight);
     }
     return { cardPx, baseHeight, rowOffsets, ...laid };
+  }
+
+  // The process / branch layout: every card at the row and column static/process_layout.js gives it. Cards that are
+  // approved or rejected count as done; the layout drops finished processes. The grid may be wider than the screen.
+  function packProcesses(cards, viewColumns) {
+    const input = cards.map((windows) => {
+      const row = windows[0];
+      const radius = Number(row.radius);
+      return {
+        id: String(row.location_id),
+        z: Number(row.z) || 0,
+        area: Number.isFinite(radius) ? Math.PI * radius * radius : 0,
+        done: reviewClass(row) !== "unknown",
+      };
+    });
+    const laid = window.ProcessLayout.layoutProcesses({ cards: input, links: state.convLinks, maxColumns: viewColumns });
+    const byId = new Map(cards.map((windows) => [String(windows[0].location_id), windows[0]]));
+    const cells = laid.cells.map((cell) => ({ row: byId.get(cell.id), gr: cell.row, gc: cell.col, group: cell.group }));
+    const packed = {
+      columns: Math.max(laid.columns, viewColumns),
+      viewColumns,
+      totalRows: Math.max(laid.totalRows, 1),
+      cells,
+      starts: [0],
+      anchors: [],
+      anchorStarts: [0],
+    };
+    assignLinkHues(packed.cells);
+    assignJoins(packed.cells);
+    return packed;
   }
 
   // Why the grid is empty when locations were asked for: not in this volume, or hidden by another filter.
@@ -2024,6 +2106,12 @@
   function showLocations() {
     els.scroller.scrollTop = 0;
     render(true);
+  }
+
+  // How many cards fit across the screen: the scroller's width less the grid's 16px margins. The grid itself can be
+  // wider than that (the process layout), so its own width says nothing about the screen.
+  function viewColumnCount() {
+    return columnCount(Math.max(0, els.scroller.clientWidth - 32));
   }
 
   function columnCount(width) {
@@ -2111,6 +2199,13 @@
     const { cardPx, columns, baseHeight, totalRows, rowOffsets, cells } = layout;
     els.grid.style.setProperty("--grid-gap", `${GRID_GAP}px`);
     els.grid.style.gridTemplateColumns = `repeat(${columns}, ${cardPx}px)`;
+    // The process layout can be wider than the screen: give the grid its full width so the scroller gets a
+    // horizontal scrollbar. Other layouts fit the screen.
+    const fullWidth = columns * cardPx + (columns - 1) * GRID_GAP;
+    const wide = layoutActive() && columns > viewColumnCount();
+    els.grid.style.right = wide ? "auto" : "";
+    els.grid.style.width = wide ? `${fullWidth}px` : "";
+    els.spacer.style.width = wide ? `${fullWidth + 32}px` : "";
     els.grid.style.gridAutoRows = `${Math.max(1, baseHeight - GRID_GAP)}px`;
     els.spacer.style.height = `${rowOffsets[rowOffsets.length - 1] || baseHeight}px`;
     const missNote = cards.length ? "" : locationMissNote();
@@ -2201,6 +2296,8 @@
           return;
         }
         window.ConverterMode.attachCards(state.rows, cards.cards);
+        state.convLinks = cards.links || [];
+        state.layoutEpoch += 1;
       } catch {
         // The cards are extra detail; the grid works without them.
       }
@@ -2246,7 +2343,9 @@
     }
     if (applyDefaultSort) {
       const hasLoss = state.rows.some((row) => row.loss != null);
-      state.sorts = [{ key: hasLoss ? "loss" : "z", desc: hasLoss }];
+      state.sorts = state.converter
+        ? [{ key: LAYOUT_SORT, desc: false }]
+        : [{ key: hasLoss ? "loss" : "z", desc: hasLoss }];
     }
     renderSortStack();
     render();
@@ -2352,8 +2451,12 @@
       applyLocalReview(row, act);
     }
     const classes = visibleClasses();
-    const stays = rows.some((row) => classes.has(reviewClass(row)));
-    if (!stays) {
+    const stays = !layoutActive() && rows.some((row) => classes.has(reviewClass(row)));
+    if (layoutActive()) {
+      // A finished process leaves the layout and the rest moves up, so the whole layout is redone.
+      state.layoutEpoch += 1;
+      resetVisibleCards();
+    } else if (!stays) {
       forgetVisibleLocation(locationId);
     }
     paintReviewNow(locationId);
@@ -2387,7 +2490,10 @@
     const approving = act === "approve";
     const wanted = approving ? "approved" : "rejected";
     const ids = ensureVisibleCards()
-      .filter((windows) => windows.some((row) => reviewClass(row) !== wanted))
+      // The process layout shows every card, so a batch there only touches cards nobody has decided yet.
+      .filter((windows) => (layoutActive()
+        ? windows.every((row) => reviewClass(row) === "unknown")
+        : windows.some((row) => reviewClass(row) !== wanted)))
       .map((windows) => windows[0].location_id);
     if (!ids.length) {
       els.status.textContent = `Nothing to ${approving ? "accept" : "reject"}: every visible card is already ${wanted}.`;
@@ -2503,10 +2609,17 @@
       lines.push(...window.GoldMode.infoLines(row.gold));
     }
     if (viewer.negatives) {
-      const count = viewer.negatives.count;
-      lines.push(
-        `${count} negative annotation${count === 1 ? "" : "s"} <span class="neg-state">(N: ${negativesOn() ? "hide" : "show"})</span>`,
-      );
+      // In the converter the existing annotation is one of the regions: it is red, the proposal's hue, both yellow.
+      const existing = state.converter ? 1 : 0;
+      const count = viewer.negatives.count - existing;
+      const parts = [];
+      if (existing) {
+        parts.push("existing annotation in red");
+      }
+      if (count > 0) {
+        parts.push(`${count} negative annotation${count === 1 ? "" : "s"}`);
+      }
+      lines.push(`${parts.join(", ")} <span class="neg-state">(N: ${negativesOn() ? "hide" : "show"})</span>`);
     }
     return lines.map((line) => `<div>${line}</div>`).join("");
   }
@@ -2776,7 +2889,7 @@
     viewer.parts = null;
     viewer.image = null;
     viewer.overlay = null;
-    spaceHidesMask = false;
+    setMaskHidden(false);
     els.viewer.hidden = true;
   }
 
@@ -3108,32 +3221,27 @@
     viewer.partIndex = Number(button.dataset.index);
     paintViewer();
   });
-  let pointerShowsMask = true;
-  let spaceHidesMask = false;
+  // Whether the viewer hides the mask. Space toggles it; the Hide and Show buttons on the image set it. The pointer's
+  // position on the image does nothing.
+  let maskHidden = false;
 
   function applyMaskVisibility() {
-    const show = spaceHidesMask ? !pointerShowsMask : pointerShowsMask;
-    els.viewerMask.style.opacity = show ? "1" : "0";
-    els.viewerCues.querySelector(".show").classList.toggle("active", show && pointerShowsMask);
-    els.viewerCues.querySelector(".hide").classList.toggle("active", !show && !pointerShowsMask);
+    els.viewerMask.style.opacity = maskHidden ? "0" : "1";
+    els.viewerCues.querySelector(".show").classList.toggle("active", !maskHidden);
+    els.viewerCues.querySelector(".hide").classList.toggle("active", maskHidden);
   }
 
-  function setPointerShowsMask(show) {
-    pointerShowsMask = show;
+  function setMaskHidden(hidden) {
+    maskHidden = hidden;
     applyMaskVisibility();
   }
 
-  els.viewer.addEventListener("mousemove", (event) => {
-    const frame = els.viewerFrame.getBoundingClientRect();
-    const overImage = event.clientX >= frame.left && event.clientX <= frame.right
-      && event.clientY >= frame.top && event.clientY <= frame.bottom;
-    if (!overImage) {
-      setPointerShowsMask(true);
-      return;
+  els.viewerCues.addEventListener("click", (event) => {
+    const cue = event.target.closest(".viewer-cue");
+    if (cue) {
+      setMaskHidden(cue.dataset.side === "hide");
     }
-    setPointerShowsMask(event.clientX >= frame.left + frame.width / 2);
   });
-  els.viewer.addEventListener("mouseleave", () => setPointerShowsMask(true));
   function zoomKeyTarget(event) {
     const tag = event.target && event.target.tagName;
     return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
@@ -3202,8 +3310,7 @@
     }
     // A tap used to hide the mask only until keyup, which fired before the
     // change was visible. Space toggles and stays until the next press.
-    spaceHidesMask = !spaceHidesMask;
-    applyMaskVisibility();
+    setMaskHidden(!maskHidden);
   }, true);
   window.addEventListener("keyup", (event) => {
     if (!isSpaceKey(event)) {
@@ -3220,11 +3327,7 @@
     event.preventDefault();
   }, true);
   window.addEventListener("blur", () => {
-    spaceHidesMask = false;
     setGridMasksHidden(false);
-    if (!els.viewer.hidden) {
-      applyMaskVisibility();
-    }
   });
   window.addEventListener("keydown", (event) => {
     if (!els.viewer.hidden && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
@@ -3281,7 +3384,7 @@
     const add = event.target.closest("#sort-add");
     if (add) {
       const used = new Set(state.sorts.map((item) => item.key));
-      const next = sortFields().find(([value]) => !used.has(value));
+      const next = sortFields().find(([value]) => value !== LAYOUT_SORT && !used.has(value));
       if (next) {
         state.sorts.push({ key: next[0], desc: false });
         renderSortStack();
@@ -3309,7 +3412,13 @@
     if (!select) {
       return;
     }
-    state.sorts[Number(select.dataset.index)].key = select.value;
+    if (select.value === LAYOUT_SORT) {
+      state.sorts = [{ key: LAYOUT_SORT, desc: false }];
+    } else if (layoutActive()) {
+      state.sorts = [{ key: select.value, desc: false }];
+    } else {
+      state.sorts[Number(select.dataset.index)].key = select.value;
+    }
     renderSortStack();
     render();
   });
@@ -3816,6 +3925,9 @@
     timer: 0,
     wasRunning: false,
     cancelling: false,
+    // A converter build shows its cards as they are made: the built count last shown and when (ms), to throttle reloads.
+    shownBuilt: 0,
+    shownAt: 0,
     dialog: document.getElementById("update-dialog"),
     since: document.getElementById("update-since"),
     last: document.getElementById("update-last"),
@@ -3854,7 +3966,8 @@
     const since = status.watermarkBefore
       ? status.watermarkBefore.replace("T", " ").replace(/\.\d+Z$/, "Z")
       : "";
-    const place = status.pages ? `page ${count(status.page)} of ${count(status.pages)}` : "";
+    const unit = status.unit || "page";
+    const place = status.pages ? `${unit} ${count(status.page)} of ${count(status.pages)}` : "";
     let headline;
     if (running && cancelling) {
       headline = "Cancelling, finishing the row in progress";
@@ -3974,11 +4087,20 @@
     paintUpdate(status);
     if (status.running) {
       updateUi.wasRunning = true;
+      const built = status.refreshed || 0;
+      if (state.converter && built > updateUi.shownBuilt && Date.now() - updateUi.shownAt > 5000) {
+        // Cards made so far appear while the build goes on, not only when it ends.
+        updateUi.shownBuilt = built;
+        updateUi.shownAt = Date.now();
+        await loadCatalog(false, true).catch(() => {});
+      }
       updateUi.timer = window.setTimeout(pollUpdate, 1000);
       return;
     }
     const justFinished = updateUi.wasRunning;
     updateUi.wasRunning = false;
+    updateUi.shownBuilt = 0;
+    updateUi.shownAt = 0;
     if (justFinished && (status.refreshed || status.added || status.circles)) {
       for (const id of status.refreshedIds || []) {
         locationGenerations.set(Number(id), locationGen(id) + 1);
@@ -4216,6 +4338,49 @@
     });
     document.getElementById("converter-continue").addEventListener("click", () => {
       document.getElementById("update-all").click();
+    });
+    // Delete the open build, after a warning that names what is lost. A running build must be cancelled first.
+    const currentBuild = () => {
+      const [set, volume] = document.getElementById("converter-build-select").value.split("|");
+      return (state.builds || []).find((build) => build.set === set && build.volume === volume) || null;
+    };
+    document.getElementById("converter-delete").addEventListener("click", () => {
+      const build = currentBuild();
+      if (!build) {
+        return;
+      }
+      document.getElementById("delete-warning").textContent = build.running
+        ? `Structure ${build.structureId} of ${build.volume} is still building. Cancel the build first.`
+        : window.ConverterMode.deleteWarning(build);
+      document.getElementById("delete-confirm").disabled = Boolean(build.running);
+      document.getElementById("delete-error").hidden = true;
+      document.getElementById("delete-dialog").hidden = false;
+      document.getElementById("delete-cancel").focus();
+    });
+    document.getElementById("delete-cancel").addEventListener("click", () => {
+      document.getElementById("delete-dialog").hidden = true;
+    });
+    document.getElementById("delete-confirm").addEventListener("click", async () => {
+      const build = currentBuild();
+      if (!build) {
+        return;
+      }
+      const confirm = document.getElementById("delete-confirm");
+      confirm.disabled = true;
+      try {
+        await getJson("/api/converter/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ set: build.set, volume: build.volume }),
+        });
+        // The page was built around this build; start over from what is left (or the empty page).
+        window.location.reload();
+      } catch (error) {
+        const message = document.getElementById("delete-error");
+        message.textContent = `Not deleted: ${error.message}`;
+        message.hidden = false;
+        confirm.disabled = false;
+      }
     });
     document.getElementById("converter-failed").addEventListener("click", () => {
       const failed = (state.convCards || []).filter((card) => card.state === "failed");

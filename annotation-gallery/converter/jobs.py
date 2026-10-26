@@ -142,6 +142,7 @@ class BuildJob:
                 "running": self.running,
                 "page": self.processed,
                 "pages": self.total,
+                "unit": "location",
                 "entitiesSeen": self.processed,
                 "refreshed": summary.built,
                 "unchanged": summary.skipped,
@@ -211,6 +212,14 @@ class BuildJob:
 def current_job(set_name: str, volume: str) -> Optional[BuildJob]:
     with _JOBS_LOCK:
         return _JOBS.get((set_name, volume))
+
+
+def forget_job(set_name: str, volume: str) -> None:
+    """Drop the finished job of a build that was deleted, so a later build of the same structure starts clean."""
+    with _JOBS_LOCK:
+        existing = _JOBS.get((set_name, volume))
+        if existing is not None and not existing.running:
+            del _JOBS[(set_name, volume)]
 
 
 def start_job(job: BuildJob) -> BuildJob:

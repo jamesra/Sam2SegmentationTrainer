@@ -118,6 +118,19 @@ def test_cards_report_state_reason_and_overlap(httpd) -> None:
     assert cards[13]["state"] == "failed" and "below one pixel" in cards[13]["reason"]
 
 
+def test_the_cards_answer_carries_the_location_links(httpd, built: Path) -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(str(built / "annotation_crops.sqlite"))
+    connection.execute("CREATE TABLE IF NOT EXISTS converter_links (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))")
+    connection.execute("DELETE FROM converter_links")
+    connection.executemany("INSERT INTO converter_links (a, b) VALUES (?, ?)", [(11, 12), (12, 13)])
+    connection.commit()
+    connection.close()
+    status, payload = get_json(httpd, f"/api/volumes/RC1/converter/cards?set={SET}")
+    assert status == 200 and payload["links"] == [[11, 12], [12, 13]]
+
+
 def test_current_outline_masks_and_images_are_served(httpd, built: Path) -> None:
     key = f"{fixtures.VOLUME}_7_D1_L11"
     for relative in (f"original/{key}_11.png", f"masks/{key}_11.png", f"images/{key}.png"):
@@ -489,3 +502,48 @@ def test_a_volume_without_a_source_record_still_uses_the_templates(clean_httpd) 
     jobs.OVERRIDES["get_json"] = lambda url: asked.append(url) or {"@odata.count": 1, "value": []}
     call_json(clean_httpd, "/api/converter/preview", {"structureId": 7})
     assert asked[0].startswith("https://websvc.codepharm.net/RC1/OData/Locations?")
+
+
+# ---- deleting a build --------------------------------------------------------------------------------------------
+
+def test_deleting_a_build_removes_its_folder_and_the_empty_structure(httpd, built: Path, converter_root: Path) -> None:
+    assert request(httpd, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 200
+    assert not built.exists() and not (converter_root / SET).exists()
+    assert call_json(httpd, "/api/converter/builds")[1]["builds"] == []
+    assert request(httpd, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 404
+
+
+def test_deleting_keeps_the_structures_other_volumes(httpd, built: Path, converter_root: Path) -> None:
+    other = converter_root / SET / "RC2"
+    other.mkdir()
+    (other / "keep.txt").write_text("x")
+    assert request(httpd, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 200
+    assert not built.exists() and (other / "keep.txt").is_file()
+
+
+@pytest.mark.parametrize("body", [{}, {"set": "structure-500"}, {"set": "../x", "volume": "RC1"}, {"set": SET, "volume": "../RC1"}])
+def test_deleting_needs_a_valid_set_and_volume(httpd, built: Path, body) -> None:
+    assert request(httpd, "POST", "/api/converter/delete", body)[0] == 400
+    assert built.is_dir()
+
+
+def test_a_reader_cannot_delete_a_build(built: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GALLERY_STUB_ROLE", "read")
+    server = make_server("127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        address = (str(server.server_address[0]), int(server.server_address[1]))
+        assert request(address, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 403
+        assert built.is_dir()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_running_build_is_not_deleted(httpd, built: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Running:
+        running = True
+
+    monkeypatch.setattr(jobs, "current_job", lambda set_name, volume: Running())
+    assert request(httpd, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 409
+    assert built.is_dir()

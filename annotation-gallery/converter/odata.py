@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 from converter import geo
 
-SELECT = "ID,ParentID,TypeCode,Z,OffEdge,MosaicShape,LastModified,Radius"
+SELECT = "ID,ParentID,TypeCode,Z,X,Y,OffEdge,MosaicShape,LastModified,Radius"
 EXPAND = "Parent($select=ID,TypeID,Label;$expand=Type($select=ID,Name,ParentID))"
 PAGE_SIZE = 500
 
@@ -54,9 +54,13 @@ def _tags(value: Any) -> Tuple[str, ...]:
     return ()
 
 
-def _point_of(wkt: str) -> Optional[Tuple[float, float]]:
-    numbers = [float(m.group(0)) for m in geo._COORD.finditer(wkt)]
-    return (numbers[0], numbers[1]) if len(numbers) >= 2 else None
+def _center_of(entity: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """A circle's centre is the location's own X, Y (mosaic pixels). Its MosaicShape is a ring of rim points whose first
+    point is the rightmost one, so the shape must not be used for it."""
+    x, y = entity.get("X"), entity.get("Y")
+    if x in (None, "") or y in (None, ""):
+        return None
+    return float(x), float(y)
 
 
 def record_from_entity(entity: Dict[str, Any]) -> Optional[LocationRecord]:
@@ -88,7 +92,7 @@ def record_from_entity(entity: Dict[str, Any]) -> Optional[LocationRecord]:
     if base["structure_id"] is not None:
         base["structure_id"] = int(base["structure_id"])
     if type_code == 1:
-        center = _point_of(wkt)
+        center = _center_of(entity)
         if center is None or not radius or radius <= 0:
             return None
         return LocationRecord(center=center, **base)
@@ -119,9 +123,8 @@ def filter_text(
     type_codes: Sequence[int] = DEFAULT_TYPE_CODES,
     z_min: Optional[int] = None,
     z_max: Optional[int] = None,
-    include_off_edge: bool = False,
 ) -> str:
-    """``$filter`` for one structure's locations: the types and Z range the user chose."""
+    """``$filter`` for one structure's locations: the types and Z range the user chose. Off-edge locations are included."""
     clauses = [f"ParentID eq {int(structure_id)}"]
     if type_codes:
         clauses.append("(" + " or ".join(f"TypeCode eq {int(code)}" for code in type_codes) + ")")
@@ -129,8 +132,6 @@ def filter_text(
         clauses.append(f"Z ge {int(z_min)}")
     if z_max is not None:
         clauses.append(f"Z le {int(z_max)}")
-    if not include_off_edge:
-        clauses.append("OffEdge eq false")
     return " and ".join(clauses)
 
 
@@ -183,6 +184,21 @@ def iter_locations(
                 record = record_from_entity(entity)
                 if record is not None:
                     yield record
+
+
+def links_url(base: str, structure_id: int) -> str:
+    """Every location link with an end in the structure's locations, as ``A`` and ``B`` location ids."""
+    return f"{base.rstrip('/')}/StructureLocationLinks(StructureID={int(structure_id)})?$select=A,B&$orderby=A,B"
+
+
+def iter_links(base: str, structure_id: int, *, get_json: GetJson = http_get_json) -> Iterator[Tuple[int, int]]:
+    """The structure's location links page by page, each as ``(a, b)`` with ``a < b``; a link is stored once."""
+    for page in iter_pages(links_url(base, structure_id), get_json):
+        for entity in page.get("value") or []:
+            if isinstance(entity, dict) and entity.get("A") is not None and entity.get("B") is not None:
+                a, b = int(entity["A"]), int(entity["B"])
+                if a != b:
+                    yield (a, b) if a < b else (b, a)
 
 
 def count_locations(base: str, structure_id: int, *, get_json: GetJson = http_get_json, **filters: Any) -> int:

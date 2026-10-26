@@ -991,6 +991,11 @@ def test_tag_pattern_matches_structure_and_type_tags() -> None:
     assert structure_ids_for_tag_pattern(structures, types, "synapse") == [10]
     assert structure_ids_for_tag_pattern(structures, types, "^gap$") == [11]
     assert structure_ids_for_tag_pattern(structures, types, "syn|gap") == [10, 11]
+    # Not a valid regular expression, so read as a wildcard pattern.
+    assert structure_ids_for_tag_pattern(structures, types, "*nap*") == [10]
+    assert structure_ids_for_tag_pattern(structures, types, "*ga?") == [11]
+    with pytest.raises(re.error):
+        structure_ids_for_tag_pattern(structures, types, "(")
 
 
 def test_thumbnail_rewritten_only_when_older_than_mask(

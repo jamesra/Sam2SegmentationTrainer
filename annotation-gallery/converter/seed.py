@@ -1,14 +1,15 @@
-"""Seeds for the segmentation server: what we already know about a location, as a mask plus a few clicks.
+"""Seeds for the segmentation server: what we already know about a location, as a shape plus a few clicks.
 
 Everything is in mosaic pixels at the request's downsample, X right, Y up, like the protocol.
 
-* A circle (LocationType 1) is a disc mask plus four clicks on its rim at 0.95 r, the encoding Viking's own segmentation
-  command uses for circles.
-* A polygon, curve polygon or closed curve (4, 6, 7) is the filled polygon plus clicks inside it: the point farthest from
-  the edge and one more in each of up to three well-separated deep parts. It is sent with ``MASK_ROLE_CORRECTION``: the
-  outline is an existing annotation that may be wrong, not a trusted starting shape. Checked live on the v5 server with an
-  RC1 location (1473146): as a SEED the walk leaked out of the structure (IoU with the original 0.23); as a CORRECTION it
-  followed the boundary (IoU 0.94).
+* A circle (LocationType 1) is a circle shape with its TRUE radius plus four clicks on its rim at 0.95 r, the encoding
+  Viking's own segmentation command uses for circles. The server softens the circle with the model's
+  circle_diameter_scale; the client never scales it.
+* A polygon, curve polygon or closed curve (4, 6, 7) is the polygon shape (exterior and holes) plus clicks inside it: the
+  point farthest from the edge and one more in each of up to three well-separated deep parts. The server softens every
+  foreground shape (an outline whose edge is not reliable), which is what an existing, possibly wrong annotation is.
+  (Under the old protocol it went as a CORRECTION mask; checked live on the v5 server with RC1 location 1473146: as a
+  SEED the walk leaked out of the structure, IoU 0.23 with the original; as a CORRECTION it followed the boundary, 0.94.)
 * Points and open curves are not seedable.
 """
 
@@ -21,8 +22,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import distance_transform_edt
 
-from converter.seg_client import MaskArray, Prompt
-from seg_proto import segmentation_pb2 as pb
+from converter.seg_client import MaskArray, Prompt, circle_shape, polygon_shape
 
 POINT, CIRCLE, ELLIPSE, POLYLINE, POLYGON, OPENCURVE, CURVEPOLYGON, CLOSEDCURVE = range(8)
 SEEDABLE = (CIRCLE, POLYGON, CURVEPOLYGON, CLOSEDCURVE)
@@ -93,7 +93,7 @@ def interior_points(mask: MaskArray, count: int = 4) -> List[Tuple[int, int]]:
 
 
 def circle_prompt(cx: float, cy: float, radius: float) -> Prompt:
-    """Disc seed plus four rim clicks at 0.95 r (left, right, top, bottom)."""
+    """The circle (true radius) plus four rim clicks at 0.95 r (left, right, top, bottom)."""
     if radius < 1.0:
         raise NotSeedable("circle radius is below one pixel at this downsample")
     rim = RIM_FRACTION * radius
@@ -103,14 +103,14 @@ def circle_prompt(cx: float, cy: float, radius: float) -> Prompt:
         (int(round(cx)), int(round(cy - rim))),
         (int(round(cx)), int(round(cy + rim))),
     ]
-    return Prompt(foreground_points=clicks, foreground_mask=disc_mask(cx, cy, radius), mask_role=pb.MASK_ROLE_SEED)
+    return Prompt(foreground_points=clicks, foreground_shapes=[circle_shape(cx, cy, radius)])
 
 
 def polygon_prompt(ring: Sequence[Tuple[float, float]], holes: Sequence[Sequence[Tuple[float, float]]] = ()) -> Prompt:
     if len(ring) < 4:
         raise NotSeedable("polygon has fewer than three vertices")
-    mask = polygon_mask(ring, holes)
-    clicks = interior_points(mask)
+    """The polygon (exterior and holes) plus clicks in its deepest parts; the raster only places the clicks."""
+    clicks = interior_points(polygon_mask(ring, holes))
     if not clicks:
         raise NotSeedable("polygon is empty at this downsample")
-    return Prompt(foreground_points=clicks, foreground_mask=mask, mask_role=pb.MASK_ROLE_CORRECTION)
+    return Prompt(foreground_points=clicks, foreground_shapes=[polygon_shape(ring, holes)])

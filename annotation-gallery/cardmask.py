@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image
 
 from annotation_crops.negatives import circle_file_stamp
-from negatives_view import IMAGE_KEY_PATTERN, _sidecar, negative_bitmask
+from negatives_view import IMAGE_KEY_PATTERN, _sidecar, negative_bitmask, original_mask_path
 from thumbs import THUMB_SIZES
 
 CARD_MASK_DIR = ("overlays", "cardmask")
@@ -89,6 +89,7 @@ def _newest_source_ns(crops: Path, image_key: str, location_id: int, own: Path |
     newest = max(sidecar_ns, circle_file_stamp(crops) or 0)
     if own is not None:
         newest = max(newest, _mtime_ns(own))
+    newest = max(newest, _mtime_ns(original_mask_path(crops, image_key, location_id)))
     masks = crops / "masks"
     for other in ids:
         if other != location_id:
