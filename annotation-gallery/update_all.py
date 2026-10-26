@@ -61,7 +61,7 @@ RETRY_BATCH = 50
 SKIP_LINES_KEPT = 200
 ERRORS_KEPT = 20
 
-_SELECT = "ID,ParentID,TypeCode,Z,OffEdge,MosaicShape,LastModified,Radius"
+_SELECT = "ID,ParentID,TypeCode,Z,X,Y,OffEdge,MosaicShape,LastModified,Radius"
 _EXPAND = "Parent($select=ID,TypeID,Label;$expand=Type($select=ID,Name,ParentID))"
 
 GetJson = Callable[[str], dict[str, Any]]
@@ -297,7 +297,15 @@ def circle_for_entity(entity: dict[str, Any]) -> Circle | None:
     label = _label_of(entity)
     if type_code == CIRCLE_TYPE_CODE:
         radius = entity.get("Radius")
-        return annotated_circle(location_id, wkt, None if radius in (None, "") else float(radius), label)
+        x, y = entity.get("X"), entity.get("Y")
+        return annotated_circle(
+            location_id,
+            None if x in (None, "") else float(x),
+            None if y in (None, "") else float(y),
+            None if radius in (None, "") else float(radius),
+            wkt,
+            label,
+        )
     polygons = support.hydrate_polygons(support.parse_wkt_polygons(wkt), type_code)
     return inscribed_circle(location_id, polygons, label)
 

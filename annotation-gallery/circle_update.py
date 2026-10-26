@@ -116,14 +116,22 @@ def _circumcenter(a: tuple[float, float], b: tuple[float, float], c: tuple[float
     return ux, uy
 
 
-def annotated_circle(location_id: int, wkt: str, stored_radius: float | None, label: str) -> Circle | None:
-    """Circle for a Viking circle location. The stored ``Radius`` wins when positive, else the WKT's."""
-    shape = circle_geometry_from_wkt(wkt)
-    if shape is None:
+def annotated_circle(
+    location_id: int, x: float | None, y: float | None, stored_radius: float | None, wkt: str, label: str
+) -> Circle | None:
+    """Circle for a Viking circle location. The centre is the location's own mosaic ``X``, ``Y`` (never read from the shape:
+    the ring's first point is the rim, not the centre). The stored ``Radius`` (mosaic pixels) wins when positive, else the
+    WKT's. None when ``X`` or ``Y`` is missing or there is no usable radius."""
+    if x is None or y is None:
         return None
-    center_x, center_y, wkt_radius = shape
-    radius = float(stored_radius) if stored_radius is not None and stored_radius > 0 else wkt_radius
-    return Circle(location_id, center_x, center_y, radius, label, False, SOURCE_ANNOTATED)
+    if stored_radius is not None and stored_radius > 0:
+        radius = float(stored_radius)
+    else:
+        shape = circle_geometry_from_wkt(wkt)
+        if shape is None:
+            return None
+        radius = shape[2]
+    return Circle(location_id, float(x), float(y), radius, label, False, SOURCE_ANNOTATED)
 
 
 def max_inscribed_circle(polygons: Sequence[Sequence[Ring]]) -> tuple[float, float, float] | None:

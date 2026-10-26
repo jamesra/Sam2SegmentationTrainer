@@ -495,9 +495,10 @@ def test_circle_geometry_from_circularstring_and_circle_wkt() -> None:
     assert (round(x, 6), round(y, 6), round(r, 6)) == (100.0, 100.0, 10.0)
     assert circle_geometry_from_wkt("CIRCLE((5 6), 7)") == (5.0, 6.0, 7.0)
     assert circle_geometry_from_wkt("POINT(1 2)") is None
-    stored = annotated_circle(3, wkt, 12.5, "MC")
+    stored = annotated_circle(3, 100.0, 100.0, 12.5, wkt, "MC")
     assert stored.radius == 12.5 and stored.source == "annotated" and not stored.has_polygon_mask
-    assert annotated_circle(3, wkt, None, "MC").radius == 10.0
+    assert (stored.center_x, stored.center_y) == (100.0, 100.0)
+    assert annotated_circle(3, 100.0, 100.0, None, wkt, "MC").radius == 10.0
 
 
 def test_inscribed_circle_of_a_square_and_a_c_shape() -> None:

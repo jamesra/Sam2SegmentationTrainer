@@ -316,10 +316,21 @@ def test_text_that_is_not_a_circle_is_rejected() -> None:
 @FAST
 @given(_CENTER, _CENTER, st.floats(0.5, 1e4), st.one_of(st.none(), st.floats(-5, 1e4, allow_nan=False)))
 def test_a_positive_stored_radius_wins_over_the_shape(cx, cy, wkt_radius, stored) -> None:
-    circle = annotated_circle(7, f"CIRCLE(({cx!r} {cy!r}), {wkt_radius!r})", stored, "mito")
+    circle = annotated_circle(7, cx, cy, stored, f"CIRCLE(({cx!r} {cy!r}), {wkt_radius!r})", "mito")
     assert circle is not None
     expected = stored if stored is not None and stored > 0 else wkt_radius
     assert (circle.center_x, circle.center_y, circle.radius) == (cx, cy, expected)
+
+
+def test_the_centre_is_the_locations_x_y_not_the_first_point_of_its_ring() -> None:
+    # Location 175934 of RC1: the ring starts at the rightmost rim point, one radius east of the centre.
+    ring = (
+        "CURVEPOLYGON (CIRCULARSTRING (90374.96249806066 75593.728178269783, 90339.857386245509 75628.833290084935, "
+        "90304.752274430357 75593.728178269783, 90339.857386245509 75558.623066454631, 90374.96249806066 75593.728178269783))"
+    )
+    circle = annotated_circle(175934, 90339.857386245509, 75593.728178269783, 35.105111815147481, ring, "mito")
+    assert circle is not None and (circle.center_x, circle.center_y) == (90339.857386245509, 75593.728178269783)
+    assert annotated_circle(175934, None, 75593.7, 35.1, ring, "mito") is None  # no X, Y: not guessed from the ring
 
 
 # ------------------------------------------------------------------------------------- entries_for_circle
