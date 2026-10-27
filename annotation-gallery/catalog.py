@@ -15,6 +15,14 @@ from typing import Any, Callable, Iterable, TypeVar
 import crops_path  # noqa: F401
 from annotation_crops.ignore import load_ignore_ids as _load_ignore_ids
 from annotation_crops.ignore import save_ignore_ids as _save_ignore_ids
+from annotation_crops.card_scores import (
+    card_score_history,
+    ensure_card_scores_schema,
+    latest_card_scores,
+    queue_location,
+    request_status,
+    scorer_alive,
+)
 from annotation_crops.scores import ensure_location_scores_schema
 
 SAM2_COLUMNS = (
@@ -315,19 +323,178 @@ def _latest_losses(
     return by_window, legacy
 
 
+# ---- card scores (annotation_crops.card_scores) ------------------------------------------------------------------
+#
+# A card's score is IoU, core recall and spill of that one crop window: its newest validation score (exact: the
+# training run's validation, or the scorer service's re-score), else its newest training-pass score (cardKind
+# "train": measured as the card was trained, not comparable). The catalog carries it as flat fields, only on cards that
+# have one, so the browser can sort on them and an unscored card simply lacks them (and sorts last). ``cardOld`` is the
+# score of the same kind before it (a re-score's, or the previous epoch's).
+
+CARD_SCORE_FIELDS = (
+    "cardIou", "cardCore", "cardSpill", "cardMismatch", "cardModel", "cardScoredAt", "cardOld", "cardKind", "cardEpoch",
+)
+"""``cardKind`` is "validation" (exact) or "train" (measured on the training pass); ``cardOld`` is of the same kind."""
+_IN_CHUNK = 500
+
+
+def _score_view(score: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "iou": score.get("iou"),
+        "core": score.get("core_recall"),
+        "spill": score.get("spill"),
+        "mismatch": score.get("mismatch"),
+        "model": score.get("model"),
+        "scoredAt": score.get("scored_at"),
+        "epoch": score.get("epoch"),
+    }
+
+
+def card_score_fields(pair: dict[str, Any] | None) -> dict[str, Any]:
+    """The catalog fields of one card from :func:`latest_card_scores`' ``{"new": ..., "old": ...}``; {} unscored."""
+    new = (pair or {}).get("new")
+    if not new:
+        return {}
+    view = _score_view(new)
+    old = pair.get("old")
+    return {
+        "cardIou": view["iou"],
+        "cardCore": view["core"],
+        "cardSpill": view["spill"],
+        "cardMismatch": view["mismatch"],
+        "cardModel": view["model"],
+        "cardScoredAt": view["scoredAt"],
+        "cardOld": _score_view(old) if old else None,
+        "cardKind": (pair or {}).get("kind") or "validation",
+        "cardEpoch": view["epoch"],
+    }
+
+
+def _card_score_connection(crops: str | os.PathLike[str]) -> sqlite3.Connection:
+    """A catalog connection with ``card_scores`` and ``card_score_requests`` in place."""
+    connection = connect(crops)
+    try:
+        ensure_card_scores_schema(connection)
+        connection.commit()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _card_scores(
+    connection: sqlite3.Connection, location_ids: Iterable[int] | None = None
+) -> dict[tuple[int, str], dict[str, Any]]:
+    """``{(location_id, image_key): card fields}`` for scored cards (every card when ``location_ids`` is None)."""
+    try:
+        if location_ids is None:
+            pairs = latest_card_scores(connection, None)
+        else:
+            ids = sorted({int(item) for item in location_ids})
+            pairs = {}
+            for start in range(0, len(ids), _IN_CHUNK):
+                pairs.update(latest_card_scores(connection, ids[start:start + _IN_CHUNK]))
+    except sqlite3.OperationalError:
+        return {}
+    return {key: fields for key, pair in pairs.items() if (fields := card_score_fields(pair))}
+
+
+def _rescoring_locations(connection: sqlite3.Connection) -> dict[int, dict[str, Any]]:
+    """Locations whose newest re-score request is still pending or running: ``{location_id: {id, state}}``."""
+    try:
+        rows = connection.execute(
+            """
+            SELECT r.id, r.location_id, r.state FROM card_score_requests AS r
+            JOIN (SELECT location_id, MAX(id) AS id FROM card_score_requests GROUP BY location_id) AS newest
+              ON newest.id = r.id
+            WHERE r.state IN ('pending', 'running')
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {int(row["location_id"]): {"id": int(row["id"]), "state": str(row["state"])} for row in rows}
+
+
+def card_scores_for(crops: str | os.PathLike[str], location_ids: Iterable[int]) -> list[dict[str, Any]]:
+    """The scored cards of these locations: ``[{location_id, image_key, cardIou, ..., cardOld}]``."""
+    ids = sorted({int(item) for item in location_ids})
+    if not ids or not sqlite_path(crops).is_file():
+        return []
+    connection = _card_score_connection(crops)
+    try:
+        scores = _card_scores(connection, ids)
+    finally:
+        connection.close()
+    return [
+        {"location_id": location_id, "image_key": image_key, **fields}
+        for (location_id, image_key), fields in sorted(scores.items())
+    ]
+
+
+def card_rescore_status(
+    crops: str | os.PathLike[str], location_ids: Iterable[int]
+) -> dict[int, dict[str, Any] | None]:
+    """The newest re-score request of each location (:func:`request_status`), None for one never queued."""
+    ids = sorted({int(item) for item in location_ids})
+    if not ids or not sqlite_path(crops).is_file():
+        return {location_id: None for location_id in ids}
+    connection = _card_score_connection(crops)
+    try:
+        return {location_id: request_status(connection, location_id) for location_id in ids}
+    finally:
+        connection.close()
+
+
+def card_history(crops: str | os.PathLike[str], location_id: int, image_key: str) -> dict[str, Any]:
+    """One card's scores over time for its trend graph (:func:`card_score_history`)."""
+    if not sqlite_path(crops).is_file():
+        return {"validation": [], "train": [], "loss": []}
+    connection = _card_score_connection(crops)
+    try:
+        return card_score_history(connection, int(location_id), str(image_key))
+    finally:
+        connection.close()
+
+
+class NoCardScorer(RuntimeError):
+    """No scorer service serves this catalog (no fresh heartbeat), so a queued re-score would never run."""
+
+
+def queue_card_rescore(crops: str | os.PathLike[str], location_id: int) -> dict[str, Any] | None:
+    """Ask the scorer service to re-score every card of ``location_id``; returns the request's status.
+
+    Raises :class:`NoCardScorer` when no scorer serves this volume (e.g. the SEM gallery while only a TEM run's
+    scorer runs), rather than leaving a request nobody will take."""
+    connection = _card_score_connection(crops)
+    try:
+        if scorer_alive(connection) is None:
+            raise NoCardScorer("no card scorer is running for this volume")
+        queue_location(connection, int(location_id))
+        connection.commit()
+        return request_status(connection, int(location_id))
+    finally:
+        connection.close()
+
+
 def list_catalog_rows(crops: str | os.PathLike[str]) -> list[dict[str, Any]]:
-    """Return catalog rows, with ``loss`` set to the latest score or None."""
+    """Return catalog rows, with ``loss`` set to the latest score or None.
+
+    A card with a card score (``card_scores``) also has the :data:`CARD_SCORE_FIELDS`, and a location whose newest
+    re-score request is pending or running has ``cardRescore`` (``{id, state}``) on each of its rows.
+    """
     path = sqlite_path(crops)
     if not path.is_file():
         return []
     crops_path = Path(crops)
-    connection = connect(crops)
+    connection = _card_score_connection(crops)
     try:
         rows = connection.execute(
             "SELECT * FROM locations ORDER BY z, location_id"
         ).fetchall()
         result = [dict(row) for row in rows]
         by_window, legacy = _latest_losses(connection)
+        card_scores = _card_scores(connection)
+        rescoring = _rescoring_locations(connection)
     finally:
         connection.close()
     approved = load_approved(crops)
@@ -335,6 +502,11 @@ def list_catalog_rows(crops: str | os.PathLike[str]) -> list[dict[str, Any]]:
         location_id = int(row["location_id"])
         image_key = str(row.get("image_key") or "")
         row["loss"] = by_window.get((location_id, image_key), legacy.get(location_id))
+        card = card_scores.get((location_id, image_key))
+        if card:
+            row.update(card)
+        if location_id in rescoring:
+            row["cardRescore"] = rescoring[location_id]
         row["approved"] = int(_approval_key(location_id, row.get("image_key") or "") in approved)
         if row.get("ignored"):
             row["approved"] = 0

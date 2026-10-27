@@ -1092,6 +1092,157 @@ body.no-review .review-only {
   font-size: 11px;
 }
 
+/* A card's card score (IoU · core · spill), pinned beside the caption so the caption's ellipsis never cuts it. */
+.card-score-slot {
+  flex: none;
+  white-space: nowrap;
+}
+
+.card-score-slot:empty {
+  display: none;
+}
+
+.card-score {
+  color: #e2e8f0;
+  font-variant-numeric: tabular-nums;
+}
+
+button.card-score {
+  margin: 0;
+  border: 1px solid transparent;
+  font: inherit;
+  font-size: 11px;
+  line-height: inherit;
+  cursor: pointer;
+}
+
+button.card-score:hover {
+  border-color: var(--accent);
+}
+
+.card-score.unscored {
+  color: var(--muted);
+}
+
+.card-score.rescoring {
+  color: #fbbf24;
+}
+
+.card-score.failed {
+  border: 1px solid #ef4444;
+}
+
+/* A training-pass score (measured while the card was trained) is muted and tagged "train". */
+.card-score.train {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.card-score .cs-tag {
+  margin-right: 4px;
+  padding: 0 3px;
+  border: 1px solid var(--muted);
+  border-radius: 3px;
+  font-style: normal;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* The trend icon beside a card's score, and the chart it opens. */
+.trend-btn {
+  margin: 0 0 0 3px;
+  padding: 0 2px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+  color: var(--muted);
+  line-height: 1;
+  vertical-align: middle;
+  cursor: pointer;
+}
+
+.trend-btn:hover,
+.trend-btn:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.trend-pop {
+  position: absolute;
+  z-index: 50;
+  width: 276px;
+  padding: 6px 8px 8px;
+  border: 1px solid #2d3440;
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 11px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.trend-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+  color: var(--muted);
+}
+
+.trend-close {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.trend-chart .trend-grid {
+  stroke: #2d3440;
+  stroke-width: 1;
+}
+
+.trend-chart .trend-axis {
+  fill: var(--muted);
+  font-size: 9px;
+}
+
+.trend-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.trend-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 3px;
+  margin-right: 3px;
+  vertical-align: middle;
+}
+
+.trend-empty {
+  margin: 8px 0;
+  color: var(--muted);
+}
+
+/* Large and Huge cards have room for IoU, core recall and spill; Medium and Small show IoU only. */
+.card-score .cs-short {
+  display: none;
+}
+
+body[data-card-size="medium"] .card-score .cs-full,
+body[data-card-size="small"] .card-score .cs-full {
+  display: none;
+}
+
+body[data-card-size="medium"] .card-score .cs-short,
+body[data-card-size="small"] .card-score .cs-short {
+  display: inline;
+}
+
 /* Update all: a slim strip under the cards. It is part of the page flow, so the cards' area shrinks instead of being covered. */
 .update-strip {
   flex: 0 0 auto;

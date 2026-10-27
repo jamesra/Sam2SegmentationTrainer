@@ -10,6 +10,7 @@ import os
 import posixpath
 import re
 import secrets
+import sqlite3
 import ssl
 import sys
 import threading
@@ -22,9 +23,13 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from catalog import (
+    NoCardScorer,
     annotation_db_name,
     approve_window,
     build_repair_pack,
+    card_history,
+    card_rescore_status,
+    card_scores_for,
     export_volume_review,
     ignore_location,
     import_review_lists,
@@ -35,6 +40,7 @@ from catalog import (
     load_ignore_ids,
     parse_review_import,
     parse_training_review,
+    queue_card_rescore,
     review_lists_are_empty,
     save_held_review,
     load_source_document,
@@ -80,6 +86,8 @@ VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 FILE_PREFIXES = frozenset({"images", "masks", "ignored", "original"})
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SESSION_COOKIE = "gallery_session"
+# Most location ids one card-scores or rescore-status request may ask about (the page asks for the few it watches).
+MAX_CARD_SCORE_IDS = 1000
 
 
 def env_map() -> dict[str, str]:
@@ -796,6 +804,14 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_ignore_export(match.group(1))
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/(card-scores|rescore-status)", path)
+        if match:
+            self._handle_card_scores_read(match.group(1), match.group(2), query)
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/card-history", path)
+        if match:
+            self._handle_card_history(match.group(1), query)
+            return
         if path == "/api/converter/builds":
             self._handle_converter_builds()
             return
@@ -904,6 +920,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/volumes/([^/]+)/import-location", path)
         if match:
             self._handle_import_location(match.group(1))
+            return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/rescore", path)
+        if match:
+            self._handle_rescore(match.group(1))
             return
         match = re.fullmatch(r"/api/volumes/([^/]+)/review-batch", path)
         if match:
@@ -1646,8 +1666,91 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
         drop_stale_thumbnails(crops, keys)
+        # Queued before the (slow) SAM2 scoring below, so the scorer service can start on the new masks at once.
+        rescore = self._queue_rescore_after_refresh(crops, location_id)
         score = self._score_refreshed(volume, crops, entity)
-        self._send_json({"ok": True, "location_id": location_id, "imageKeys": keys, "score": score})
+        self._send_json(
+            {"ok": True, "location_id": location_id, "imageKeys": keys, "score": score, "rescore": rescore}
+        )
+
+    def _queue_rescore_after_refresh(self, crops: Path, location_id: int) -> dict[str, Any] | None:
+        """Queue the redrawn location for the card scorer (``card_score_requests``): ``{"request": status}``.
+
+        A failure is ``{"error": ...}``; the refresh itself has already succeeded. ``GALLERY_RESCORE_ON_REFRESH=0``
+        turns this off (None), and so does a volume no scorer serves.
+        """
+        if os.environ.get("GALLERY_RESCORE_ON_REFRESH", "1").strip().lower() in ("0", "false", "no", "off"):
+            return None
+        try:
+            return {"request": queue_card_rescore(crops, location_id)}
+        except NoCardScorer:
+            return None
+        except sqlite3.Error as exc:
+            return {"error": f"could not queue a re-score: {exc}"}
+
+    def _handle_rescore(self, volume: str) -> None:
+        """Queue a location for the card scorer without redrawing it."""
+        if not self._review_granted(volume):
+            return
+        try:
+            location_id = int(self._read_json().get("location_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "location_id required"}, status=400)
+            return
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        if not location_image_keys(crops, [location_id]):
+            self._send_json({"error": f"location {location_id} has no cards in this volume"}, status=404)
+            return
+        try:
+            request = queue_card_rescore(crops, location_id)
+        except NoCardScorer as exc:
+            self._send_json({"error": str(exc)}, status=503)
+            return
+        except sqlite3.Error as exc:
+            self._send_json({"error": f"could not queue a re-score: {exc}"}, status=500)
+            return
+        self._send_json({"ok": True, "location_id": location_id, "request": request})
+
+    def _handle_card_history(self, volume: str, query: dict[str, list[str]]) -> None:
+        """One card's scores over time (``id`` and ``key``), for its trend graph."""
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        try:
+            location_id = int((query.get("id") or [""])[0])
+        except ValueError:
+            self._send_json({"error": "id must be a location id"}, status=400)
+            return
+        image_key = (query.get("key") or [""])[0]
+        self._send_json({"location_id": location_id, "image_key": image_key,
+                         **card_history(crops, location_id, image_key)})
+
+    def _handle_card_scores_read(self, volume: str, what: str, query: dict[str, list[str]]) -> None:
+        """``card-scores``: the scored cards of ``ids``; ``rescore-status``: each location's newest re-score request.
+
+        ``ids`` is a comma-separated list of location ids (at most :data:`MAX_CARD_SCORE_IDS`).
+        """
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        try:
+            ids = sorted({int(part) for value in query.get("ids", []) for part in value.split(",") if part.strip()})
+        except ValueError:
+            self._send_json({"error": "ids must be location ids"}, status=400)
+            return
+        if not ids:
+            self._send_json({"error": "ids required"}, status=400)
+            return
+        if len(ids) > MAX_CARD_SCORE_IDS:
+            self._send_json({"error": f"at most {MAX_CARD_SCORE_IDS} ids"}, status=400)
+            return
+        if what == "card-scores":
+            self._send_json({"cards": card_scores_for(crops, ids)})
+            return
+        statuses = card_rescore_status(crops, ids)
+        self._send_json({"status": {str(location_id): status for location_id, status in statuses.items()}})
 
     def _score_refreshed(self, volume: str, crops: Path, entity: dict[str, Any]) -> dict[str, Any] | None:
         """Score the refreshed location with the current model (see score.py) and store it as the card's SAM2 badge.

@@ -48,6 +48,8 @@
     rows: [],
     permission: "read",
     hasSam2: false,
+    // True when some card has a card score (the scorer service's IoU, core recall and spill; see cardScoreHtml).
+    hasCardScores: false,
     sorts: [{ key: "z", desc: false }],
     // The converter's location links ([a, b] pairs) and a counter that changes when the layout must be redone.
     convLinks: [],
@@ -1449,8 +1451,21 @@
     if (state.hasSam2) {
       fields.push(["sam2GtIou", "SAM2 GT IoU"]);
     }
+    if (state.hasCardScores && !state.converter) {
+      fields.push(...CARD_SORT_FIELDS);
+    }
     return fields;
   }
+
+  // Card-score sorts. Picking one sets its "worst first" direction (low IoU and core recall, high spill and mismatch);
+  // the arrow still flips it. Unscored cards sort last either way (compareValues puts missing values last).
+  const CARD_SORT_FIELDS = [
+    ["cardIou", "IoU"],
+    ["cardCore", "Core recall"],
+    ["cardSpill", "Spill"],
+    ["cardMismatch", "Model mismatch"],
+  ];
+  const CARD_SORT_WORST_DESC = new Map([["cardIou", false], ["cardCore", false], ["cardSpill", true], ["cardMismatch", true]]);
 
   function compareValues(left, right, desc) {
     if (left == null && right == null) {
@@ -1750,7 +1765,9 @@
     const sam2 = row.sam2GtIou == null
       ? ""
       : `<span class="badge" title="${sam2Title}">SAM2 ${Number(row.sam2GtIou).toFixed(2)}${coarse ? ` · D${coarse[1]}` : ""}</span>`;
-    const loss = row.loss == null ? "" : `<span class="badge">${state.converter ? "change" : "loss"} ${Number(row.loss).toFixed(state.converter ? 2 : 3)}</span>`;
+    // In the gallery the card's score is its card score (cardScoreHtml, beside the caption); the training loss is only
+    // in that badge's tooltip. The converter's "change" stays here.
+    const loss = row.loss == null || !state.converter ? "" : `<span class="badge">change ${Number(row.loss).toFixed(2)}</span>`;
     const structureName = row.type_name || "Structure";
     const structureText = row.structure_id == null ? structureName : `${structureName} ${row.structure_id}`;
     const structureHref = sbfsemHref(row);
@@ -1759,6 +1776,397 @@
       : structureText;
     const label = row.structure_label ? ` · ${row.structure_label}` : "";
     return `<a class="viking-link" href="${vikingHref(row)}" title="Open in Viking">#${row.location_id}</a> · Z ${row.z} · ${structure}${label} ${loss}${sam2}`;
+  }
+
+  // ---- card scores --------------------------------------------------------------------------------------------------
+  // The scorer service (sam2-em-score-cards --serve) scores each card the way validation does: IoU, core recall (null
+  // when the annotation is too thin to have a core) and spill (can exceed 1). The catalog carries the newest score as
+  // cardIou, cardCore, cardSpill, cardMismatch (= max(1 - core, spill)), cardModel, cardScoredAt, and the one before it
+  // as cardOld after a re-score. A location whose re-score request is pending or running shows "re-scoring…".
+  // cardKind is "validation" (exact: eval mode, fixed prompt) or "train" (measured while the card was trained:
+  // augmented image, random prompt, weights mid-epoch; shown with a "train" tag, never compared with validation).
+  const CARD_SCORE_KEYS = ["cardIou", "cardCore", "cardSpill", "cardMismatch", "cardModel", "cardScoredAt", "cardOld",
+    "cardKind", "cardEpoch"];
+  const TRAIN_SCORE_NOTE = "Measured while training (augmented image, random prompt, weights mid-epoch): a rough guide, not comparable with validation scores.";
+  const RESCORE_POLL_MS = 2000;
+  const RESCORE_GIVE_UP_MS = 5 * 60 * 1000;
+  // location id -> { state: "pending" | "running" | "failed", error, since (ms) }
+  const rescoreMarks = new Map();
+  const rescoreWatch = { timer: 0, volume: "", trainingSet: "" };
+
+  function attrText(text) {
+    return String(text).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function scoreText(value) {
+    return value == null ? "–" : Number(value).toFixed(2);
+  }
+
+  // "0.91", or "0.82→0.91" after a re-score.
+  function scorePair(oldValue, newValue, hasOld) {
+    return hasOld ? `${scoreText(oldValue)}→${scoreText(newValue)}` : scoreText(newValue);
+  }
+
+  function cardScoreTitle(row, mark) {
+    const old = row.cardOld || null;
+    const lines = [];
+    if (mark && (mark.state === "pending" || mark.state === "running")) {
+      lines.push(mark.state === "running" ? "Re-scoring this location's cards now" : "Re-score queued; waiting for the scorer");
+    }
+    if (mark && mark.state === "failed") {
+      lines.push(`Re-score failed: ${mark.error || "no reason given"}`);
+    }
+    if (row.cardIou != null || row.cardMismatch != null) {
+      const kind = row.cardKind === "train" ? "Training-pass score" : "Validation score";
+      lines.push(`${kind}${row.cardModel ? ` (model ${row.cardModel}` : " ("}${row.cardScoredAt ? `, ${row.cardScoredAt})` : ")"}`);
+      if (row.cardKind === "train") {
+        lines.push(TRAIN_SCORE_NOTE);
+      }
+      lines.push(`IoU ${scorePair(old && old.iou, row.cardIou, Boolean(old))}`);
+      lines.push(row.cardCore == null
+        ? "core recall: none (the annotation is too thin to have a core)"
+        : `core recall ${scorePair(old && old.core, row.cardCore, Boolean(old))}`);
+      lines.push(`spill ${scorePair(old && old.spill, row.cardSpill, Boolean(old))} (predicted area outside the mask, as a share of it)`);
+      lines.push(`model mismatch ${scorePair(old && old.mismatch, row.cardMismatch, Boolean(old))} = max(1 − core recall, spill)`);
+      if (old) {
+        lines.push(`before: ${old.model ? `model ${old.model}` : "earlier score"}${old.scoredAt ? `, ${old.scoredAt}` : ""}`);
+      }
+    } else if (!mark || mark.state === "failed") {
+      lines.push("No card score yet");
+    }
+    if (row.loss != null) {
+      lines.push(`training loss ${Number(row.loss).toFixed(3)}`);
+    }
+    if (state.permission === "review") {
+      lines.push("Click to re-score this location's cards with the current model (no redraw)");
+    }
+    return lines.join("\n");
+  }
+
+  // The badge. Large and Huge cards show IoU, core recall and spill; Medium and Small have room for IoU only (app.css
+  // hides .cs-full there). Reviewers can click it to queue a re-score without redrawing.
+  function cardScoreBadge(row) {
+    if (state.converter) {
+      return "";
+    }
+    const mark = rescoreMarks.get(Number(row.location_id));
+    const busy = Boolean(mark) && (mark.state === "pending" || mark.state === "running");
+    const scored = row.cardIou != null || row.cardMismatch != null;
+    if (!busy && !scored && row.loss == null && !mark) {
+      return "";
+    }
+    let full;
+    let short;
+    if (busy) {
+      full = "re-scoring…";
+      short = full;
+    } else if (scored) {
+      const old = row.cardOld || null;
+      const hasOld = Boolean(old);
+      short = `IoU ${scorePair(old && old.iou, row.cardIou, hasOld)}`;
+      full = `${short} · core ${scorePair(old && old.core, row.cardCore, hasOld)} · spill ${scorePair(old && old.spill, row.cardSpill, hasOld)}`;
+    } else {
+      full = "–";
+      short = full;
+    }
+    const train = scored && !busy && row.cardKind === "train";
+    const classes = ["badge", "card-score", busy ? "rescoring" : "", mark && mark.state === "failed" ? "failed" : "",
+      scored ? "" : "unscored", train ? "train" : ""]
+      .filter(Boolean).join(" ");
+    const title = attrText(cardScoreTitle(row, mark));
+    const tag = train ? `<span class="cs-tag">train</span>` : "";
+    const inner = `${tag}<span class="cs-full">${full}</span><span class="cs-short">${short}</span>`;
+    return state.permission === "review"
+      ? `<button type="button" class="${classes}" data-act="rescore" data-id="${row.location_id}" title="${title}">${inner}</button>`
+      : `<span class="${classes}" title="${title}">${inner}</span>`;
+  }
+
+  function cardScoreHtml(row) {
+    return `<span class="card-score-slot" data-id="${row.location_id}" data-key="${row.image_key || ""}">${cardScoreBadge(row)}${trendButton(row)}</span>`;
+  }
+
+  // ---- score trend --------------------------------------------------------------------------------------------------
+  // A small chart of one card's IoU, core recall and spill across epochs (validation solid, training pass dashed).
+  const TREND_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><polyline points="1,13 5,8 9,10 15,3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const TREND_SERIES = [
+    { key: "iou", label: "IoU", color: "#7dd3fc" },
+    { key: "core_recall", label: "core", color: "#4ade80" },
+    { key: "spill", label: "spill", color: "#fb923c" },
+  ];
+
+  function trendButton(row) {
+    if (state.converter || (row.cardIou == null && row.cardMismatch == null)) {
+      return "";
+    }
+    return `<button type="button" class="trend-btn" data-act="trend" data-id="${row.location_id}" data-key="${attrText(row.image_key || "")}" title="Score trend across epochs" aria-label="Score trend">${TREND_ICON}</button>`;
+  }
+
+  function closeTrend() {
+    const open = document.querySelector(".trend-pop");
+    if (open) {
+      open.remove();
+    }
+  }
+
+  // Points of one kind as [{x, point}], x the epoch (or the order scored when a score has no epoch).
+  function trendPoints(points) {
+    return points.map((point, index) => ({ x: point.epoch == null ? index : Number(point.epoch), point }));
+  }
+
+  // The chart's SVG: one line per measure and kind, y from 0 to 1 (spill above 1 is drawn at the top edge).
+  function trendSvg(history) {
+    const width = 260;
+    const height = 120;
+    const pad = { l: 28, r: 8, t: 8, b: 20 };
+    const kinds = [
+      { name: "validation", points: trendPoints(history.validation || []), dash: "", hollow: false },
+      { name: "train", points: trendPoints(history.train || []), dash: "3 3", hollow: true },
+    ];
+    const xs = kinds.flatMap((kind) => kind.points.map((p) => p.x));
+    if (!xs.length) {
+      return `<p class="trend-empty">No scores yet.</p>`;
+    }
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const sx = (x) => pad.l + (maxX === minX ? (width - pad.l - pad.r) / 2 : ((x - minX) / (maxX - minX)) * (width - pad.l - pad.r));
+    const sy = (y) => pad.t + (1 - Math.max(0, Math.min(1, y))) * (height - pad.t - pad.b);
+    const parts = [];
+    for (const tick of [0, 0.5, 1]) {
+      parts.push(`<line x1="${pad.l}" x2="${width - pad.r}" y1="${sy(tick)}" y2="${sy(tick)}" class="trend-grid"/>`);
+      parts.push(`<text x="${pad.l - 4}" y="${sy(tick) + 3}" text-anchor="end" class="trend-axis">${tick}</text>`);
+    }
+    const epochs = [...new Set(xs)].sort((a, b) => a - b);
+    const step = Math.max(1, Math.ceil(epochs.length / 8));
+    epochs.filter((_, i) => i % step === 0).forEach((x) => {
+      parts.push(`<text x="${sx(x)}" y="${height - 6}" text-anchor="middle" class="trend-axis">${x}</text>`);
+    });
+    for (const kind of kinds) {
+      for (const series of TREND_SERIES) {
+        const pts = kind.points.filter((p) => p.point[series.key] != null);
+        if (!pts.length) {
+          continue;
+        }
+        const path = pts.map((p) => `${sx(p.x).toFixed(1)},${sy(Number(p.point[series.key])).toFixed(1)}`).join(" ");
+        parts.push(`<polyline points="${path}" fill="none" stroke="${series.color}" stroke-width="1.6"${kind.dash ? ` stroke-dasharray="${kind.dash}"` : ""}/>`);
+        for (const p of pts) {
+          const value = Number(p.point[series.key]);
+          const tip = `${series.label} ${value.toFixed(3)} · ${kind.name} · ${p.point.model || ""}${p.point.epoch != null ? ` (epoch ${p.point.epoch})` : ""}`;
+          parts.push(`<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(value).toFixed(1)}" r="2.6" fill="${kind.hollow ? "var(--panel)" : series.color}" stroke="${series.color}" stroke-width="1.2"><title>${attrText(tip)}</title></circle>`);
+        }
+      }
+    }
+    return `<svg class="trend-chart" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Score trend">${parts.join("")}</svg>`;
+  }
+
+  function trendLegend(history) {
+    const series = TREND_SERIES.map((s) => `<span><i style="background:${s.color}"></i>${s.label}</span>`).join("");
+    const kinds = [
+      (history.validation || []).length ? `<span class="trend-kind">── validation</span>` : "",
+      (history.train || []).length ? `<span class="trend-kind" title="${attrText(TRAIN_SCORE_NOTE)}">- - training pass</span>` : "",
+    ].join("");
+    return `<div class="trend-legend">${series}${kinds}</div>`;
+  }
+
+  async function openTrend(button) {
+    closeTrend();
+    const id = Number(button.dataset.id);
+    const key = button.dataset.key || "";
+    const pop = document.createElement("div");
+    pop.className = "trend-pop";
+    pop.setAttribute("role", "dialog");
+    pop.innerHTML = `<div class="trend-head">#${id} · score trend <button type="button" class="trend-close" aria-label="Close">×</button></div><p class="trend-empty">Loading…</p>`;
+    document.body.appendChild(pop);
+    const box = button.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - 290, box.right - 280));
+    const top = box.bottom + 190 < window.innerHeight ? box.bottom + 4 : Math.max(8, box.top - 194);
+    pop.style.left = `${left + window.scrollX}px`;
+    pop.style.top = `${top + window.scrollY}px`;
+    pop.querySelector(".trend-close").addEventListener("click", closeTrend);
+    try {
+      const url = withSet(`/api/volumes/${encodeURIComponent(state.volume)}/card-history?id=${id}&key=${encodeURIComponent(key)}`);
+      const history = await getJson(url);
+      if (!document.body.contains(pop)) {
+        return;
+      }
+      pop.querySelector(".trend-empty").outerHTML = trendSvg(history) + trendLegend(history);
+    } catch (error) {
+      const empty = pop.querySelector(".trend-empty");
+      if (empty) {
+        empty.textContent = `Could not load the trend: ${error.message}`;
+      }
+    }
+  }
+
+  // Redraw one location's card-score badges in place (after its scores or its re-score state changed).
+  function paintCardScores(locationId) {
+    const id = String(locationId);
+    els.grid.querySelectorAll(`.card-score-slot[data-id="${id}"]`).forEach((slot) => {
+      const row = windowsForLocation(locationId).find((item) => (item.image_key || "") === (slot.dataset.key || ""));
+      slot.innerHTML = row ? cardScoreBadge(row) + trendButton(row) : "";
+    });
+  }
+
+  // Put a location's newest card scores (from /card-scores) on its rows; its cards without one lose theirs.
+  function applyCardScores(locationIds, cards) {
+    const wanted = new Set(locationIds.map(String));
+    for (const row of state.rows) {
+      if (wanted.has(String(row.location_id))) {
+        for (const key of CARD_SCORE_KEYS) {
+          delete row[key];
+        }
+        delete row.cardRescore;
+      }
+    }
+    for (const card of cards) {
+      const row = windowsForLocation(card.location_id).find((item) => (item.image_key || "") === (card.image_key || ""));
+      if (!row) {
+        continue;
+      }
+      for (const key of CARD_SCORE_KEYS) {
+        if (key in card) {
+          row[key] = card[key];
+        }
+      }
+    }
+    if (!state.hasCardScores && cards.length) {
+      state.hasCardScores = true;
+      renderSortStack();
+    }
+  }
+
+  function rescoreUrl(volume, suffix, ids) {
+    return withSet(`/api/volumes/${encodeURIComponent(volume)}/${suffix}?ids=${ids.join(",")}`);
+  }
+
+  // Show "re-scoring…" on a location's cards and poll until its request is done or failed (or 5 minutes pass).
+  function watchRescore(locationId, request) {
+    const id = Number(locationId);
+    if (rescoreWatch.volume !== state.volume || rescoreWatch.trainingSet !== state.trainingSet) {
+      resetRescoreWatch();
+    }
+    const known = request && request.state;
+    if (known === "done" || known === "failed") {
+      rescoreMarks.set(id, { state: "running", error: "", since: Date.now() });
+    } else {
+      rescoreMarks.set(id, { state: known || "pending", error: "", since: Date.now() });
+    }
+    paintCardScores(id);
+    scheduleRescorePoll();
+  }
+
+  function resetRescoreWatch() {
+    window.clearTimeout(rescoreWatch.timer);
+    rescoreWatch.timer = 0;
+    rescoreMarks.clear();
+    rescoreWatch.volume = state.volume;
+    rescoreWatch.trainingSet = state.trainingSet;
+  }
+
+  function watchedRescores() {
+    return [...rescoreMarks].filter(([, mark]) => mark.state === "pending" || mark.state === "running").map(([id]) => id);
+  }
+
+  function scheduleRescorePoll() {
+    if (!rescoreWatch.timer && watchedRescores().length) {
+      rescoreWatch.timer = window.setTimeout(pollRescores, RESCORE_POLL_MS);
+    }
+  }
+
+  async function pollRescores() {
+    rescoreWatch.timer = 0;
+    const { volume, trainingSet } = rescoreWatch;
+    const ids = watchedRescores();
+    if (!ids.length || !volume) {
+      return;
+    }
+    let statuses = null;
+    try {
+      statuses = (await getJson(rescoreUrl(volume, "rescore-status", ids))).status || {};
+    } catch {
+      // A failed poll is retried at the next tick, until the give-up time.
+    }
+    if (rescoreWatch.volume !== volume || rescoreWatch.trainingSet !== trainingSet) {
+      return;
+    }
+    const finished = [];
+    const now = Date.now();
+    for (const id of ids) {
+      const mark = rescoreMarks.get(id);
+      if (!mark) {
+        continue;
+      }
+      const status = statuses ? statuses[String(id)] : null;
+      if (status && (status.state === "done" || status.state === "failed")) {
+        finished.push({ id, status });
+      } else if (now - mark.since > RESCORE_GIVE_UP_MS) {
+        finished.push({ id, status: null });
+      } else if (status && status.state !== mark.state) {
+        mark.state = status.state;
+        paintCardScores(id);
+      }
+    }
+    if (finished.length) {
+      await finishRescores(volume, trainingSet, finished);
+    }
+    scheduleRescorePoll();
+  }
+
+  async function finishRescores(volume, trainingSet, finished) {
+    const ids = finished.map((item) => item.id);
+    let cards = null;
+    try {
+      cards = (await getJson(rescoreUrl(volume, "card-scores", ids))).cards || [];
+    } catch {
+      // Keep the scores shown; a reload picks the new ones up.
+    }
+    if (rescoreWatch.volume !== volume || rescoreWatch.trainingSet !== trainingSet) {
+      return;
+    }
+    if (cards) {
+      applyCardScores(ids, cards);
+    }
+    const notes = [];
+    for (const { id, status } of finished) {
+      if (status && status.state === "failed") {
+        rescoreMarks.set(id, { state: "failed", error: status.error || "", since: Date.now() });
+        notes.push(`Re-score of #${id} failed${status.error ? `: ${status.error}` : ""}.`);
+      } else if (!status) {
+        rescoreMarks.delete(id);
+        notes.push(`Re-score of #${id} has not finished after ${RESCORE_GIVE_UP_MS / 60000} minutes; reload later to see it.`);
+      } else {
+        rescoreMarks.delete(id);
+        notes.push(`Re-scored #${id}${status.cards != null ? ` (${status.cards} card${status.cards === 1 ? "" : "s"})` : ""}.`);
+      }
+      paintCardScores(id);
+    }
+    els.status.textContent = notes.join(" ");
+  }
+
+  async function queueRescore(locationId) {
+    const id = Number(locationId);
+    const result = await getJson(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/rescore`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ location_id: id }),
+    });
+    watchRescore(id, result.request);
+    els.status.textContent = `Queued #${id} for re-scoring.`;
+  }
+
+  // After a catalog load: watch the locations the catalog says are still being re-scored (cardRescore). A reload of the
+  // same volume keeps the marks it has (a failed re-score keeps its tooltip); another volume or set starts afresh.
+  function watchCatalogRescores() {
+    if (rescoreWatch.volume !== state.volume || rescoreWatch.trainingSet !== state.trainingSet) {
+      resetRescoreWatch();
+    }
+    for (const row of state.rows) {
+      const id = Number(row.location_id);
+      const mark = rescoreMarks.get(id);
+      if (row.cardRescore && (!mark || mark.state === "failed")) {
+        rescoreMarks.set(id, { state: row.cardRescore.state || "pending", error: "", since: Date.now() });
+      }
+    }
+    scheduleRescorePoll();
   }
 
   function shapeOffsets(windows, columns) {
@@ -1820,7 +2228,7 @@
       <article class="card ${joinClasses(cell)}" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="--link-h:${cell.linkH};--link-s:${cell.linkS}%;--link-l:${cell.linkL}%;grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
         ${windowHtml(row)}
         ${windowActions(row)}
-        <div class="meta"><div class="meta-row"><div>${captionHtml(row)}</div>${refreshButton(row)}</div></div>
+        <div class="meta"><div class="meta-row"><div>${captionHtml(row)}</div>${cardScoreHtml(row)}${refreshButton(row)}</div></div>
       </article>`;
   }
 
@@ -2366,12 +2774,23 @@
         state.sorts = [{ key: "z", desc: false }];
       }
     }
+    state.hasCardScores = !state.converter && state.rows.some((row) => row.cardIou != null || row.cardMismatch != null);
+    if (!state.hasCardScores) {
+      state.sorts = state.sorts.filter((item) => !CARD_SORT_WORST_DESC.has(item.key));
+      if (!state.sorts.length) {
+        state.sorts = [{ key: "z", desc: false }];
+      }
+    }
     if (applyDefaultSort) {
+      // Worst model mismatch first when the cards have card scores, else the highest training loss, else by section.
       const hasLoss = state.rows.some((row) => row.loss != null);
       state.sorts = state.converter
         ? [{ key: LAYOUT_SORT, desc: false }]
-        : [{ key: hasLoss ? "loss" : "z", desc: hasLoss }];
+        : (state.hasCardScores
+          ? [{ key: "cardMismatch", desc: true }]
+          : [{ key: hasLoss ? "loss" : "z", desc: hasLoss }]);
     }
+    watchCatalogRescores();
     renderSortStack();
     render();
   }
@@ -2626,6 +3045,12 @@
     }
     if (row.sam2GtIou != null) {
       lines.push(`SAM2 ${Number(row.sam2GtIou).toFixed(2)}`);
+    }
+    if (!state.converter && (row.cardIou != null || row.cardMismatch != null)) {
+      const old = row.cardOld || null;
+      const hasOld = Boolean(old);
+      lines.push(`IoU ${scorePair(old && old.iou, row.cardIou, hasOld)} · core ${scorePair(old && old.core, row.cardCore, hasOld)}`
+        + ` · spill ${scorePair(old && old.spill, row.cardSpill, hasOld)}`);
     }
     if (state.converter && row.conv) {
       lines.push(...window.ConverterMode.infoLines(row.conv));
@@ -3163,6 +3588,19 @@
     clearLinkHot();
   });
 
+  // The trend popover closes on a click outside it, on Escape, and when the grid scrolls.
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".trend-pop") && !event.target.closest(".trend-btn")) {
+      closeTrend();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeTrend();
+    }
+  });
+  els.grid.addEventListener("scroll", closeTrend, { passive: true });
+
   els.grid.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-act]");
     if (button) {
@@ -3171,6 +3609,20 @@
         event.stopPropagation();
         refreshLocation(Number(button.dataset.id)).catch((error) => {
           els.status.textContent = error.message;
+        });
+        return;
+      }
+      if (button.dataset.act === "trend") {
+        event.preventDefault();
+        event.stopPropagation();
+        openTrend(button);
+        return;
+      }
+      if (button.dataset.act === "rescore") {
+        event.preventDefault();
+        event.stopPropagation();
+        queueRescore(Number(button.dataset.id)).catch((error) => {
+          els.status.textContent = `Could not queue a re-score: ${error.message}`;
         });
         return;
       }
@@ -3411,7 +3863,7 @@
       const used = new Set(state.sorts.map((item) => item.key));
       const next = sortFields().find(([value]) => value !== LAYOUT_SORT && !used.has(value));
       if (next) {
-        state.sorts.push({ key: next[0], desc: false });
+        state.sorts.push({ key: next[0], desc: CARD_SORT_WORST_DESC.get(next[0]) || false });
         renderSortStack();
         render();
       }
@@ -3442,7 +3894,11 @@
     } else if (layoutActive()) {
       state.sorts = [{ key: select.value, desc: false }];
     } else {
-      state.sorts[Number(select.dataset.index)].key = select.value;
+      const criterion = state.sorts[Number(select.dataset.index)];
+      criterion.key = select.value;
+      if (CARD_SORT_WORST_DESC.has(select.value)) {
+        criterion.desc = CARD_SORT_WORST_DESC.get(select.value);
+      }
     }
     renderSortStack();
     render();
@@ -3959,10 +4415,17 @@
       setRefreshMark(id, "done");
       repaintLocation(id);
       applyRefreshScore(id, result.score);
+      // The server also queued the location for the card scorer: its cards say "re-scoring…" until it is done.
+      const rescore = result.rescore || null;
+      if (rescore && rescore.request) {
+        watchRescore(id, rescore.request);
+      }
       const count = (result.imageKeys || []).length;
       els.status.textContent = (count
         ? `Refreshed ${count} crop mask${count === 1 ? "" : "s"}.`
-        : "No existing crop for that location.") + refreshScoreText(result.score);
+        : "No existing crop for that location.") + refreshScoreText(result.score)
+        + (rescore && rescore.request ? " Re-scoring its cards." : "")
+        + (rescore && rescore.error ? ` Not queued for re-scoring: ${rescore.error}` : "");
       if (!els.viewer.hidden && String(openId) === String(locationId)) {
         const row = state.rows.find((item) =>
           String(item.location_id) === String(openId) && (item.image_key || "") === (openKey || "")

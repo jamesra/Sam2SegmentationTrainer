@@ -189,6 +189,8 @@ const context = {{
   reviewClass: () => "pending",
   closeViewer: () => {{}},
   renderSortStack: () => {{}},
+  watchCatalogRescores: () => {{}},
+  CARD_SORT_WORST_DESC: new Map(),
   render: () => {{ renders += 1; }},
   document: {{ body: {{ classList: {{ toggle: () => {{}} }} }} }},
 }};
