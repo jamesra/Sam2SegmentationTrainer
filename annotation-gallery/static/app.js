@@ -2139,6 +2139,12 @@
       }
       paintCardScores(id);
     }
+    // Sorted by a card score: the new score moves the card to its place in that order. The cards on screen are kept,
+    // so their images are not loaded again.
+    if (cards && !layoutActive() && state.sorts.some((item) => CARD_SORT_WORST_DESC.has(item.key))) {
+      resetVisibleCards();
+      render(true, true);
+    }
     els.status.textContent = notes.join(" ");
   }
 

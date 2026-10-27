@@ -560,3 +560,13 @@ def test_nothing_is_queued_where_no_scorer_runs(httpd, crops: Path, refreshable)
         assert connection.execute("SELECT COUNT(*) FROM card_score_requests").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+def test_a_finished_rescore_resorts_a_card_score_sort() -> None:
+    """Sorted by a card score, a re-scored card moves to its new place; the status note is written after the render."""
+    source = APP_JS.read_text(encoding="utf-8")
+    finish = source.split("async function finishRescores", 1)[1].split("async function queueRescore", 1)[0]
+    assert "state.sorts.some((item) => CARD_SORT_WORST_DESC.has(item.key))" in finish
+    assert "!layoutActive()" in finish
+    assert finish.index("resetVisibleCards();") < finish.index("render(true, true);")
+    assert finish.index("render(true, true);") < finish.index('els.status.textContent = notes.join(" ");')
