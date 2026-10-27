@@ -849,6 +849,17 @@ def test_spa_hides_review_controls_without_review() -> None:
     assert 'class="jpeg"' in html or "jpeg" in js
 
 
+def test_spa_card_size_shows_before_relayout() -> None:
+    """A size click clears the cards and paints before the slow re-layout, so the change shows at once."""
+    js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    select = js.split("function selectCardSize", 1)[1].split("function rememberOverlay", 1)[0]
+    assert select.index("syncCardSizeButtons()") < select.index('els.grid.innerHTML = ""')
+    assert "reprioritize()" in select
+    assert "requestAnimationFrame(() => window.requestAnimationFrame(" in select
+    assert "mine === resizeToken" in select
+    assert "\n    render(true);" not in select
+
+
 def test_dockerfile_has_no_nornir() -> None:
     lines = [
         line

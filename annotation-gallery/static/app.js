@@ -1291,6 +1291,11 @@
     syncCardSizeButtons();
   }
 
+  let resizeToken = 0;
+
+  // A new size re-lays out every card and asks for new images, which takes a while. Show the choice at once: mark the
+  // button, clear the old cards (dropping their queued loads) and say so, then lay out the new size only after the
+  // browser has painted that. Quick repeated clicks lay out only the last size.
   function selectCardSize(name) {
     if (!Object.prototype.hasOwnProperty.call(CARD_SIZES, name) || name === state.cardSize) {
       return;
@@ -1300,7 +1305,15 @@
     syncCardSizeButtons();
     rowStride = 0;
     windowTop = -1;
-    render(true);
+    els.grid.innerHTML = "";
+    reprioritize();
+    els.status.textContent = `Loading ${name} cards…`;
+    const mine = ++resizeToken;
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      if (mine === resizeToken) {
+        render(true);
+      }
+    }));
   }
 
   function rememberOverlay() {
