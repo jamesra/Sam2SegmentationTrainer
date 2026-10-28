@@ -155,7 +155,15 @@ body.filters-collapsed .bar {
   color: var(--ink);
 }
 
-.filter-row > button {
+/* Update all with Update visible under it. */
+.update-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.filter-row > button,
+.update-buttons > button {
   border: 0;
   background: #232833;
   color: var(--ink);

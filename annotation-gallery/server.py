@@ -1014,9 +1014,21 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 "error": "Update all needs the nornir-buildmanager mount. No masks were changed.",
             }, status=503)
             return
+        # Update Visible sends the location ids of the cards it shows; Update All sends none.
+        try:
+            raw_ids = self._read_json().get("ids")
+            ids = None if raw_ids is None else [int(item) for item in raw_ids]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self._send_json({"error": "ids must be a list of location ids"}, status=400)
+            return
+        if ids is not None and not ids:
+            self._send_json({"error": "no visible locations to update"}, status=400)
+            return
         source = load_source_document(crops)
         url = odata_endpoint(volume, source).strip()
-        started_job, _new = update_all.start_job(volume, crops, url, str(source.get("exporter") or "tiled"))
+        started_job, _new = update_all.start_job(
+            volume, crops, url, str(source.get("exporter") or "tiled"), ids=ids
+        )
         self._send_json({**update_all.idle_status(crops), **started_job.snapshot()})
 
     def _volume_source(self, volume: str) -> dict[str, Any]:

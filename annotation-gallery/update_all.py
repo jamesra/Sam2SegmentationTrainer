@@ -58,6 +58,8 @@ STATE_FILE = "update_state.json"
 LOG_FILE = "update_all.log"
 PAGE_SIZE = int(os.environ.get("GALLERY_UPDATE_PAGE_SIZE", "500") or 500)
 RETRY_BATCH = 50
+# Update Visible asks for its ids in lists this long: one OData request each, a few hundred bytes of URL.
+VISIBLE_BATCH = 200
 SKIP_LINES_KEPT = 200
 ERRORS_KEPT = 20
 
@@ -180,6 +182,16 @@ def locations_url(base: str, filter_text: str) -> str:
         f"&$count=true"
     )
     return f"{base.rstrip('/')}/Locations?{query}"
+
+
+def id_in_clause(ids: list[int]) -> str:
+    """``ID in (1,2,3)``: the locations with these ids.
+
+    Not ``ID eq 1 or ID eq 2 or ...``: Viking's OData rejects a ``$filter`` of more than 100 nodes (HTTP 400, "The
+    node count limit of '100' has been exceeded"), which 25 ``or``-ed ids already pass. An ``in`` list stays a few
+    nodes however long it is (RC1's 137 skipped ids went through in one request).
+    """
+    return "ID in (" + ",".join(str(int(item)) for item in ids) + ")"
 
 
 def iter_pages(url: str, get_json: GetJson) -> Iterator[dict[str, Any]]:
@@ -349,6 +361,8 @@ class UpdateJob:
     exporter: str
     page_size: int
     deps: Dependencies
+    # Update Visible: only these locations, never the watermark walk or the skipped-id retry. None is Update All.
+    ids: list[int] | None = None
     phase: str = "starting"
     page: int = 0
     pages: int = 0
@@ -417,6 +431,9 @@ class UpdateJob:
                 "watermarkAfter": self.watermark_after,
                 "stateSaved": self.state_saved,
                 "refreshedIds": list(self.refreshed_ids),
+                "scope": "all" if self.ids is None else "visible",
+                "requested": 0 if self.ids is None else len(self.ids),
+                **({} if self.ids is None else {"unit": "batch"}),
             }
 
     def _set(self, **values: Any) -> None:
@@ -487,7 +504,8 @@ class UpdateJob:
     def _walk_rows(self) -> None:
         state = load_state(self.crops)
         before = parse_odata_datetime(state.get("watermark")) or initial_watermark(self.crops)
-        self._set(watermark_before=odata_literal(before), phase="reading catalog")
+        visible = self.ids is not None
+        self._set(watermark_before="" if visible else odata_literal(before), phase="reading catalog")
         known = _catalog_ids(self.crops)
         newest = before
         index: list[TileIndex] = []
@@ -559,6 +577,10 @@ class UpdateJob:
                 self.deps.drop_stale(self.crops, sorted(set(touched_keys)))
                 touched_keys.clear()
 
+        if visible:
+            self._walk_ids(handle, flush_page)
+            return
+
         # Ids skipped by an earlier run are asked for again, in small batches.
         if previous_skips:
             self._set(phase="retrying skipped")
@@ -566,8 +588,7 @@ class UpdateJob:
                 if self._cancel.is_set():
                     break
                 batch = previous_skips[start:start + RETRY_BATCH]
-                clause = " or ".join(f"ID eq {item}" for item in batch)
-                for _document, rows in self._rows(locations_url(self.odata, clause)):
+                for _document, rows in self._rows(locations_url(self.odata, id_in_clause(batch))):
                     for entity in rows:
                         handle(entity, retry=True)
                     flush_page()
@@ -623,6 +644,43 @@ class UpdateJob:
             with self._lock:
                 self.errors.append("could not write update_state.json; the watermark was not saved")
 
+    def _walk_ids(
+        self, handle: Callable[[dict[str, Any], bool], None], flush_page: Callable[[], None]
+    ) -> None:
+        """Update Visible: redraw just ``self.ids``, one tick per batch.
+
+        ``update_state.json`` is left alone: the watermark says how far *every* change has been checked, which a run
+        over some locations does not show, and the skipped ids wait for the next Update All.
+        """
+        ids = sorted(set(self.ids or []))
+        batches = [ids[start:start + VISIBLE_BATCH] for start in range(0, len(ids), VISIBLE_BATCH)]
+        self._set(phase="updating visible", pages=max(1, len(batches)))
+        seen: set[int] = set()
+        for batch in batches:
+            if self._cancel.is_set():
+                break
+            for _document, rows in self._rows(locations_url(self.odata, id_in_clause(batch))):
+                for entity in rows:
+                    seen.add(int(entity["ID"]))
+                    with self._lock:
+                        self.entities_seen += 1
+                    handle(entity, True)
+                flush_page()
+            with self._lock:
+                self.page += 1
+        cancelled = self._cancel.is_set()
+        missing = len(ids) - len(seen)
+        if missing and not cancelled:
+            with self._lock:
+                self.notes.append(
+                    f"{missing} of the {len(ids)} locations are no longer in OData; their cards were left as they are."
+                )
+        self._set(
+            cancelled=cancelled,
+            phase="cancelled" if cancelled else ("done" if self.failed == 0 else "failed"),
+            finished=time.time(),
+        )
+
 
 # ------------------------------------------------------------------- registry
 
@@ -638,8 +696,12 @@ def start_job(
     *,
     page_size: int | None = None,
     deps: Dependencies | None = None,
+    ids: list[int] | None = None,
 ) -> tuple[UpdateJob, bool]:
-    """Start the volume's job, or return the one already running. The flag is True for a new job."""
+    """Start the volume's job, or return the one already running. The flag is True for a new job.
+
+    ``ids`` makes it an Update Visible job over just those locations (see :meth:`UpdateJob._walk_ids`).
+    """
     with _jobs_lock:
         current = _jobs.get(volume)
         if current is not None and current.running:
@@ -651,6 +713,7 @@ def start_job(
             exporter=exporter,
             page_size=page_size or PAGE_SIZE,
             deps=deps or Dependencies(),
+            ids=None if ids is None else [int(item) for item in ids],
         )
         _jobs[volume] = job
     job.start()

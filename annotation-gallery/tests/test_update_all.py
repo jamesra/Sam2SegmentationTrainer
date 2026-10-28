@@ -22,7 +22,10 @@ if str(GALLERY_ROOT) not in sys.path:
 from catalog import connect  # noqa: E402
 from refresh import TileIndex, add_new_location, covers_box  # noqa: E402
 from update_all import (  # noqa: E402
+    RETRY_BATCH,
+    VISIBLE_BATCH,
     Dependencies,
+    id_in_clause,
     initial_watermark,
     load_state,
     odata_literal,
@@ -75,8 +78,8 @@ class _FakeOData:
                 skip = int(query.get("skip", ["0"])[0])
                 chosen = owner.entities
                 filter_text = query.get("$filter", [""])[0]
-                if "ID eq" in filter_text:
-                    wanted = {int(part.split("eq")[1]) for part in filter_text.split(" or ")}
+                if filter_text.startswith("ID in ("):
+                    wanted = set(int(item) for item in filter_text.split("(", 1)[1].rstrip(")").split(","))
                     chosen = [e for e in chosen if e["ID"] in wanted]
                 size = owner.server_max
                 if owner.honor_prefer and prefer and prefer.startswith("odata.maxpagesize="):
@@ -146,6 +149,13 @@ def _run(crops: Path, odata: _FakeOData, deps: Dependencies, page_size: int = 2)
     assert started
     job.join(20)
     return job.snapshot()
+
+
+def test_a_retry_batch_is_one_in_list_not_or_ed_ids() -> None:
+    """OData refuses a $filter of more than 100 nodes; 25 ``ID eq .. or`` terms passed it and failed RC1's retry."""
+    clause = id_in_clause(list(range(1000, 1000 + RETRY_BATCH)))
+    assert clause.startswith("ID in (1000,1001,") and clause.endswith(f",{999 + RETRY_BATCH})")
+    assert " or " not in clause and " eq " not in clause
 
 
 def test_time_helpers_round_trip() -> None:
@@ -296,7 +306,7 @@ def test_cancel_stops_without_advancing(tmp_path: Path) -> None:
 
 
 def _stub_odata(entities: list[dict]):
-    """A ``get_json`` that answers ``ID eq`` retry batches from *entities* and every other query with no rows.
+    """A ``get_json`` that answers ``ID in`` retry batches from *entities* and every other query with no rows.
 
     No rows for the watermark query is the case that matters: a skipped id is older than the watermark, so only
     ``skipped_ids`` brings it back.
@@ -306,8 +316,8 @@ def _stub_odata(entities: list[dict]):
     def get_json(url: str) -> dict:
         filter_text = parse_qs(urlparse(url).query)["$filter"][0]
         rows = []
-        if "ID eq" in filter_text:
-            wanted = {int(part.split("eq")[1]) for part in filter_text.split(" or ")}
+        if filter_text.startswith("ID in ("):
+            wanted = set(int(item) for item in filter_text.split("(", 1)[1].rstrip(")").split(","))
             rows = [by_id[item] for item in sorted(wanted) if item in by_id]
         return {"value": rows, "@odata.count": len(rows)}
 
@@ -624,3 +634,31 @@ def test_import_location_adds_missing_skips_untiled_and_ignores_known(tmp_path: 
     assert calls["drop"] == [[KEY_A]]
     rows = connect(crops).execute("SELECT image_key FROM locations WHERE location_id = 5").fetchall()
     assert [row[0] for row in rows] == [KEY_A]
+
+
+def test_update_visible_redraws_only_its_ids_and_leaves_the_state_alone(tmp_path: Path) -> None:
+    """Update Visible asks for its ids in ``in`` batches, never the watermark walk or the skipped-id retry."""
+    ids = tuple(range(1, VISIBLE_BATCH + 6))
+    crops = _crops(tmp_path, ids=ids)
+    save_state(crops, {"watermark": WATERMARK, "skipped_ids": [9999]})
+    entities = [_entity(item, "2025-12-01T00:00:00Z") for item in ids[:-1]] + [_entity(9999, "2025-12-01T00:00:00Z")]
+    deps = _outcome_deps(entities, {})
+    asked: list[str] = []
+    answer = deps.get_json
+
+    def get_json(url: str) -> dict:
+        asked.append(parse_qs(urlparse(url).query)["$filter"][0])
+        return answer(url)
+
+    deps.get_json = get_json
+    job, started = start_job("visible", crops, "http://odata.invalid", "tiled", page_size=10, deps=deps, ids=list(ids))
+    assert started
+    job.join(20)
+    result = job.snapshot()
+    assert result["phase"] == "done" and result["scope"] == "visible" and result["requested"] == len(ids)
+    assert result["refreshed"] == len(ids) - 1 and result["pages"] == 2 and result["page"] == 2
+    assert all(text.startswith("ID in (") for text in asked) and len(asked) == 2
+    assert not any("9999" in text for text in asked)
+    assert any("1 of the" in note and "no longer in OData" in note for note in result["notes"])
+    assert result["watermarkBefore"] == ""
+    assert load_state(crops) == {"watermark": WATERMARK, "skipped_ids": [9999]}

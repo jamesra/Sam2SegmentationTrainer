@@ -93,7 +93,7 @@
     if (select) {
       select.title = "A gold set: a seeded random sample of locations per volume. Touch up each mask, then approve it.";
     }
-    for (const id of ["update-all", "volume-settings"]) {
+    for (const id of ["update-all", "update-visible", "volume-settings"]) {
       const element = doc.getElementById(id);
       if (element) {
         element.hidden = true;

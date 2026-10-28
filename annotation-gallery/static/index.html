@@ -118,7 +118,10 @@
     <div class="filter review-only">
       <span title="Asks OData for every location changed since the last check, redraws the ones this volume has, and adds new ones whose crop images are already here.">Volume</span>
       <div class="filter-row">
-        <button type="button" id="update-all" title="Update masks and annotations from OData: changes since the last check.">Update all</button>
+        <div class="update-buttons">
+          <button type="button" id="update-all" title="Update masks and annotations from OData: changes since the last check.">Update all</button>
+          <button type="button" id="update-visible" title="Redraw only the cards shown now, after every filter, from OData. The Update all watermark is not changed.">Update visible</button>
+        </div>
         <button type="button" id="converter-build" class="review-only" hidden title="Convert the annotations of a structure into proposed polygons">Build structure</button>
         <button type="button" id="gold-draw" class="review-only" hidden title="Draw a new seeded random sample of locations per volume">Draw sample</button>
         <button type="button" id="gold-list" class="review-only" hidden title="Add the location ids of a .txt file to this volume's gold cards, or replace them">Open list</button>

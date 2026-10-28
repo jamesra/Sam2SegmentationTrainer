@@ -195,8 +195,8 @@ const element = () => ({{ hidden: false, textContent: "", title: "", dataset: {{
   value: 0, max: 1, attrs: {{}}, removeAttribute(n) {{ delete this.attrs[n]; this.valueRemoved = true; }},
   setAttribute(n, v) {{ this.attrs[n] = v; }} }});
 const updateUi = {{ timer: 0, wasRunning: false, cancelling: false }};
-for (const name of ["dialog", "since", "last", "start", "close", "strip", "title", "bar", "line", "detail",
-                    "detailToggle", "cancel", "dismiss"]) updateUi[name] = element();
+for (const name of ["dialog", "heading", "since", "last", "start", "close", "strip", "title", "bar", "line",
+                    "detail", "detailToggle", "cancel", "dismiss"]) updateUi[name] = element();
 updateUi.dialog.hidden = true; updateUi.strip.hidden = true;
 const state = {{ volume: "RC1" }};
 const els = {{ status: {{ textContent: "" }} }};
@@ -209,7 +209,7 @@ const context = {{
   updateStripShown: false,
   withSet: (url) => url,
   updateUrl: (suffix = "") => "/api/volumes/" + state.volume + "/update-all" + suffix,
-  getJson: async (url, options) => {{ calls.push({{ url, method: options && options.method || "GET" }}); return statusAnswer; }},
+  getJson: async (url, options) => {{ calls.push({{ url, method: options && options.method || "GET", body: options && options.body }}); return statusAnswer; }},
   render: (flag) => renders.push(flag),
   window: {{ setTimeout: (fn, ms) => {{ timers.push(ms); return timers.length; }}, clearTimeout: () => {{}} }},
   locationGenerations: new Map(), locationGen: () => 0, resetVisibleCards: () => {{}}, loadCatalog: async () => {{}},
@@ -254,6 +254,25 @@ console.log(JSON.stringify({ dialogHidden: updateUi.dialog.hidden, stripHidden: 
     assert result["dialogHidden"] is False and result["stripHidden"] is True
     assert result["since"] == "Changes since 2026-10-20 02:41:07Z will be checked."
     assert result["renders"] == []
+
+
+@needs_node
+def test_update_visible_asks_about_its_cards_and_posts_their_ids() -> None:
+    result = _node(_page_script("""
+statusAnswer = { running: false, phase: "idle", watermark: "2026-10-20T02:41:07.046666Z" };
+await api.openUpdateAll([11, 12, 13]);
+const asked = { heading: updateUi.heading.textContent, since: updateUi.since.textContent };
+await api.startUpdateAll();
+const visiblePost = calls.filter((c) => c.method === "POST").pop().body;
+await api.openUpdateAll();
+const allHeading = updateUi.heading.textContent;
+await api.startUpdateAll();
+const allPost = calls.filter((c) => c.method === "POST").pop().body;
+console.log(JSON.stringify({ asked, visiblePost, allHeading, allPost }));
+"""))
+    assert result["asked"] == {"heading": "Update visible", "since": "The 3 visible locations will be redrawn from OData."}
+    assert json.loads(result["visiblePost"]) == {"ids": [11, 12, 13]}
+    assert result["allHeading"] == "Update all" and json.loads(result["allPost"]) == {}
 
 
 @needs_node

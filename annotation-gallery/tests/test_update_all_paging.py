@@ -94,8 +94,8 @@ class _Script:
             pages = self.update if kind == "update" else self.retry[int(kind)]
             return kind, pages, int(number)
         filter_text = parse_qs(parsed.query)["$filter"][0]
-        if "ID eq" in filter_text:
-            first = filter_text.split(" or ")[0].split("eq")[1].strip()
+        if filter_text.startswith("ID in ("):
+            first = filter_text.split("(", 1)[1].split(",")[0].rstrip(")").strip()
             return first, self.retry[int(first)], 0
         return "update", self.update, 0
 

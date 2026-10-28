@@ -4461,7 +4461,10 @@
     // A converter build shows its cards as they are made: the built count last shown and when (ms), to throttle reloads.
     shownBuilt: 0,
     shownAt: 0,
+    // The locations the open dialog will update (Update visible), or null for Update all.
+    ids: null,
     dialog: document.getElementById("update-dialog"),
+    heading: document.getElementById("update-title"),
     since: document.getElementById("update-since"),
     last: document.getElementById("update-last"),
     start: document.getElementById("update-start"),
@@ -4508,6 +4511,8 @@
       headline = "Reading the catalog";
     } else if (running && phase === "retrying skipped") {
       headline = "Retrying locations skipped last time";
+    } else if (running && phase === "updating visible") {
+      headline = `Updating ${count(status.requested)} visible locations`;
     } else if (running) {
       headline = since ? `Checking changes since ${since}` : "Checking changes";
     } else {
@@ -4659,7 +4664,8 @@
     }
   }
 
-  async function openUpdateAll() {
+  // ids: Update visible, just these locations (the cards shown now). Without them: Update all.
+  async function openUpdateAll(ids = null) {
     if (!state.volume) {
       return;
     }
@@ -4669,7 +4675,13 @@
       await pollUpdate();
       return;
     }
-    if (status) {
+    updateUi.ids = ids;
+    updateUi.heading.textContent = ids ? "Update visible" : "Update all";
+    if (ids) {
+      const noun = ids.length === 1 ? "location" : "locations";
+      updateUi.since.textContent = `The ${ids.length.toLocaleString("en-US")} visible ${noun} will be redrawn from OData.`;
+      updateUi.last.textContent = "Hidden cards and the Update all watermark are not changed.";
+    } else if (status) {
       updateUi.since.textContent = describeWatermark(status);
       const last = status.lastCounts || {};
       updateUi.last.textContent = status.lastRun
@@ -4686,7 +4698,7 @@
       const status = await getJson(updateUrl(), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify(updateUi.ids ? { ids: updateUi.ids } : {}),
       });
       updateUi.dialog.hidden = true;
       updateUi.wasRunning = true;
@@ -4942,6 +4954,16 @@
 
   document.getElementById("update-all").addEventListener("click", () => {
     openUpdateAll().catch((error) => {
+      els.status.textContent = error.message;
+    });
+  });
+  document.getElementById("update-visible").addEventListener("click", () => {
+    const ids = ensureVisibleCards().map((windows) => Number(windows[0].location_id));
+    if (!ids.length) {
+      els.status.textContent = "No cards are shown, so there is nothing to update.";
+      return;
+    }
+    openUpdateAll(ids).catch((error) => {
       els.status.textContent = error.message;
     });
   });
