@@ -26,7 +26,9 @@ ZERO = {
     "prob_box_only": 0.0,
     "prob_box_points": 0.0,
     "prob_circle_seed": 0.0,
-    "prob_adjacent_seed": 0.0,
+    "prob_circle_annotator": 0.0,
+    "prob_circle_pull_through": 0.0,
+    "prob_adjacent_poly_seed": 0.0,
     "prob_subset_seed": 0.0,
     "prob_correction": 0.0,
     "prob_near_correct": 0.0,
@@ -36,7 +38,9 @@ _FIELD = {
     PromptType.BOX: "prob_box_only",
     PromptType.BOX_POINTS: "prob_box_points",
     PromptType.CIRCLE_SEED: "prob_circle_seed",
-    PromptType.ADJACENT_SEED: "prob_adjacent_seed",
+    PromptType.CIRCLE_ANNOTATOR: "prob_circle_annotator",
+    PromptType.CIRCLE_PULL_THROUGH: "prob_circle_pull_through",
+    PromptType.ADJACENT_POLY_SEED: "prob_adjacent_poly_seed",
     PromptType.SUBSET_SEED: "prob_subset_seed",
     PromptType.CORRECTION: "prob_correction",
     PromptType.NEAR_CORRECT: "prob_near_correct",
@@ -60,7 +64,11 @@ class PromptConfigTests(unittest.TestCase):
     def test_defaults_sum_to_one(self) -> None:
         CFG.validate()
         self.assertAlmostEqual(sum(CFG.probabilities().values()), 1.0)
-        self.assertEqual(CFG.variants_per_sample, 3)
+        self.assertEqual(CFG.variants_per_sample, 4)
+        self.assertEqual(
+            (CFG.prob_circle_seed, CFG.prob_circle_annotator, CFG.prob_circle_pull_through), (0.10, 0.20, 0.05)
+        )
+        self.assertAlmostEqual(CFG.circle_share(), 0.35)
 
     def test_rejects_bad_sum_negative_and_inverted_range(self) -> None:
         with self.assertRaises(ValueError):
@@ -80,7 +88,7 @@ class PromptConfigTests(unittest.TestCase):
         cfg = {
             "prompt": {
                 "prob_points_only": 0.15,
-                "prob_circle_seed": 0.35,
+                "prob_circle_seed": 0.05,
                 "box_points_max": 2,
                 "erode_px": [2, 20],
             },
@@ -92,7 +100,7 @@ class PromptConfigTests(unittest.TestCase):
         self.assertEqual(config.erode_px, (2.0, 20.0))
         self.assertEqual(config.cache_size, 8)
         self.assertIs(config.drop_overlapping_circles, True)
-        self.assertEqual(config.prob_adjacent_seed, 0.15)
+        self.assertEqual(config.prob_adjacent_poly_seed, 0.15)
         self.assertEqual(PromptConfig.from_cfg({}), CFG)
 
     def test_from_cfg_validates(self) -> None:
@@ -158,16 +166,23 @@ class BoxTests(unittest.TestCase):
 
 
 class ChoosePromptTypeTests(unittest.TestCase):
-    def test_adjacent_share_moves_to_the_circle_seed_until_shapes_exist(self) -> None:
+    def test_adjacent_share_moves_to_the_circle_peers_until_shapes_exist(self) -> None:
+        # Its 0.15 is split among the three circle peers in proportion to their shares (0.10 / 0.20 / 0.05 of 0.35).
         rng = np.random.default_rng(0)
-        drawn = [choose_prompt_type(CFG, rng) for _ in range(6000)]
-        self.assertNotIn(PromptType.ADJACENT_SEED, drawn)
-        share = drawn.count(PromptType.CIRCLE_SEED) / len(drawn)
-        self.assertAlmostEqual(share, 0.55, delta=0.04)
+        drawn = [choose_prompt_type(CFG, rng) for _ in range(12000)]
+        self.assertNotIn(PromptType.ADJACENT_POLY_SEED, drawn)
+        for kind, share in (
+            (PromptType.CIRCLE_SEED, 0.10), (PromptType.CIRCLE_ANNOTATOR, 0.20), (PromptType.CIRCLE_PULL_THROUGH, 0.05)
+        ):
+            self.assertAlmostEqual(drawn.count(kind) / len(drawn), share * 0.50 / 0.35, delta=0.015, msg=kind)
+
+    def test_with_every_circle_peer_at_zero_the_adjacent_share_goes_to_the_plain_circle(self) -> None:
+        cfg = _only(PromptType.ADJACENT_POLY_SEED)
+        self.assertIs(choose_prompt_type(cfg, np.random.default_rng(0)), PromptType.CIRCLE_SEED)
 
     def test_everything_available_draws_every_type(self) -> None:
         rng = np.random.default_rng(1)
-        drawn = {choose_prompt_type(CFG, rng, can_adjacent_seed=True) for _ in range(4000)}
+        drawn = {choose_prompt_type(CFG, rng, can_adjacent_poly_seed=True) for _ in range(4000)}
         self.assertEqual(drawn, {kind for kind, share in CFG.probabilities().items() if share > 0})
 
     def test_exclude_draws_without_replacement(self) -> None:
@@ -416,22 +431,22 @@ class BuildPromptTests(unittest.TestCase):
                 self.assertLess(float(prompt.dense_logits.min()), -5.0)
         self.assertGreater(merged_seen, 3)
 
-    def test_adjacent_seed_fits_inside_or_falls_back_to_the_circle(self) -> None:
+    def test_adjacent_poly_seed_fits_inside_or_falls_back_to_the_circle(self) -> None:
         shape = np.zeros((30, 30), dtype=bool)
         shape[5:25, 8:22] = True
         prompt = build_prompt(
-            PromptType.ADJACENT_SEED,
+            PromptType.ADJACENT_POLY_SEED,
             target_mask=self.target,
             circle_mask=self.circle,
             regions=[],
-            cfg=_only(PromptType.ADJACENT_SEED),
+            cfg=_only(PromptType.ADJACENT_POLY_SEED),
             rng=np.random.default_rng(0),
             adjacent_shape=shape,
         )
-        self.assertIs(prompt.prompt_type, PromptType.ADJACENT_SEED)
+        self.assertIs(prompt.prompt_type, PromptType.ADJACENT_POLY_SEED)
         grown = distance_transform_edt(~self.target) <= 10.0
         self.assertGreaterEqual(float((prompt.input_mask & grown).sum()) / prompt.input_mask.sum(), 0.97)
-        missing = self._build(PromptType.ADJACENT_SEED, regions=[])
+        missing = self._build(PromptType.ADJACENT_POLY_SEED, regions=[])
         self.assertIs(missing.prompt_type, PromptType.CIRCLE_SEED)
 
     def test_background_points_ride_along_by_probability(self) -> None:

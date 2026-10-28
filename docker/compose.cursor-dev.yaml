@@ -44,6 +44,16 @@ x-gallery-env: &gallery-env
   GALLERY_IDENTITY_API: "${GALLERY_IDENTITY_API:-https://identity.codepharm.net:6001}"
   GALLERY_READ_PERMISSION: "${GALLERY_READ_PERMISSION:-Read}"
   GALLERY_REVIEW_PERMISSION: "${GALLERY_REVIEW_PERMISSION:-Annotate}"
+  # The converter (/converter/) and gold review (/gold/) pages. Each is off when its root is empty. The roots are under the
+  # mirror, so TEM and SEM keep their own. The converter needs a segmentation server and a VikingXML (<volume> is replaced
+  # by the volume name; RC1's VikingXML is in an older format the converter cannot read yet).
+  GALLERY_CONVERTER_ROOT: "${GALLERY_CONVERTER_ROOT-/data-local/converter}"
+  GALLERY_GOLD_ROOT: "${GALLERY_GOLD_ROOT-/data-local/gold}"
+  GALLERY_SEGMENTATION_TARGET: "${GALLERY_SEGMENTATION_TARGET:-host.docker.internal:40448}"
+  GALLERY_SEGMENTATION_TLS_NAME: "${GALLERY_SEGMENTATION_TLS_NAME:-segmentation.codepharm.net}"
+  GALLERY_CONVERTER_VIKINGXML: "${GALLERY_CONVERTER_VIKINGXML:-http://rogue1.codepharm.net/<volume>/SliceToVolume.VikingXML}"
+  GALLERY_CONVERTER_VIKINGXML_RC1: "${GALLERY_CONVERTER_VIKINGXML_RC1:-http://rogue1.codepharm.net/RABBIT/rogue1.vikingxml}"
+  GALLERY_CONVERTER_TILE_CACHE: "${GALLERY_CONVERTER_TILE_CACHE:-/data-local/converter/tile-cache}"
 
 x-nornir-buildmanager: &nornir-buildmanager
   type: bind
@@ -115,6 +125,13 @@ services:
       - type: bind
         source: ./drop-sys-admin-after-mounts.sh
         target: /usr/local/bin/drop-sys-admin-after-mounts.sh
+        read_only: true
+      # Published section-correction sets (<DB>/<stos group>/manifest.json + <z>.vfield.npz), read-only: the trainer
+      # uses them to place carried-forward adjacent polygons (data.corrections_root: /corrections). This is the folder
+      # the correction service serves from; override the host path with SAM2_CORRECTIONS_HOST.
+      - type: bind
+        source: ${SAM2_CORRECTIONS_HOST:-\\wsl.localhost\Ubuntu\srv\viking\section-correction\corrections}
+        target: /corrections
         read_only: true
       # nornir_shared MQTT helpers, read-only. Entry script warns and continues if import fails.
       - type: bind

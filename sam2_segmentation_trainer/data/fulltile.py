@@ -42,6 +42,12 @@ def cap_full_tiles(
     if threshold is None or keep_fraction >= 1.0:
         return list(examples)
     kept: list[CropExample] = []
+    # TODO(v6): the draw depends only on the location and the run seed, so the SAME ~keep_fraction of full tiles
+    # is kept every epoch and the rest are never seen in the whole run (v5: 3,809 kept, 12,148 never trained on).
+    # For v6, mix the epoch into the draw (e.g. keep_hash(f"{example.split_key}|{epoch}", seed)) so a different
+    # quarter is used each epoch: same cost per epoch, every full tile seen over the run. Needs the epoch passed in
+    # here and the cap re-applied at each epoch start (train.py calls _cap_full_tiles only at start-up and on an
+    # inventory refresh). Do not change this mid-run: it would alter a live run's training set.
     for example in examples:
         if is_full_tile(example, threshold) and keep_hash(example.split_key, seed) >= keep_fraction:
             continue

@@ -31,7 +31,7 @@ from sam2_segmentation_trainer.goal_metrics import (
     ground_truth_terms,
     sample_goal_metrics,
 )
-from sam2_segmentation_trainer.model import decode_grouped, encode_images
+from sam2_segmentation_trainer.model import decode_grouped, encode_images, to_device_async
 
 MASK_LOGIT_CLIP = 20.0
 """Previous logits are clipped to this before they become the next mask prompt (the range the server feeds)."""
@@ -101,7 +101,7 @@ def error_clicks(
         coords[i] = ((x + 0.5) * width / low_w, (y + 0.5) * height / low_h)
         labels[i] = label
     device = low_res_logits.device
-    return torch.from_numpy(coords).to(device), torch.from_numpy(labels).to(device)
+    return to_device_async(torch.from_numpy(coords), device), to_device_async(torch.from_numpy(labels), device)
 
 
 def _append_click(

@@ -60,12 +60,18 @@ def build_data_record(
     val_counts: Mapping[str, int],
     split_seed: int | None = None,
     train_fraction: float | None = None,
+    adjacent_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The record for ``data_dir``.
 
     ``set`` is the version folder after resolving a ``current`` symlink; ``requested`` is the name that was asked
     for. ``fingerprint`` (12 hex digits) hashes every file digest, so it changes when any volume's inventory,
     approved list or ignore list changes.
+
+    ``adjacent_projection`` (per volume, from ``TileContext.projection``) says how the adjacent-section outlines
+    were placed: ``projected`` with the VikingXML and stos group, and the residual correction set's directory,
+    manifest provenance (``built_utc``, ``annotation_watermark``, method, ...) and manifest digest, so an exported
+    model names the field it trained with; or ``centroid`` with the reason. It is not part of ``fingerprint``.
     """
     data_dir = Path(data_dir)
     per_volume = {volume: volume_fingerprint(volume, data_dir) for volume in volumes}
@@ -80,6 +86,7 @@ def build_data_record(
         "val_examples": {key: int(value) for key, value in val_counts.items()},
         "split_seed": split_seed,
         "train_fraction": train_fraction,
+        "adjacent_projection": None if adjacent_projection is None else dict(adjacent_projection),
     }
 
 

@@ -85,7 +85,7 @@ class PromptRestrictionTests(unittest.TestCase):
     def test_falls_back_to_points_when_nothing_allowed_has_weight(self) -> None:
         cfg = PromptConfig(
             prob_points_only=0.0, prob_box_only=0.5, prob_box_points=0.0, prob_circle_seed=0.0,
-            prob_adjacent_seed=0.0, prob_subset_seed=0.5, prob_correction=0.0, prob_near_correct=0.0,
+            prob_circle_annotator=0.0, prob_circle_pull_through=0.0, prob_adjacent_poly_seed=0.0, prob_subset_seed=0.5, prob_correction=0.0, prob_near_correct=0.0,
         )
         rng = np.random.default_rng(0)
         kind = choose_prompt_type(cfg, rng, allowed=FULL_TILE_PROMPTS)
@@ -99,19 +99,62 @@ class PromptRestrictionTests(unittest.TestCase):
             context = build_tile_context(examples, load_circles=False)
             cfg = PromptConfig(
                 prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0, prob_circle_seed=0.0,
-                prob_adjacent_seed=0.0, prob_subset_seed=1.0, prob_correction=0.0, prob_near_correct=0.0,
+                prob_circle_annotator=0.0, prob_circle_pull_through=0.0,
+                prob_adjacent_poly_seed=0.0, prob_subset_seed=1.0, prob_correction=0.0, prob_near_correct=0.0,
             )
             dataset = EMSegDataset(
                 examples, split="train", image_size=32, tiles=context, prompt_cfg=cfg,
                 seed=1, full_tile_threshold=0.99,
             )
             item = dataset[0]
-            # Variant 1 is the circle seed; a fully masked tile has nothing else to draw but points.
-            self.assertEqual(
-                [v["prompt_type"] for v in item["variants"]],
-                [PromptType.CIRCLE_SEED.value, PromptType.POINTS.value],
-            )
+            # A fully masked tile cannot draw a subset seed, and nothing it may draw has a share: the shortfall rule
+            # gives one points variant and stops.
+            self.assertEqual([v["prompt_type"] for v in item["variants"]], [PromptType.POINTS.value])
             self.assertTrue(item["sample_meta"].full_tile)
+
+    def test_full_tiles_draw_no_pull_through_and_have_three_variants(self) -> None:
+        import torch
+
+        from sam2_segmentation_trainer.data.dataset import EpochCounter, collate_em
+        from sam2_segmentation_trainer.model import combined_loss
+
+        self.assertNotIn(PromptType.CIRCLE_PULL_THROUGH, FULL_TILE_PROMPTS)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_crops(root, "RC1", n=6)
+            normal = index_volumes(volumes=["RC1"], root=root)
+            full = [replace(e, area_frac=1.0) for e in normal]
+            counter = EpochCounter()
+            dataset = EMSegDataset(
+                full, split="train", image_size=32, tiles=build_tile_context(full, load_circles=False),
+                prompt_cfg=PromptConfig(), seed=1, full_tile_threshold=0.99, epoch=counter,
+            )
+            for epoch in range(3):
+                counter.set(epoch)
+                for index in range(len(dataset)):
+                    variants = dataset[index]["variants"]
+                    asked = [v["requested_prompt_type"] for v in variants]
+                    # Points, circle_seed and circle_annotator once each (the default mix has 4 variants): no
+                    # pull-through that would decode the circle_seed prompt a second time.
+                    self.assertEqual(sorted(asked), ["circle_annotator", "circle_seed", "points"])
+            # A 3-variant full tile batches with a 4-variant normal sample; the loss averages each sample's variants.
+            mixed = EMSegDataset(
+                normal, split="train", image_size=32, tiles=build_tile_context(normal, load_circles=False),
+                prompt_cfg=PromptConfig(), seed=1, full_tile_threshold=0.99,
+            )
+            batch = collate_em([dataset[0], mixed[0]])
+            index = batch["variant_index"]
+            self.assertEqual(torch.bincount(index).tolist(), [3, 4])
+            pred = torch.randn(index.numel(), 32, 32)
+            target = batch["mask"][index].float()
+            loss, stats = combined_loss(
+                pred, target, torch.rand(index.numel()), focal_weight=20.0, dice_weight=1.0, iou_weight=1.0,
+                variant_index=index, num_samples=2,
+            )
+            per_variant = stats["sample_losses"]
+            expected = (per_variant[index == 0].mean() + per_variant[index == 1].mean()) / 2
+            self.assertTrue(torch.isfinite(loss))
+            self.assertAlmostEqual(float(loss), float(expected), places=5)
 
     def test_normal_tiles_keep_the_configured_mix(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -121,16 +164,18 @@ class PromptRestrictionTests(unittest.TestCase):
             context = build_tile_context(examples, load_circles=False)
             cfg = PromptConfig(
                 prob_points_only=0.0, prob_box_only=0.0, prob_box_points=0.0, prob_circle_seed=0.0,
-                prob_adjacent_seed=0.0, prob_subset_seed=1.0, prob_correction=0.0, prob_near_correct=0.0,
+                prob_circle_annotator=0.0, prob_circle_pull_through=0.0,
+                prob_adjacent_poly_seed=0.0, prob_subset_seed=1.0, prob_correction=0.0, prob_near_correct=0.0,
             )
             dataset = EMSegDataset(
                 examples, split="train", image_size=32, tiles=context, prompt_cfg=cfg,
                 seed=1, full_tile_threshold=0.99,
             )
             item = dataset[0]
+            # No family is forced: the only family with a share comes first, then the shortfall points variant.
             self.assertEqual(
                 [v["prompt_type"] for v in item["variants"]],
-                [PromptType.CIRCLE_SEED.value, PromptType.SUBSET_SEED.value, PromptType.POINTS.value],
+                [PromptType.SUBSET_SEED.value, PromptType.POINTS.value],
             )
             self.assertFalse(item["sample_meta"].full_tile)
 

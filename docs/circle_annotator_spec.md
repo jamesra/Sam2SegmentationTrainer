@@ -74,6 +74,15 @@ In `validation.py` and `config/em_finetune.yaml`: `circle_annotator` is in `DEFA
 
 ## Step 2: training rule
 
+> **Superseded Oct 18, 2026.** The per-variant replacement below (and `circle_seed_jitter.prob`) is gone. The circle
+> prompts are now three peer prompt types in the `prob_*` mix: `circle_seed` (0.10, the plain circle),
+> `circle_annotator` (0.20, the disc from `annotator_circle`, generator `[seed, epoch, index, k, 2]`) and
+> `circle_pull_through` (0.05, see "Pull-through circles" below, generator `[seed, epoch, index, k, 3]`). No variant
+> is forced to be a circle: all four variants are drawn from the mix without replacement. A disc that cannot be drawn
+> falls back to the plain circle and the variant is reported as `circle_seed` (`requested_prompt_type` keeps what was
+> drawn). An adjacent polygon seed that cannot be fitted falls back to the plain circle. A retired `prob` key in an
+> old config's `circle_seed_jitter` block is ignored. The containment rule (inside the target only) stands.
+
 In `_mixed_item`, after `circle_aug` is final (after the existing fallback that fits `inscribed_circle_xyr`), for each
 variant `k` whose `kind` is `PromptType.CIRCLE_SEED` (variant 0 included):
 
@@ -87,7 +96,7 @@ if jitter.prob > 0:
             circle_k = disc
 ```
 
-Pass `circle_k` as `circle_mask` to that variant's `build_prompt`. The adjacent-seed fallback to a circle also uses
+Pass `circle_k` as `circle_mask` to that variant's `build_prompt`. The adjacent-polygon-seed fallback to a circle also uses
 `circle_k`. With `prob` 0 nothing is drawn, so prompts are bit-identical to the current code. Encoding, negatives
 and losses are unchanged: no `prompt_encoding` version bump.
 
@@ -95,6 +104,20 @@ and losses are unchanged: no `prompt_encoding` version bump.
 (`prompt_fg`), multiply it by the ground-truth target, so the trusted seed core counts only where it overlaps the
 target. With the rule above the disc is already inside the visible target before augmentation; this guards against
 elastic warps and rasterization at the edge. The prompt itself is never clipped.
+
+## Pull-through circles (`circle_pull_through`)
+
+Added Oct 18, 2026. An annotator sometimes draws the circle across the cell edge. `pull_through_circle(target, rng,
+cfg, depth=None, info=None)` in `data/prompts.py` draws such a disc: per try, the radius `U(radius_range) x D`
+(D the target's maximum depth, raised to `min_radius_px`), then a centre among target pixels whose depth is between
+0.25 and 0.9 of the radius; the first disc with at least `overlap_min` of its area inside the target and at least
+`outside_min` outside is returned, else None after `max_tries`. The disc is not clipped; the containment weight is
+zero outside the target, so the model learns to ignore that part and expand from the inside part to the full cell.
+
+`prompt.circle_pull_through` (`CirclePullThrough`): `overlap_min` 0.60, `outside_min` 0.05, `radius_range`
+[0.4, 0.9], `min_radius_px` 6, `max_tries` 20. Its share is `prompt.prob_circle_pull_through` (0.05). There is no
+validation family for it yet (possible follow-up). Tests: `tests/test_circle_pull_through.py`. Gallery:
+`docs/prompt_overview.md`.
 
 ## Tests (`tests/`)
 

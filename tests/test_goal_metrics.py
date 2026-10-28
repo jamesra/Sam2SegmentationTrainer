@@ -8,11 +8,11 @@ from annotation_crops.prompt_encoding import edge_distance
 from sam2_segmentation_trainer.data.refine import grow_mask
 from sam2_segmentation_trainer.data.weights import neighbor_core_labels
 from sam2_segmentation_trainer.goal_metrics import (
-    EARLY_STOPPING_MIN_DELTA,
-    RECALL_MIN_DELTA,
+    SELECTION_FLOORS,
     GoalSummary,
     SelectionKey,
     add_goal_fields,
+    describe_selection,
     improves,
     sample_goal_metrics,
     sample_no_harm,
@@ -207,94 +207,71 @@ class SummaryTests(unittest.TestCase):
         self.assertTrue(sample_no_harm(no_core))
 
 
+def _key(recall=0.96, iou=0.86, spill=0.04, merge=0.001, frag=0.09):
+    return selection_key(GoalSummary(core_recall=recall, merge_rate=merge, spill=spill, frag=frag), iou)
+
+
 class SelectionTests(unittest.TestCase):
-    def _key(self, recall, merge=0.0, spill=0.0):
-        return selection_key(GoalSummary(core_recall=recall, merge_rate=merge, spill=spill), 0.975)
-
-    def test_reaching_the_target_beats_not_reaching_it(self) -> None:
-        self.assertTrue(self._key(0.976, merge=0.5, spill=2.0) > self._key(0.974, merge=0.0))
-
-    def test_among_epochs_at_the_target_the_lowest_merge_rate_wins(self) -> None:
-        self.assertTrue(self._key(0.976, merge=0.02) > self._key(0.99, merge=0.03))
-        self.assertFalse(self._key(0.99, merge=0.03) > self._key(0.976, merge=0.02))
-
-    def test_spill_breaks_a_merge_rate_tie(self) -> None:
-        self.assertTrue(self._key(0.98, merge=0.02, spill=0.01) > self._key(0.98, merge=0.02, spill=0.05))
-
-    def test_below_the_target_the_highest_recall_wins(self) -> None:
-        self.assertTrue(self._key(0.95, merge=0.9) > self._key(0.94, merge=0.0))
-
-    def test_round_trip_and_float_noise(self) -> None:
-        key = self._key(0.98, merge=0.02, spill=0.01)
-        again = SelectionKey.from_list(key.to_list())
-        self.assertFalse(again > key)
-        self.assertFalse(key > again)
-        # A change far below the fourth decimal is noise, not an improvement that resets the patience.
-        self.assertFalse(self._key(0.98, merge=0.02, spill=0.01 - 1e-7) > key)
-
-    def test_patience_two_stops_after_two_epochs_without_a_better_key(self) -> None:
-        patience, best, waited, stopped_at = 2, None, 0, None
-        epochs = [
-            self._key(0.96),                       # first: saved
-            self._key(0.98, merge=0.05),           # reaches the target: better
-            self._key(0.98, merge=0.06),           # worse: wait 1
-            self._key(0.99, merge=0.07),           # worse: wait 2 -> stop
-            self._key(0.99, merge=0.0),            # never reached
-        ]
-        for epoch, key in enumerate(epochs):
-            if best is None or key > best:
-                best, waited = key, 0
-            else:
-                waited += 1
-                if waited >= patience:
-                    stopped_at = epoch
-                    break
-        self.assertEqual(stopped_at, 3)
-
-
-class NoiseFloorTests(unittest.TestCase):
-    """``improves``: the selection ordering with a noise floor, so jitter does not save checkpoints or reset patience."""
-
-    def _key(self, recall, merge=0.0, spill=0.0):
-        return selection_key(GoalSummary(core_recall=recall, merge_rate=merge, spill=spill), 0.975)
+    """``improves``: better by its noise floor in at least one metric, worse by its floor in none."""
 
     def test_the_first_epoch_always_counts(self) -> None:
-        self.assertTrue(improves(self._key(0.5), None))
+        self.assertTrue(improves(_key(), None))
 
-    def test_reaching_the_gate_counts_and_losing_it_does_not(self) -> None:
-        below = self._key(0.97, merge=0.0)
-        above = self._key(0.976, merge=0.5, spill=2.0)
-        self.assertTrue(improves(above, below))
-        self.assertFalse(improves(below, above))
+    def test_one_metric_beyond_its_floor_counts(self) -> None:
+        best = _key()
+        self.assertTrue(improves(_key(recall=0.964), best))  # +0.004
+        self.assertTrue(improves(_key(iou=0.866), best))
+        self.assertTrue(improves(_key(spill=0.034), best))
+        self.assertTrue(improves(_key(merge=0.0), best, {**SELECTION_FLOORS, "merge_rate": 0.001}))
+        self.assertTrue(improves(_key(frag=0.078), best))
 
-    def test_merge_rate_must_fall_by_the_floor(self) -> None:
-        best = self._key(0.98, merge=0.050, spill=0.10)
-        self.assertFalse(improves(self._key(0.98, merge=0.049, spill=0.10), best))  # 0.001: noise
-        self.assertFalse(improves(self._key(0.98, merge=0.0485, spill=0.10), best))  # 0.0015
-        self.assertTrue(improves(self._key(0.98, merge=0.048, spill=0.10), best))  # exactly 0.002
-        self.assertTrue(improves(self._key(0.98, merge=0.030, spill=0.50), best))  # a real gain beats worse spill
-        self.assertFalse(improves(self._key(0.99, merge=0.052, spill=0.0), best))  # worse merge, better recall
+    def test_changes_inside_the_floors_are_noise(self) -> None:
+        best = _key()
+        self.assertFalse(improves(_key(recall=0.9635, iou=0.865, spill=0.035, merge=0.0, frag=0.08), best))
+        self.assertFalse(improves(best, best))
+        # Noise in other metrics does not block a real gain.
+        self.assertTrue(improves(_key(recall=0.957, iou=0.875, spill=0.044, frag=0.10), best))
 
-    def test_a_merge_tie_within_the_floor_is_decided_by_spill_with_the_same_floor(self) -> None:
-        best = self._key(0.98, merge=0.050, spill=0.100)
-        self.assertTrue(improves(self._key(0.98, merge=0.0505, spill=0.097), best))  # spill down 0.003
-        self.assertFalse(improves(self._key(0.98, merge=0.0505, spill=0.099), best))  # spill down 0.001
-        self.assertFalse(improves(self._key(0.98, merge=0.050, spill=0.100), best))  # identical
-        self.assertTrue(improves(self._key(0.98, merge=0.049, spill=0.090), best))  # merge within floor, spill -0.01
-        self.assertFalse(improves(self._key(0.98, merge=0.0495, spill=0.150), best))
+    def test_a_trade_beyond_the_floors_is_not_an_improvement(self) -> None:
+        best = _key()
+        self.assertFalse(improves(_key(recall=0.99, spill=0.06), best))
+        self.assertFalse(improves(_key(iou=0.90, merge=0.004), best))
 
-    def test_below_the_gate_recall_must_rise_by_half_a_tenth_of_a_point(self) -> None:
-        best = self._key(0.9500)
-        self.assertFalse(improves(self._key(0.9503), best))
-        self.assertTrue(improves(self._key(0.9505), best))
-        self.assertFalse(improves(self._key(0.9490), best))
+    def test_the_core_recall_target_is_not_a_gate(self) -> None:
+        # Crossing 97.5% with worse spill is a trade; better IoU and spill below the target count.
+        self.assertFalse(improves(_key(recall=0.976, spill=0.10), _key(recall=0.974)))
+        self.assertTrue(improves(_key(recall=0.960, iou=0.872, spill=0.026, merge=0.0, frag=0.065),
+                                 _key(recall=0.9605, iou=0.858, spill=0.045, merge=0.0011, frag=0.095)))
+
+    def test_floors_can_be_overridden_per_metric(self) -> None:
+        best = _key()
+        self.assertFalse(improves(_key(iou=0.866), best, {**SELECTION_FLOORS, "iou": 0.01}))
+        self.assertTrue(improves(_key(iou=0.871), best, {**SELECTION_FLOORS, "iou": 0.01}))
+
+    def test_round_trip_and_float_noise(self) -> None:
+        key = _key()
+        again = SelectionKey.from_dict(key.to_dict())
+        self.assertEqual(again.metrics, key.metrics)
+        self.assertEqual(set(key.to_dict()), set(SELECTION_FLOORS))
+        # Rounded to 4 decimals: a change far below that is no change.
+        self.assertEqual(_key(spill=0.04 - 1e-7).metrics, key.metrics)
+
+    def test_a_key_needs_every_metric(self) -> None:
+        with self.assertRaises(ValueError):
+            SelectionKey({"core_recall": 0.9})
+
+    def test_describe_names_the_metrics_that_moved(self) -> None:
+        line = describe_selection(_key(iou=0.88, spill=0.06), _key())
+        self.assertIn("better beyond the noise floor: iou 0.8600 -> 0.8800", line)
+        self.assertIn("worse: spill 0.0400 -> 0.0600", line)
+        self.assertEqual(describe_selection(_key(), None), "first validated epoch")
 
     def test_small_steady_gains_count_once_they_add_up_against_the_best(self) -> None:
-        # Each epoch gains 0.0003 over the last. Measured against the best so far, a gain only counts once it
-        # reaches 0.0005, so the checkpoint is saved every second epoch, not every epoch.
+        # Each epoch gains 0.003 IoU over the last. Measured against the best so far, a gain only counts once it
+        # reaches the 0.006 floor, so the checkpoint is saved every second epoch.
         best, waited, saved, longest = None, 0, [], 0
         for epoch in range(6):
-            key = self._key(0.9500 + 0.0003 * epoch)
+            key = _key(iou=0.850 + 0.003 * epoch)
             if improves(key, best):
                 best, waited = key, 0
                 saved.append(epoch)
@@ -306,8 +283,8 @@ class NoiseFloorTests(unittest.TestCase):
 
     def test_a_plateau_inside_the_noise_floor_stops_the_run_with_patience_two(self) -> None:
         best, waited, stopped = None, 0, None
-        for epoch, merge in enumerate([0.040, 0.0395, 0.0405, 0.039, 0.0392]):
-            key = self._key(0.98, merge=merge, spill=0.1)
+        for epoch, iou in enumerate([0.860, 0.862, 0.858, 0.864, 0.870]):
+            key = _key(iou=iou)
             if improves(key, best):
                 best, waited = key, 0
             else:
@@ -317,9 +294,10 @@ class NoiseFloorTests(unittest.TestCase):
                     break
         self.assertEqual(stopped, 2)
 
-    def test_the_defaults(self) -> None:
-        self.assertEqual(EARLY_STOPPING_MIN_DELTA, 0.002)
-        self.assertEqual(RECALL_MIN_DELTA, 0.0005)
+    def test_the_default_floors(self) -> None:
+        self.assertEqual(
+            SELECTION_FLOORS, {"core_recall": 0.004, "iou": 0.006, "spill": 0.006, "merge_rate": 0.002, "frag": 0.012}
+        )
 
 
 if __name__ == "__main__":

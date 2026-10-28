@@ -30,7 +30,14 @@ from torch.utils.data import DataLoader
 
 from annotation_crops.prompt_encoding import window
 from sam2_segmentation_trainer.data.approved import as_approved, is_approved
-from sam2_segmentation_trainer.data.dataset import VAL_PROMPTS, EMSegDataset, collate_em
+from sam2_segmentation_trainer.data.circle_seed_trust import DEFAULT_OVERSIZE_RANGE
+from sam2_segmentation_trainer.data.dataset import (
+    VAL_PROMPTS,
+    EMSegDataset,
+    collate_em,
+    limit_main_process_cv2,
+    limit_worker_threads,
+)
 from sam2_segmentation_trainer.goal_metrics import (
     CORE_BAND_PX,
     CORE_RECALL_TARGET,
@@ -58,7 +65,7 @@ DEFAULT_VAL_PROMPTS = (
 near-correct mask ("do no harm"), the interior point, the legacy centroid, the circle seed without negative
 context and an annotator-like circle seed (both diagnostics; neither selects a checkpoint)."""
 
-NEG_SPLIT_PROMPTS = ("circle_mask", "circle_mask_noneg", "circle_annotator")
+NEG_SPLIT_PROMPTS = ("circle_mask", "circle_mask_noneg", "circle_annotator", "circle_oversize")
 """Circle-seed families whose results are also split by whether the sample has negative context (``with_neg`` and
 ``no_neg``)."""
 
@@ -109,6 +116,11 @@ class ModeResult:
     recall_by_depth: dict[str, DepthBin] = field(default_factory=dict)
     """Core recall by the ground truth's maximum depth (see ``goal_metrics.DEPTH_BINS``)."""
     approved_by_volume: dict[str, int] = field(default_factory=dict)
+    gold: GoalSummary | None = None
+    """Goal metrics over the gold set's locations (``data.gold_set``); None when the records carry none."""
+    gold_n: int = 0
+    gold_iou: float | None = None
+    gold_by_volume: dict[str, int] = field(default_factory=dict)
     with_neg: GoalSummary | None = None
     """Goal metrics over the samples whose tile has negative context (None when the records do not say)."""
     no_neg: GoalSummary | None = None
@@ -173,6 +185,15 @@ def summarize_mode(records: Sequence[dict[str, Any]], *, target: float = CORE_RE
             name = str(record.get("volume") or "").strip()
             if name:
                 result.approved_by_volume[name] = result.approved_by_volume.get(name, 0) + 1
+    gold = [r for r in scored if r.get("gold")]
+    result.gold_n = len(gold)
+    if gold:
+        result.gold = summarize_goal(gold, target=target)
+        result.gold_iou = float(np.mean([r["iou"] for r in gold]))
+        for record in gold:
+            name = str(record.get("volume") or "").strip()
+            if name:
+                result.gold_by_volume[name] = result.gold_by_volume.get(name, 0) + 1
     for field_name, bucket in (("volume", result.by_volume), ("category", result.by_category)):
         buckets: dict[str, list[float]] = {}
         for record in scored:
@@ -183,11 +204,10 @@ def summarize_mode(records: Sequence[dict[str, Any]], *, target: float = CORE_RE
     return result
 
 
-def epoch_selection(
-    results: dict[str, ModeResult], primary: str, target: float = CORE_RECALL_TARGET
-) -> SelectionKey:
-    """The key that orders epochs for ``best_model.pt`` and early stopping, from the primary mode's goal metrics."""
-    return selection_key(results[primary].goal, target)
+def epoch_selection(results: dict[str, ModeResult], primary: str) -> SelectionKey:
+    """The key that compares epochs for ``best_model.pt`` and early stopping: the primary mode's goal metrics and
+    tolerant IoU."""
+    return selection_key(results[primary].goal, results[primary].iou)
 
 
 def predict_batch(model, batch, device, image_size: int) -> torch.Tensor:
@@ -463,9 +483,10 @@ def full_pass_due(epoch: int, num_epochs: int, every: int) -> bool:
 
 
 def select_validation_subset(
-    examples: Sequence, fraction: float, seed: int, approved: frozenset | set | None = None
+    examples: Sequence, fraction: float, seed: int, approved: frozenset | set | None = None, gold=None
 ) -> list:
-    """A fixed, stratified subset of the validation examples, always including every Approved one.
+    """A fixed, stratified subset of the validation examples, always including every Approved one and every
+    window of a gold location (``gold`` is a :class:`~sam2_segmentation_trainer.data.valsets.GoldSet` or None).
 
     Each volume contributes its ``ceil(fraction * n)`` examples with the smallest hash of
     ``(seed, volume, image key, location id)``, so the draw is reproducible from the run seed, stable when the
@@ -490,9 +511,18 @@ def select_validation_subset(
         for example in sorted(members, key=draw)[:count]:
             chosen.add(id(example))
     for example in examples:
-        if is_approved(approved, example):
+        if is_approved(approved, example) or (gold and gold.matches(example)):
             chosen.add(id(example))
     return [example for example in examples if id(example) in chosen]
+
+
+def mark_gold_records(records: dict[str, list[dict[str, Any]]], gold) -> None:
+    """Flag every record of a gold location ``gold: True``. A record's ``key`` is ``(volume, image_key,
+    location_id)``; a gold location counts all of its windows."""
+    for rows in records.values():
+        for record in rows:
+            volume, _image_key, location_id = record["key"]
+            record["gold"] = gold.contains(volume, location_id)
 
 
 @dataclass(slots=True)
@@ -505,6 +535,8 @@ class SuiteResult:
     seconds: float = 0.0
     n_samples: int = 0
     timings: dict[str, float] = field(default_factory=dict)
+    records: dict[str, list[dict[str, Any]]] | None = None
+    """Every scored sample per family (from :func:`score_sample`), only when ``run(keep_records=True)``."""
 
 
 class ValidationSuite:
@@ -537,9 +569,12 @@ class ValidationSuite:
         merge_min_px: int = MERGE_MIN_PX,
         core_recall_target: float = CORE_RECALL_TARGET,
         approved: frozenset | set | None = None,
+        gold=None,
         epoch_subset: float = 1.0,
         batch_size: int = 1,
         metric_threads: int = 4,
+        circle_seed_taper: float | None = None,
+        circle_oversize_range: Sequence[float] = DEFAULT_OVERSIZE_RANGE,
     ) -> None:
         modes = list(dict.fromkeys(modes))
         if not modes:
@@ -563,6 +598,9 @@ class ValidationSuite:
         self.epoch_subset = float(epoch_subset)
         self.seed = int(seed)
         self.approved = as_approved(approved)
+        # Gold locations (data.valsets.GoldSet): always in the subset, and their records are flagged "gold" so
+        # summarize_mode reports them as their own row.
+        self.gold = gold if gold else None
         self._dataset_args = dict(
             split="val",
             image_size=image_size,
@@ -577,11 +615,14 @@ class ValidationSuite:
             edge_tau_depth_frac=edge_tau_depth_frac,
             core_band_px=core_band_px,
             approved=approved,
+            # Evaluation only (sam2-em-eval --goal); see docs/circle_seed_trust_eval.md.
+            circle_seed_taper=circle_seed_taper,
+            circle_oversize_range=circle_oversize_range,
         )
         examples = list(examples)
         self.full_dataset = EMSegDataset(examples, val_families=self.modes, **self._dataset_args)
         self.subset_dataset = EMSegDataset(
-            select_validation_subset(examples, self.epoch_subset, self.seed, self.approved),
+            select_validation_subset(examples, self.epoch_subset, self.seed, self.approved, self.gold),
             val_families=self.subset_modes,
             **self._dataset_args,
         )
@@ -607,7 +648,7 @@ class ValidationSuite:
         examples = list(examples)
         self.full_dataset.replace_examples(examples)
         self.subset_dataset.replace_examples(
-            select_validation_subset(examples, self.epoch_subset, self.seed, self.approved)
+            select_validation_subset(examples, self.epoch_subset, self.seed, self.approved, self.gold)
         )
         self._refresh_keys()
 
@@ -619,6 +660,7 @@ class ValidationSuite:
         dataset = self.full_dataset if full else self.subset_dataset
         if limit is not None:
             dataset = torch.utils.data.Subset(dataset, list(range(min(int(limit), len(dataset)))))
+        limit_main_process_cv2()
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -626,6 +668,7 @@ class ValidationSuite:
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=collate_em,
+            worker_init_fn=limit_worker_threads,
         )
 
     def run(
@@ -637,11 +680,14 @@ class ValidationSuite:
         *,
         full: bool = False,
         overlays_per_volume: int = 0,
+        keep_records: bool = False,
     ) -> SuiteResult:
         """One pass over the subset, or over the full split (which also yields the subset numbers).
 
         A full pass scores every family, centroid included; the subset results are filtered out of it, so a
-        full pass costs no extra subset pass. Overlay strips come from the primary family.
+        full pass costs no extra subset pass. Overlay strips come from the primary family. ``keep_records`` keeps
+        every per-sample record in the result (``SuiteResult.records``), for offline analysis such as how large the
+        per-epoch subset must be (``scripts/valset_size_study.py``); training leaves it off.
         """
         started = time.perf_counter()
         timings: dict[str, float] = {}
@@ -659,6 +705,8 @@ class ValidationSuite:
             timings=timings,
         )
         target = self.core_recall_target
+        if self.gold:
+            mark_gold_records(records, self.gold)
         full_results = None
         if full:
             full_results = {mode: summarize_mode(records.get(mode, []), target=target) for mode in self.modes}
@@ -677,6 +725,7 @@ class ValidationSuite:
             seconds=time.perf_counter() - started,
             n_samples=n_samples,
             timings=timings,
+            records=records if keep_records else None,
         )
 
 
@@ -727,12 +776,14 @@ def log_results(
 
     The goal metrics go to ``<root>/<metric>/<mode>``; for the refinement prompts the input mask's values go to
     ``<root>/input/<metric>/<mode>`` and the change to ``<root>/delta_<metric>/<mode>``; Approved masks go to
-    ``<root>_approved/<metric>/<mode>``. The per-epoch subset pass logs under ``val_subset`` and the full pass
-    under ``val_full``, so the two never mix; with ``root="val_subset"`` the old names ``val/iou`` and
-    ``val_iou/{volume}`` are also written, carrying the primary mode's tolerant IoU (a diagnostic) for existing
-    dashboards. ``label`` names the pass in the summary line. A full pass (``root="val_full"``) also logs the
-    goal metrics per category (``val_full_cat/<metric>/<mode>/<category>``), per volume (``val_full_vol/...``) and
-    core recall by the ground truth's maximum depth (``val_full_depth/<metric>/<mode>/<bin>``).
+    ``<root>_approved/<metric>/<mode>`` and the gold set's locations (when the run has one) to
+    ``<root>_gold/<metric>/<mode>``, with ``<root>_gold/iou`` and ``<root>_gold/n``. The per-epoch subset pass logs
+    under ``val_subset`` and the full pass under ``val_full``, so the two never mix; with ``root="val_subset"`` the
+    old names ``val/iou`` and ``val_iou/{volume}`` are also written, carrying the primary mode's tolerant IoU (a
+    diagnostic) for existing dashboards. ``label`` names the pass in the summary line. A full pass
+    (``root="val_full"``) also logs the goal metrics per category (``val_full_cat/<metric>/<mode>/<category>``),
+    per volume (``val_full_vol/...``) and core recall by the ground truth's maximum depth
+    (``val_full_depth/<metric>/<mode>/<bin>``).
     """
     for mode, result in results.items():
         writer.add_scalar(f"{root}/iou/{mode}", result.iou, epoch)
@@ -765,6 +816,12 @@ def log_results(
         writer.add_scalar(f"{root}_approved/n/{mode}", result.approved_n, epoch)
         for volume, count in result.approved_by_volume.items():
             writer.add_scalar(f"{root}_approved_n/{mode}/{volume}", count, epoch)
+        if result.gold is not None:
+            _log_goal(writer, f"{root}_gold", mode, result.gold, epoch)
+            writer.add_scalar(f"{root}_gold/iou/{mode}", result.gold_iou, epoch)
+            writer.add_scalar(f"{root}_gold/n/{mode}", result.gold_n, epoch)
+            for volume, count in result.gold_by_volume.items():
+                writer.add_scalar(f"{root}_gold_n/{mode}/{volume}", count, epoch)
         if result.fulltile_iou is not None:
             writer.add_scalar(f"{root}/iou_fulltile/{mode}", result.fulltile_iou, epoch)
         for volume, score in result.by_volume.items():
@@ -813,6 +870,8 @@ def format_summary(
     )
     if main.approved is not None:
         text += f"; approved (n={main.approved_n}): {_goal_text(main.approved)}"
+    if main.gold is not None:
+        text += f"; gold (n={main.gold_n}): {_goal_text(main.gold)}, IoU {main.gold_iou:.4f}"
     for name, goal, count in (("with_neg", main.with_neg, main.with_neg_n), ("no_neg", main.no_neg, main.no_neg_n)):
         if goal is not None and primary in NEG_SPLIT_PROMPTS:
             text += f"; {name} (n={count}): {_goal_text(goal)}"

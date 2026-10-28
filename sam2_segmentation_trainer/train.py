@@ -40,17 +40,35 @@ from sam2_segmentation_trainer.data.dataset import (
     EpochCounter,
     MissingTileFlag,
     collate_em,
+    limit_main_process_cv2,
+    limit_worker_threads,
 )
 from sam2_segmentation_trainer.data.approved import ApprovedSet, approved_counts, load_approved
+from sam2_segmentation_trainer.data.circle_seed_trust import DEFAULT_OVERSIZE_RANGE
+from sam2_segmentation_trainer.data.valsets import (
+    GoldSet,
+    frozen_info,
+    load_frozen_split,
+    load_gold,
+    partition_with_gold,
+    resolve_gold_path,
+    resolve_split_path,
+)
 from sam2_segmentation_trainer.data.prompts import PromptConfig
 from sam2_segmentation_trainer.data.tiles import (
     TileContext,
+    adjacent_placement_summary,
     build_tile_context,
 )
 from sam2_segmentation_trainer.losses import containment_warmup_scale
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
 from annotation_crops.prompt_encoding import CORRECTION_LOGIT, EDGE_TAU_DEPTH_FRAC, EDGE_TAU_PX, SEED_LOGIT
 from sam2_segmentation_trainer.data_record import build_data_record, write_data_record
+from sam2_segmentation_trainer.card_scores import (
+    TrainPassScores,
+    record_validation_card_scores,
+    run_model_label,
+)
 from sam2_segmentation_trainer.export_serve import BEST_EPOCH_FILE, launch_epoch_export
 from sam2_segmentation_trainer.encoding_record import (
     RECORD_NAME,
@@ -70,7 +88,13 @@ from sam2_segmentation_trainer.data.manifest import (
     volume_counts,
 )
 from sam2_segmentation_trainer.data.fulltile import cap_full_tiles, is_full_tile
-from sam2_segmentation_trainer.goal_metrics import EARLY_STOPPING_MIN_DELTA, MERGE_MIN_PX, SelectionKey, improves
+from sam2_segmentation_trainer.goal_metrics import (
+    MERGE_MIN_PX,
+    SELECTION_FLOORS,
+    SelectionKey,
+    describe_selection,
+    improves,
+)
 from sam2_segmentation_trainer.interactive import iterative_predict_masks
 from sam2_segmentation_trainer.validation import (
     DEFAULT_VAL_PROMPTS,
@@ -470,6 +494,12 @@ def run_throughput_benchmark(
             "(keep gradient_accumulation_steps so effective batch stays similar)."
         ) from exc
 
+    # Read now: the validation timing below would otherwise be counted in the "timed train steps" peak.
+    train_peak = (
+        (torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved())
+        if device.type == "cuda" and torch.cuda.is_available()
+        else None
+    )
     val_times: list[float] = []
     need_val = warmup_val + val_steps
     # With a validation suite the real pass is timed below (its dataset carries one prompt variant per family, which
@@ -480,6 +510,7 @@ def run_throughput_benchmark(
             warmup_val = min(warmup_val, max(0, n_val_take // 5))
             val_steps = max(1, n_val_take - warmup_val)
             n_val_take = warmup_val + val_steps
+        limit_main_process_cv2()
         val_dl = DataLoader(
             Subset(val_ds, list(range(n_val_take))),
             batch_size=1,
@@ -487,6 +518,7 @@ def run_throughput_benchmark(
             num_workers=num_workers,
             pin_memory=True,
             collate_fn=collate_em,
+            worker_init_fn=limit_worker_threads,
         )
 
         def val_one(batch) -> None:
@@ -581,13 +613,18 @@ def run_throughput_benchmark(
             if share > 0.2
             else "    -> GPU-bound: the DataLoader keeps up"
         )
-    if device.type == "cuda" and torch.cuda.is_available():
+    if train_peak is not None:
         print(
             f"  peak CUDA memory in the timed train steps: "
-            f"{torch.cuda.max_memory_allocated() / 1024**3:.2f}G allocated, "
-            f"{torch.cuda.max_memory_reserved() / 1024**3:.2f}G reserved, "
+            f"{train_peak[0] / 1024**3:.2f}G allocated, "
+            f"{train_peak[1] / 1024**3:.2f}G reserved, "
             f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}G total"
         )
+        if time_validation:
+            print(
+                f"  peak CUDA memory including validation: {torch.cuda.max_memory_allocated() / 1024**3:.2f}G "
+                f"allocated, {torch.cuda.max_memory_reserved() / 1024**3:.2f}G reserved"
+            )
     if val_times:
         print(f"  val   {_summarize_times(val_times)}  (one family, point prompt, no goal metrics)")
     if suite_times:
@@ -701,11 +738,17 @@ def build_validation_suite(
     tile_context,
     *,
     approved,
+    gold: GoldSet | None = None,
     prompt_cfg: PromptConfig | None,
     missing_tiles=None,
     num_workers: int | None = None,
+    circle_seed_taper: float | None = None,
+    circle_oversize_range: tuple[float, float] = DEFAULT_OVERSIZE_RANGE,
 ) -> ValidationSuite:
-    """The validation suite a run uses, from the config (``eval:`` and ``val:`` sections)."""
+    """The validation suite a run uses, from the config (``eval:`` and ``val:`` sections).
+
+    ``circle_seed_taper`` and ``circle_oversize_range`` are evaluation-only options that ``sam2-em-eval --goal``
+    passes (docs/circle_seed_trust_eval.md); a training run leaves them at their defaults."""
     val_modes = [str(m) for m in OmegaConf.select(cfg, "eval.val_prompts", default=list(DEFAULT_VAL_PROMPTS))]
     return ValidationSuite(
         val_ex,
@@ -726,23 +769,35 @@ def build_validation_suite(
         merge_min_px=int(OmegaConf.select(cfg, "val.merge_min_px", default=MERGE_MIN_PX)),
         core_recall_target=float(OmegaConf.select(cfg, "val.core_recall_target", default=0.975)),
         approved=approved,
+        gold=gold,
         epoch_subset=float(OmegaConf.select(cfg, "val.epoch_subset", default=0.25)),
         batch_size=int(OmegaConf.select(cfg, "val.batch_size", default=4)),
         metric_threads=int(OmegaConf.select(cfg, "val.metric_threads", default=4)),
+        circle_seed_taper=circle_seed_taper,
+        circle_oversize_range=circle_oversize_range,
     )
 
 
 def _circle_guard(cfg: DictConfig, prompt_cfg: PromptConfig) -> dict:
-    """Keyword arguments for :func:`build_tile_context`: the circle scale, and a failure when circles are absent."""
+    """Keyword arguments for :func:`build_tile_context`: the circle scale, a failure when circles are absent, and
+    where the adjacent-section outlines are placed (``prompt.adjacent_poly.placement``) with the registration and
+    correction data that projects them (``data.registration_root``, ``data.corrections_root``,
+    ``data.adjacent_residual``; null roots fall back to the centroid placement with a warning)."""
+    registration = OmegaConf.select(cfg, "data.registration_root", default=None)
+    corrections = OmegaConf.select(cfg, "data.corrections_root", default=None)
     return {
-        "require_circles": prompt_cfg.prob_circle_seed > 0.0
+        "require_circles": prompt_cfg.circle_share() > 0.0
         and bool(OmegaConf.select(cfg, "data.require_circle_file", default=True)),
         "circle_scale": _circle_scale(cfg),
+        "adjacent_placement": prompt_cfg.adjacent_poly.placement,
+        "registration_root": None if registration in (None, "") else str(registration),
+        "corrections_root": None if corrections in (None, "") else str(corrections),
+        "adjacent_residual": str(OmegaConf.select(cfg, "data.adjacent_residual", default="auto")),
     }
 
 
 def prompt_mix_fractions(counts: Counter[str]) -> dict[str, float]:
-    """Share of each prompt type among the samples of one epoch, largest first."""
+    """Share of each prompt type among the prompt variants of one epoch, largest first."""
     total = sum(counts.values())
     if total == 0:
         return {}
@@ -751,15 +806,60 @@ def prompt_mix_fractions(counts: Counter[str]) -> dict[str, float]:
 
 def _log_prompt_mix(writer: SummaryWriter, epoch: int, counts: Counter[str]) -> None:
     """Print and log the realized prompt mix (share and count per family), so a missing circle file or a dropped
-    type shows at once. Variant 0 of every sample is fixed, so this differs from the ``prob_*`` shares."""
+    type shows at once. Every variant is drawn from the mix without replacement (a family appears at most once per
+    sample), so a family's share of the variants differs from its ``prob_*``: rare families are over-represented. The
+    count is of the family built (after a circle or adjacent-seed fallback); see ``train/prompt_fallback/*``."""
     fractions = prompt_mix_fractions(counts)
     if not fractions:
         return
     summary = ", ".join(f"{ptype} {share:.1%}" for ptype, share in fractions.items())
-    print(f"epoch {epoch} prompt mix ({sum(counts.values())} samples): {summary}")
+    print(f"epoch {epoch} prompt mix ({sum(counts.values())} variants): {summary}")
     for ptype, share in fractions.items():
         writer.add_scalar(f"train/prompt_mix/{ptype}", share, epoch)
         writer.add_scalar(f"train/prompt_count/{ptype}", counts[ptype], epoch)
+
+
+PROMPT_DROPPED = "dropped"
+"""The ``built`` name of a fallback whose variant was dropped (a rejected adjacent outline with no new family left)."""
+
+
+def _log_prompt_fallbacks(writer: SummaryWriter, epoch: int, counts: Counter[tuple[str, str]]) -> None:
+    """Print and log the variants built as another family than the mix drew (requested -> built: a circle_annotator or
+    circle_pull_through disc that could not be drawn becomes circle_seed, an adjacent polygon seed that could not be
+    fitted becomes circle_seed, a rejected projected outline is drawn again or ``dropped``). ``train/prompt_mix/*``
+    counts the family built; ``train/prompt_fallback/{asked}`` is the total asked for as ``asked`` and built as
+    something else, and ``train/prompt_fallback/{asked}/{built}`` splits it by what was built."""
+    if not counts:
+        return
+    summary = ", ".join(f"{asked} -> {built} {n}" for (asked, built), n in counts.most_common())
+    print(f"epoch {epoch} prompt fallbacks: {summary}")
+    totals: Counter[str] = Counter()
+    for (asked, built), n in counts.items():
+        totals[asked] += n
+        writer.add_scalar(f"train/prompt_fallback/{asked}/{built}", n, epoch)
+    for asked, n in totals.items():
+        writer.add_scalar(f"train/prompt_fallback/{asked}", n, epoch)
+
+
+def _log_adjacent_rule(writer: SummaryWriter, epoch: int, rule: Counter[str], variants: int, built: int) -> None:
+    """Print and log the overlap rule of projected adjacent outlines (``prompt.adjacent_poly``): of the variants
+    that drew ``adjacent_poly_seed`` with a projected outline, how many passed (``train/adjacent_poly/pass_rate``)
+    and how many were drawn again as another family (``train/adjacent_poly/rejected``, also counted in
+    ``train/prompt_fallback/adjacent_poly_seed``), and the realised share of ``adjacent_poly_seed`` among all
+    variants (``train/adjacent_poly/share``)."""
+    tested = rule["pass"] + rule["fail"]
+    share = built / variants if variants else 0.0
+    if tested:
+        rate = rule["pass"] / tested
+        print(
+            f"epoch {epoch} adjacent_poly_seed: {built} of {variants} variants ({share:.1%}); projected outlines "
+            f"{rule['pass']} of {tested} passed the overlap rule ({rate:.1%}), {rule['fail']} drawn again"
+        )
+        writer.add_scalar("train/adjacent_poly/pass_rate", rate, epoch)
+        writer.add_scalar("train/adjacent_poly/passed", rule["pass"], epoch)
+        writer.add_scalar("train/adjacent_poly/rejected", rule["fail"], epoch)
+    if variants:
+        writer.add_scalar("train/adjacent_poly/share", share, epoch)
 
 
 def _iterative_rounds(cfg: DictConfig, seed: int, epoch: int, step: int) -> int:
@@ -834,6 +934,60 @@ def load_approved_set(cfg: DictConfig, data_dir: Path | None = None) -> Approved
     return load_approved(raw, [str(v) for v in cfg.data.volumes], data_dir if data_dir is not None else data_root())
 
 
+def load_gold_set(cfg: DictConfig) -> GoldSet | None:
+    """The gold set named by ``data.gold_set`` (a name under ``{valsets}/gold`` or a path), or None.
+
+    A missing file is an error: a run asked to report a gold row must not quietly run without one. A draft (not yet
+    ``final``) is used with a warning, since its contents can still change between runs.
+    """
+    ref = OmegaConf.select(cfg, "data.gold_set", default=None)
+    if ref in (None, ""):
+        return None
+    path = resolve_gold_path(str(ref))
+    gold = load_gold(path)
+    print(f"gold set {gold.name!r} ({path}): {len(gold)} locations, status {gold.status}; per volume {gold.by_volume()}")
+    if gold.status != "final":
+        print(
+            f"WARNING: gold set {gold.name!r} is a {gold.status} ({gold.pending} candidates not reviewed); its rows "
+            "can change between runs until it is finalized"
+        )
+    if not gold:
+        print(f"WARNING: gold set {gold.name!r} has no accepted locations; the gold row will be empty")
+    return gold
+
+
+def frozen_split_path(cfg: DictConfig) -> Path | None:
+    """The frozen split named by ``data.frozen_split`` (a name under ``{valsets}/splits`` or a path), or None."""
+    ref = OmegaConf.select(cfg, "data.frozen_split", default=None)
+    if ref in (None, ""):
+        return None
+    return resolve_split_path(str(ref))
+
+
+def start_from_frozen_split(path: Path, examples, cfg: DictConfig, volumes: list[str]):
+    """A new run's split from a frozen split: the frozen membership, plus locations that appeared since, placed by
+    their section (``zslab``) or with the run seed (``location``). Volumes without validation sections warn."""
+    split = load_frozen_split(path)
+    info = frozen_info(path)
+    grown = include_new_keys(
+        split, examples, train_fraction=float(cfg.data.train_split), seed=int(cfg.training.seed)
+    )
+    added = len(grown.train_keys) + len(grown.val_keys) - len(split.train_keys) - len(split.val_keys)
+    print(
+        f"using frozen split {info.get('name') or path.stem} ({path}, mode={grown.mode}, from "
+        f"{info.get('source', 'unknown')}); {added} location(s) new since it was frozen were placed by "
+        f"{'section' if grown.val_z else 'seed'}"
+    )
+    if grown.val_z:
+        uncovered = [v for v in volumes if not grown.val_z.get(v)]
+        if uncovered:
+            print(
+                f"WARNING: frozen split {path.stem} has no validation sections for {uncovered}; "
+                "those volumes are trained on but never validated"
+            )
+    return grown
+
+
 def _loss_inputs(batch: dict, device) -> dict:
     """Device tensors shared by every loss call: per-variant targets and weights, and the variant index."""
     index = batch["variant_index"].to(device, non_blocking=True)
@@ -866,8 +1020,11 @@ def _make_loader(
     # DataLoader rejects these kwargs when the loading process is the main process.
     worker_kwargs: dict = {}
     if num_workers > 0:
+        limit_main_process_cv2()
         worker_kwargs["prefetch_factor"] = int(prefetch_factor)
         worker_kwargs["persistent_workers"] = bool(persistent_workers)
+        # A stalled worker must raise (the run resumes from last.pt) instead of waiting forever with no error.
+        worker_kwargs["timeout"] = LOADER_TIMEOUT_SECONDS
     return DataLoader(
         subset,
         batch_size=batch_size,
@@ -876,8 +1033,15 @@ def _make_loader(
         pin_memory=True,
         drop_last=drop_last,
         collate_fn=collate_em,
+        # One thread per worker for OpenBLAS, OpenCV and torch (thread pools in 4 workers halved the throughput).
+        worker_init_fn=limit_worker_threads,
         **worker_kwargs,
     )
+
+
+LOADER_TIMEOUT_SECONDS = 1800
+"""Seconds the training loader waits for one batch before raising. A cold NAS read takes seconds, so half an hour
+means a worker is stuck, not slow."""
 
 
 def due_for_val_images(global_step: int, last_step: int | None, every_n_steps: int) -> bool:
@@ -1088,6 +1252,62 @@ def _resolve_run_name(cfg: DictConfig, ckpt_root: Path, out_dir: Path) -> str:
     return next_run_name(prefix, roots)
 
 
+PROMPT_LAYOUT_SECTIONS = ("circle_seed_jitter", "circle_pull_through")
+"""``prompt.*`` sections of the circle peers whose presence is part of a run's prompt layout."""
+
+
+def prompt_layout(cfg) -> dict:
+    """The prompt layout a run trains with: ``prompt.variants_per_sample``, every ``prompt.prob_*`` key with its value
+    and which circle-peer sections (:data:`PROMPT_LAYOUT_SECTIONS`) are present. Read from the config as written."""
+    prompt = OmegaConf.select(cfg, "prompt", default=None)
+    prompt = {} if prompt is None else OmegaConf.to_container(prompt, resolve=True)
+    return {
+        "variants_per_sample": prompt.get("variants_per_sample"),
+        "prob": {key: float(value) for key, value in sorted(prompt.items()) if key.startswith("prob_")},
+        "sections": sorted(key for key in PROMPT_LAYOUT_SECTIONS if key in prompt),
+    }
+
+
+def prompt_layout_differences(saved, current) -> list[str]:
+    """How the prompt layout of ``saved`` (a run's config.yaml) differs from ``current``; empty when it does not."""
+    old, new = prompt_layout(saved), prompt_layout(current)
+    out: list[str] = []
+    if old["variants_per_sample"] != new["variants_per_sample"]:
+        out.append(f"prompt.variants_per_sample {old['variants_per_sample']} -> {new['variants_per_sample']}")
+    for key in sorted(set(old["prob"]) - set(new["prob"])):
+        out.append(f"prompt.{key} only in the saved run")
+    for key in sorted(set(new["prob"]) - set(old["prob"])):
+        out.append(f"prompt.{key} not in the saved run")
+    for key in sorted(set(old["prob"]) & set(new["prob"])):
+        if not math.isclose(old["prob"][key], new["prob"][key], abs_tol=1e-9):
+            out.append(f"prompt.{key} {old['prob'][key]:g} -> {new['prob'][key]:g}")
+    for key in PROMPT_LAYOUT_SECTIONS:
+        if (key in old["sections"]) != (key in new["sections"]):
+            out.append(f"prompt.{key} {'only in the saved run' if key in old['sections'] else 'not in the saved run'}")
+    return out
+
+
+def check_resume_layout(run_dir: Path, cfg: DictConfig) -> None:
+    """Refuse to resume ``run_dir`` when its saved ``config.yaml`` trains another prompt layout.
+
+    Resuming would carry on the old run's weights, optimizer and LR schedule with a different prompt mix, overwrite its
+    config.yaml and export the result under its model version. Called only when ``training.resume`` is on and the run
+    has a ``last.pt`` (or its ``.bak``); a run without a saved config is not checked.
+    """
+    saved_path = run_dir / "config.yaml"
+    has_last = (run_dir / "last.pt").is_file() or (run_dir / "last.pt.bak").is_file()
+    if not has_last or not saved_path.is_file():
+        return
+    differences = prompt_layout_differences(OmegaConf.load(saved_path), cfg)
+    if differences:
+        raise RuntimeError(
+            f"cannot resume {run_dir}: its config.yaml trains a different prompt layout "
+            f"({'; '.join(differences)}). Set training.run_name to a new run (for example the next sam2_em_vN) "
+            "or pass -refresh to start from pretrained weights (with run_name auto that is the next sam2_em_vN; with "
+            "a pinned run_name it restarts that run directory)."
+        )
+
+
 def _z_runs(zs) -> str:
     """Compact text for a set of section numbers: ``"10-14, 40-43"``."""
     ordered = sorted(int(z) for z in zs)
@@ -1119,9 +1339,16 @@ def _move_ignored_masks(volumes: list[str], data_dir: Path) -> None:
 
 
 def _record_training_data(
-    run_dir: Path, data_dir: Path, volumes: list[str], train_ex, val_ex, cfg: DictConfig
+    run_dir: Path,
+    data_dir: Path,
+    volumes: list[str],
+    train_ex,
+    val_ex,
+    cfg: DictConfig,
+    tile_context: TileContext | None = None,
 ) -> None:
-    """Write ``training_data.json`` (which data set and files this run trains on); a failure only warns."""
+    """Write ``training_data.json`` (which data set and files this run trains on, and which registration and
+    correction data placed its adjacent-section outlines); a failure only warns."""
     try:
         write_data_record(
             run_dir,
@@ -1132,6 +1359,7 @@ def _record_training_data(
                 val_counts=_counts_by_volume(val_ex),
                 split_seed=int(cfg.training.seed),
                 train_fraction=float(cfg.data.train_split),
+                adjacent_projection=None if tile_context is None else tile_context.projection,
             ),
         )
     except Exception as exc:
@@ -1182,6 +1410,9 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     if migrated:
         print(f"migrated from {legacy} -> {run_dir}: {', '.join(migrated)}")
     print(f"run directory (checkpoints): {run_dir}")
+    if bool(cfg.training.get("resume", True)):
+        # Before config.yaml is overwritten: a run with another prompt layout is never continued.
+        check_resume_layout(run_dir, cfg)
     OmegaConf.save(cfg, run_dir / "config.yaml")
     write_record(run_dir / RECORD_NAME, metadata_from_settings(settings_from_cfg(cfg)))
     warn_encoding_differences(cfg)
@@ -1226,14 +1457,33 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             f"mixed prompts on: {n_with_negatives}/{len(examples)} examples have other "
             "annotations in their tile"
         )
+        # One loud line for an operator reading the log remotely: without registration data adjacent seeds are rare.
+        banner = adjacent_placement_summary(tile_context, volumes)
+        rule = "=" * 100
+        print(rule, banner, rule, sep="\n", flush=True)
+        if "centroid fallback for [" in banner and "centroid fallback for []" not in banner:
+            progress.warn(banner)  # also on the dashboard as a warning
+        else:
+            progress.transcript(banner)
 
     even = bool(cfg.data.get("even_per_volume", False))
     run_split = run_dir / "split.json"
     legacy_split = out_dir / "splits" / f"{cfg.data.split_name}.json"
+    frozen_path = frozen_split_path(cfg)
+    frozen_used: Path | None = None
     if run_split.is_file():
         split = load_split(run_split)
         split_path = run_split
         even_applied = False
+        if frozen_path is not None:
+            print(f"data.frozen_split is set, but this run keeps its own {run_split} (it already has one)")
+    elif frozen_path is not None:
+        # A new run on a frozen split validates on the same sections as every other run that uses it.
+        split = start_from_frozen_split(frozen_path, examples, cfg, volumes)
+        split_path = run_split
+        save_split(split, run_split)
+        even_applied = False
+        frozen_used = frozen_path
     elif run_existed and legacy_split.is_file():
         split = load_split(legacy_split)
         split_path = run_split
@@ -1246,7 +1496,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         save_split(split, run_split)
         even_applied = even
         print(f"wrote split {run_split} mode={split.mode} even_per_volume={even}")
-    train_ex, val_ex = split.partition(examples)
+    gold = load_gold_set(cfg)
+    train_ex, val_ex = partition_with_gold(gold, *split.partition(examples))
     train_ex = _cap_full_tiles(train_ex, cfg)
     if not train_ex or not val_ex:
         raise RuntimeError(
@@ -1256,7 +1507,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     val_counts = _counts_by_volume(val_ex)
     print(f"train per volume: {train_counts}")
     print(f"val per volume: {val_counts}")
-    _record_training_data(run_dir, data_dir, volumes, train_ex, val_ex, cfg)
+    _record_training_data(run_dir, data_dir, volumes, train_ex, val_ex, cfg, tile_context)
     _write_run_inputs(
         run_dir / "inputs.json",
         RunInputs(
@@ -1275,6 +1526,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             num_epochs=int(cfg.training.num_epochs),
             model_config=str(cfg.model.config),
             pretrained=checkpoint,
+            frozen_split=None if frozen_used is None else str(frozen_used),
+            gold_set=None if gold is None else str(resolve_gold_path(str(cfg.data.gold_set))),
         ),
     )
 
@@ -1309,12 +1562,14 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         leak_core_px=_leak_settings(cfg)[1],
         approved=approved,
         approved_weight=float(OmegaConf.select(cfg, "data.approved_weight", default=1.0)),
+        elastic_warp=bool(OmegaConf.select(cfg, "data.elastic_warp", default=False)),
     )
     val_suite = build_validation_suite(
         cfg,
         val_ex,
         tile_context,
         approved=approved,
+        gold=gold,
         prompt_cfg=prompt_cfg if mixed_prompts else None,
         missing_tiles=missing_tiles,
         num_workers=num_workers,
@@ -1399,7 +1654,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         print(f"Run directory: {run_dir} (benchmark only; no last.pt written)")
         return run_dir
 
-    writer = SummaryWriter(log_dir=str(run_dir / "tb"))
+    # The run folder is on the NAS, where each event takes milliseconds to write. The writer's own thread does the
+    # writing; with the default queue of 10 the training loop waited on it at every loss flush (about 500 events),
+    # 11% of the main thread's time in a py-spy sample. 5000 lets a flush queue without waiting.
+    writer = SummaryWriter(log_dir=str(run_dir / "tb"), max_queue=5000)
     profiler = TbStepProfiler(
         cfg,
         run_dir / "tb",
@@ -1409,12 +1667,18 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     best_val_iou = -1.0
     best_selection = None  # SelectionKey values of the best epoch so far
     epochs_without_improve = 0
-    global_step = 0
+    global_step = 0  # batches trained; paces logging, validation images and the profiler
+    samples_seen = 0  # the x axis of the training charts
     opt_step = 0
     start_epoch = 0
     start_step = 0
     patience = int(cfg.training.early_stopping_patience)
-    min_delta = float(cfg.training.get("early_stopping_min_delta", EARLY_STOPPING_MIN_DELTA))
+    floors = early_stopping_floors(cfg)
+    print(
+        f"early stopping: patience {patience}; noise floors "
+        f"{', '.join(f'{name} {value:g}' for name, value in floors.items())}; "
+        f"validation subset {OmegaConf.select(cfg, 'val.epoch_subset', default=1.0)}"
+    )
     full_every = max(1, int(OmegaConf.select(cfg, "val.full_every_n_epochs", default=3)))
     save_every = max(1, int(cfg.training.get("save_every_n_steps", 200)))
     resume_enabled = bool(cfg.training.get("resume", True))
@@ -1447,11 +1711,24 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         scaler.load_state_dict(payload["scaler"])
         start_epoch = int(payload["epoch"])
         start_step = int(payload["step_in_epoch"])
+        # step_in_epoch counts batches. After a batch-size change, resume at the same sample instead: rounding down
+        # repeats at most batch_size - 1 samples. A checkpoint without "batch_size" predates this and is taken as
+        # counted in the current batch size.
+        saved_batch = int(payload.get("batch_size") or batch_size)
+        if saved_batch != batch_size and start_step:
+            samples_done = start_step * saved_batch
+            start_step = samples_done // batch_size
+            print(
+                f"batch size {saved_batch} -> {batch_size}: {samples_done} samples of epoch {payload['epoch']} done, "
+                f"resuming at batch {start_step} ({samples_done - start_step * batch_size} sample(s) repeated)"
+            )
         global_step = int(payload["global_step"])
+        # A checkpoint from before samples_seen was saved counted every batch in one size.
+        samples_seen = int(payload.get("samples_seen") or global_step * saved_batch)
         opt_step = int(payload["opt_step"])
         best_val_iou = float(payload["best_val_iou"])
         saved_selection = payload.get("best_selection")
-        best_selection = None if saved_selection is None else SelectionKey.from_list(saved_selection)
+        best_selection = None if saved_selection is None else SelectionKey.from_dict(saved_selection)
         epochs_without_improve = int(payload["epochs_without_improve"])
         restore_rng(payload["rng"])
         print(
@@ -1464,26 +1741,49 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
     signal.signal(signal.SIGTERM, stop.request)
 
     def save_now(epoch: int, step_in_epoch: int) -> None:
-        _save_last(
-            run_dir,
-            _snapshot(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                step_in_epoch=step_in_epoch,
-                global_step=global_step,
-                opt_step=opt_step,
-                best_val_iou=best_val_iou,
-                epochs_without_improve=epochs_without_improve,
-                freeze_mode=freeze_mode,
-                unfreeze_mask_cnn=unfreeze_mask_cnn,
-                best_selection=None if best_selection is None else best_selection.to_list(),
-            ),
+        payload = _snapshot(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            step_in_epoch=step_in_epoch,
+            global_step=global_step,
+            opt_step=opt_step,
+            best_val_iou=best_val_iou,
+            epochs_without_improve=epochs_without_improve,
+            freeze_mode=freeze_mode,
+            unfreeze_mask_cnn=unfreeze_mask_cnn,
+            best_selection=None if best_selection is None else best_selection.to_dict(),
         )
+        # step_in_epoch counts batches, so a resume needs the batch size it was counted in (see the resume check).
+        payload["batch_size"] = batch_size
+        payload["samples_seen"] = samples_seen
+        _save_last(run_dir, payload)
 
     export_each_epoch = bool(cfg.training.get("export_serve_each_epoch", True))
+    # Per-card scores for the gallery (annotation_crops.card_scores): training-pass scores as each card is trained,
+    # and each epoch's validation records as its validation cards' scores.
+    card_scores_on = bool(OmegaConf.select(cfg, "training.card_scores", default=True))
+    train_scores = (
+        TrainPassScores(
+            data_dir, run_name=run_name, threshold=float(cfg.data.mask_threshold), band=_leak_settings(cfg)[1]
+        )
+        if card_scores_on
+        else None
+    )
+
+    def record_epoch_card_scores(records, epoch_done: int) -> None:
+        if not card_scores_on or not records:
+            return
+        try:
+            written = record_validation_card_scores(
+                data_dir, records, family=val_suite.primary, model=run_model_label(run_name, epoch_done),
+                epoch=epoch_done,
+            )
+            progress.transcript(f"wrote {written} validation card scores ({val_suite.primary})")
+        except Exception as exc:  # the gallery's scores must never stop training
+            progress.transcript(f"validation card scores not written: {exc}")
 
     def export_epoch(epoch_done: int) -> None:
         """Start the detached serve export for the weights just saved; a failure never stops training."""
@@ -1529,7 +1829,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             if grown != split:
                 split = grown
                 save_split(split, run_split)
-            train_ex, val_ex = split.partition(examples)
+            train_ex, val_ex = partition_with_gold(gold, *split.partition(examples))
             train_ex = _cap_full_tiles(train_ex, cfg)
             if not train_ex:
                 raise RuntimeError(
@@ -1546,7 +1846,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 f"epoch {epoch}: inventory rebuilt, "
                 f"train={len(train_ex)} val={len(val_ex)}"
             )
-            _record_training_data(run_dir, data_dir, volumes, train_ex, val_ex, cfg)
+            _record_training_data(run_dir, data_dir, volumes, train_ex, val_ex, cfg, tile_context)
         step0 = start_step if epoch == start_epoch else 0
         epoch_counter.set(epoch)
         indices = remaining_epoch_indices(
@@ -1587,7 +1887,13 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         t_prev = time.perf_counter()
         loss_window = _LossWindow()
         epoch_prompt_mix: Counter[str] = Counter()
+        epoch_fallbacks: Counter[tuple[str, str]] = Counter()
+        epoch_adjacent_rule: Counter[str] = Counter()
         log_every = max(1, int(cfg.training.log_every_n_steps))
+
+        # Training speed for the dashboard, between loss flushes: wall clock and samples only, no GPU sync. Reset each
+        # epoch so the validation pass is not counted in the first interval.
+        speed_clock = {"t": None, "samples": 0}
 
         def flush_losses() -> None:
             rows = loss_window.drain()
@@ -1627,8 +1933,15 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     "train/lr", optimizer.param_groups[0]["lr"], row["global_step"]
                 )
             record_location_scores(data_dir, rows)
+            if train_scores is not None:
+                train_scores.flush()
             last = rows[-1]
             pbar.set_postfix(loss=f"{last['loss']:.4f}")
+            now = time.perf_counter()
+            samples_per_s = None
+            if speed_clock["t"] is not None and now > speed_clock["t"]:
+                samples_per_s = (samples_seen - speed_clock["samples"]) / (now - speed_clock["t"])
+            speed_clock["t"], speed_clock["samples"] = now, samples_seen
             progress.report_step(
                 step=last["step"],
                 batches_per_epoch=batches_per_epoch,
@@ -1636,6 +1949,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 log_every=1,
                 loss=last["loss"],
                 lr=float(optimizer.param_groups[0]["lr"]),
+                samples_per_s=samples_per_s,
             )
 
         for rel_i, batch in enumerate(pbar):
@@ -1725,15 +2039,27 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 stats,
                 epoch=epoch,
                 step=step,
-                global_step=global_step,
+                # The training charts' x axis: samples seen, so it keeps its scale when the batch size changes.
+                global_step=samples_seen,
                 duration_s=t_done - t_prev,
                 meta=batch.get("meta") or [],
                 prompt_types=batch.get("prompt_type") or [],
             )
+            if train_scores is not None:
+                train_scores.submit(pred, batch, epoch)
+            epoch_fallbacks.update(
+                (asked, built)
+                for asked, built in zip(batch.get("requested_prompt_type") or [], batch.get("prompt_type") or [])
+                if asked != built
+            )
+            epoch_fallbacks.update((asked, PROMPT_DROPPED) for asked in batch.get("dropped_prompt_type") or [])
+            # Per sample, so a failed outline whose variant was dropped still counts.
+            epoch_adjacent_rule.update(rule for rule in batch.get("adjacent_rule") or [] if rule is not None)
             t_prev = t_done
             if (global_step + 1) % log_every == 0:
                 flush_losses()
             global_step += 1
+            samples_seen += int(images.shape[0])
             profiler.step()
             if stop.stop:
                 save_now(epoch, step + 1)
@@ -1746,8 +2072,15 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
 
         flush_losses()
         _log_prompt_mix(writer, epoch, epoch_prompt_mix)
+        _log_prompt_fallbacks(writer, epoch, epoch_fallbacks)
+        _log_adjacent_rule(
+            writer, epoch, epoch_adjacent_rule, sum(epoch_prompt_mix.values()),
+            epoch_prompt_mix.get("adjacent_poly_seed", 0),
+        )
 
         if interrupted:
+            if train_scores is not None:
+                train_scores.close()
             profiler.close()
             writer.close()
             print(f"Run directory: {run_dir}")
@@ -1771,13 +2104,15 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     float(cfg.data.mask_threshold),
                     full=full_due,
                     overlays_per_volume=capture_overlays,
+                    keep_records=card_scores_on,
                 )
             finally:
                 progress.stage("validate", "end")
+            record_epoch_card_scores(suite_result.records, epoch)
             # The subset numbers (also taken out of a full pass) select the checkpoint and stop the run.
             val_results, overlays = suite_result.subset, suite_result.overlays
             val_iou = val_results[val_suite.primary].iou
-            val_key = epoch_selection(val_results, val_suite.primary, core_recall_target)
+            val_key = epoch_selection(val_results, val_suite.primary)
             val_summary = log_results(
                 writer,
                 epoch,
@@ -1804,7 +2139,7 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     writer.add_image(
                         f"val_overlay/{volume}/{slot}",
                         panel,
-                        global_step,
+                        samples_seen,
                         dataformats="HWC",
                     )
                 last_val_image_step = global_step
@@ -1814,7 +2149,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     f"({', '.join(sorted(slots))})"
                 )
             progress.transcript(val_summary)
-            if improves(val_key, best_selection, min_delta):
+            progress.transcript(f"  selection: {describe_selection(val_key, best_selection, floors)}")
+            if improves(val_key, best_selection, floors):
                 best_val_iou = val_iou
                 best_selection = val_key
                 epochs_without_improve = 0
@@ -1825,8 +2161,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                 )
                 goal = val_results[val_suite.primary].goal
                 progress.transcript(
-                    f"  saved best_model.pt (core recall {goal.core_recall:.4f}, merge rate {goal.merge_rate:.3f}, "
-                    f"spill {goal.spill:.3f}; {'target reached' if val_key.gated else 'below the target'})"
+                    f"  saved best_model.pt (core recall {goal.core_recall:.4f}, IoU {val_iou:.4f}, "
+                    f"merge rate {goal.merge_rate:.3f}, spill {goal.spill:.3f}, frag {goal.frag:.3f})"
                 )
             else:
                 epochs_without_improve += 1
@@ -1834,8 +2170,10 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
                     if suite_result.full is None:
                         # The last validation of a run is always the full split.
                         final = val_suite.run(
-                            model, device, image_size, float(cfg.data.mask_threshold), full=True
+                            model, device, image_size, float(cfg.data.mask_threshold), full=True,
+                            keep_records=card_scores_on,
                         )
+                        record_epoch_card_scores(final.records, epoch)
                         progress.transcript(
                             log_results(
                                 writer, epoch, final.full, val_suite.primary, core_recall_target,
@@ -1861,16 +2199,31 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
             progress.transcript("stop requested after epoch save")
             break
 
+    if train_scores is not None:
+        train_scores.close()
     profiler.close()
     writer.close()
     if progress.status == "stopped":
         print(f"Run directory: {run_dir}")
     else:
         progress.transcript(
-            f"Training complete. Best epoch by the core-recall rule: "
-            f"{'none' if best_selection is None else best_selection.values}. Run directory: {run_dir}"
+            f"Training complete. Best epoch's selection metrics: "
+            f"{'none' if best_selection is None else best_selection.metrics}. Run directory: {run_dir}"
         )
     return run_dir
+
+
+def early_stopping_floors(cfg: DictConfig) -> dict[str, float]:
+    """The noise floor of each selection metric: ``training.early_stopping_floors`` over the defaults in
+    ``goal_metrics.SELECTION_FLOORS``. An unknown metric name is an error, so a typo cannot silently do nothing."""
+    given = OmegaConf.select(cfg, "training.early_stopping_floors", default=None) or {}
+    unknown = sorted(set(given) - set(SELECTION_FLOORS))
+    if unknown:
+        raise ValueError(
+            f"training.early_stopping_floors: unknown metric(s) {', '.join(unknown)}; "
+            f"known: {', '.join(SELECTION_FLOORS)}"
+        )
+    return {name: float(given.get(name, default)) for name, default in SELECTION_FLOORS.items()}
 
 
 def load_train_cfg(overrides: list[str] | None = None) -> DictConfig:

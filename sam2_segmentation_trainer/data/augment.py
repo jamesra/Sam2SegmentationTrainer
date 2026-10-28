@@ -6,23 +6,28 @@ import albumentations as A
 import numpy as np
 
 
-def build_train_transform() -> A.Compose:
-    """Geometry and intensity only. Tiles are already the model size, so this does not resample."""
+def build_train_transform(elastic_warp: bool = False) -> A.Compose:
+    """Geometry and intensity only. Tiles are already the model size, so this does not resample.
+
+    ``elastic_warp`` (``data.elastic_warp``, off by default) adds an elastic warp to a fifth of the samples. At
+    alpha 30, sigma 5 it moves no pixel more than about 2 px, so it only roughens edges; the training set is large
+    enough not to need it.
+    """
     # GaussNoise API is std_range as a fraction of 255 (replaces var_limit).
-    return A.Compose(
-        [
-            A.RandomRotate90(p=0.5),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.GaussNoise(std_range=(0.04, 0.20), p=0.4),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.15, contrast_limit=0.2, p=0.5
-            ),
-            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
-            A.Blur(blur_limit=(3, 7), p=0.3),
-            A.ElasticTransform(alpha=30, sigma=5, p=0.2),
-        ]
-    )
+    transforms = [
+        A.RandomRotate90(p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.GaussNoise(std_range=(0.04, 0.20), p=0.4),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.15, contrast_limit=0.2, p=0.5
+        ),
+        A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+        A.Blur(blur_limit=(3, 7), p=0.3),
+    ]
+    if elastic_warp:
+        transforms.append(A.ElasticTransform(alpha=30, sigma=5, p=0.2))
+    return A.Compose(transforms)
 
 
 def build_val_transform() -> A.Compose:

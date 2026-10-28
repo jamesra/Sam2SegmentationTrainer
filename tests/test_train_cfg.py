@@ -13,10 +13,17 @@ class TrainCfgTests(unittest.TestCase):
         self.assertEqual(list(cfg.data.volumes), ["RC1", "RC2", "RPC1", "RPC2"])
         self.assertEqual(cfg.model.config, "configs/sam2.1/sam2.1_hiera_l.yaml")
         self.assertFalse(bool(cfg.model.activation_checkpointing))
+        # Batch 2 x 8 accumulation (effective 16), checkpointing off: fastest beside the segmentation server (Oct 27).
         self.assertEqual(int(cfg.training.batch_size), 2)
         self.assertEqual(int(cfg.training.gradient_accumulation_steps), 8)
-        self.assertEqual(float(cfg.training.early_stopping_min_delta), 0.002)
-        self.assertEqual(float(cfg.val.epoch_subset), 0.25)
+        from sam2_segmentation_trainer.goal_metrics import SELECTION_FLOORS
+        from sam2_segmentation_trainer.train import early_stopping_floors
+
+        self.assertEqual(early_stopping_floors(cfg), SELECTION_FLOORS)
+        self.assertEqual(early_stopping_floors(load_train_cfg(["training.early_stopping_floors.iou=0.01"]))["iou"], 0.01)
+        with self.assertRaises(ValueError):
+            early_stopping_floors(load_train_cfg(["training.early_stopping_floors.ioU=0.01"]))
+        self.assertEqual(float(cfg.val.epoch_subset), 0.10)
         self.assertEqual(int(cfg.val.full_every_n_epochs), 3)
         self.assertEqual(int(cfg.val.batch_size), 4)
         self.assertEqual(int(cfg.val.metric_threads), 4)
@@ -25,7 +32,8 @@ class TrainCfgTests(unittest.TestCase):
         self.assertEqual(int(cfg.training.save_every_n_steps), 200)
         self.assertEqual(int(cfg.training.early_stopping_patience), 2)
         self.assertIsNone(cfg.training.checkpoint_dir)
-        self.assertEqual(str(cfg.training.run_name), "auto")
+        # Pinned: auto + resume would continue the newest last.pt (the aborted 3-variant v4 run).
+        self.assertEqual(str(cfg.training.run_name), "sam2_em_v5")
         self.assertFalse(bool(cfg.data.even_per_volume))
         self.assertTrue(bool(cfg.training.profiler.enabled))
         self.assertEqual(int(cfg.training.profiler.active), 3)
@@ -42,19 +50,25 @@ class TrainCfgTests(unittest.TestCase):
             cfg.prompt.prob_box_only,
             cfg.prompt.prob_box_points,
             cfg.prompt.prob_circle_seed,
-            cfg.prompt.prob_adjacent_seed,
+            cfg.prompt.prob_circle_annotator,
+            cfg.prompt.prob_circle_pull_through,
+            cfg.prompt.prob_adjacent_poly_seed,
             cfg.prompt.prob_subset_seed,
             cfg.prompt.prob_correction,
             cfg.prompt.prob_near_correct,
         ]
         self.assertAlmostEqual(sum(float(p) for p in probs), 1.0)
-        self.assertEqual(float(cfg.prompt.prob_circle_seed), 0.40)
-        self.assertEqual(float(cfg.prompt.prob_adjacent_seed), 0.15)
-        self.assertEqual(int(cfg.prompt.variants_per_sample), 3)
+        self.assertEqual(float(cfg.prompt.prob_circle_seed), 0.10)
+        self.assertEqual(float(cfg.prompt.prob_circle_annotator), 0.20)
+        self.assertEqual(float(cfg.prompt.prob_circle_pull_through), 0.05)
+        self.assertEqual(float(cfg.prompt.prob_adjacent_poly_seed), 0.15)
+        self.assertEqual(int(cfg.prompt.variants_per_sample), 4)
+        self.assertNotIn("prob", cfg.prompt.circle_seed_jitter)
         self.assertEqual(float(cfg.prompt.edge_tau_px), 8.0)
         self.assertEqual(float(cfg.prompt.edge_tau_depth_frac), 0.25)
         self.assertEqual(list(cfg.prompt.erode_px), [10, 40])
         self.assertEqual(list(cfg.prompt.dilate_px), [5, 50])
+        self.assertEqual(list(cfg.prompt.shrink_px), [5, 50])
         self.assertEqual(list(cfg.prompt.correction_wobble_px), [10, 20])
         self.assertEqual(list(cfg.prompt.near_correct_wobble_px), [5, 12])
         self.assertEqual(list(cfg.prompt.near_correct_excursion_px), [15, 30])
@@ -116,7 +130,7 @@ class TrainCfgTests(unittest.TestCase):
     def test_prompt_probabilities_must_sum_to_one(self) -> None:
         with self.assertRaises(ValueError):
             load_train_cfg(["prompt.prob_points_only=0.5"])
-        cfg = load_train_cfg(["prompt.prob_points_only=0.20", "prompt.prob_circle_seed=0.30"])
+        cfg = load_train_cfg(["prompt.prob_points_only=0.20", "prompt.prob_circle_seed=0.0"])
         self.assertAlmostEqual(float(cfg.prompt.prob_points_only), 0.20)
 
     def test_next_run_name_increments(self) -> None:
@@ -149,6 +163,78 @@ class TrainCfgTests(unittest.TestCase):
             os.utime(older / "last.pt", (1_000, 1_000))
             os.utime(newer / "last.pt", (2_000, 2_000))
             self.assertEqual(latest_resumable_run([root]), "sam2_em_rpc1")
+
+    def _old_layout_run(self, root: Path) -> Path:
+        """A run directory with a last.pt and the config.yaml of the 3-variant layout (before the circle peers)."""
+        from omegaconf import OmegaConf
+
+        run = root / "runs" / "sam2_em_v4_centred"
+        run.mkdir(parents=True)
+        (run / "last.pt").write_bytes(b"weights")
+        old = load_train_cfg()
+        prompt = OmegaConf.to_container(old.prompt)
+        for key in ("prob_circle_annotator", "prob_circle_pull_through", "prob_adjacent_poly_seed",
+                    "circle_pull_through", "adjacent_poly"):
+            prompt.pop(key)
+        prompt.update(variants_per_sample=3, prob_circle_seed=0.40, prob_adjacent_seed=0.15, prob_subset_seed=0.10)
+        old.prompt = OmegaConf.create(prompt)
+        OmegaConf.save(old, run / "config.yaml")
+        return run
+
+    def test_resume_refuses_a_run_with_another_prompt_layout(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        from sam2_segmentation_trainer.train import check_resume_layout, prompt_layout_differences
+
+        with TemporaryDirectory() as tmp:
+            run = self._old_layout_run(Path(tmp))
+            with self.assertRaises(RuntimeError) as caught:
+                check_resume_layout(run, load_train_cfg())
+            message = str(caught.exception)
+            self.assertIn("cannot resume", message)
+            self.assertIn("prompt.variants_per_sample 3 -> 4", message)
+            self.assertIn("prompt.prob_adjacent_seed only in the saved run", message)
+            self.assertIn("prompt.prob_circle_pull_through not in the saved run", message)
+            self.assertIn("prompt.prob_circle_seed 0.4 -> 0.1", message)
+            self.assertIn("prompt.circle_pull_through not in the saved run", message)
+            self.assertIn("training.run_name", message)
+            self.assertIn("-refresh", message)
+            # The saved config is left as it was.
+            self.assertEqual(prompt_layout_differences(load_train_cfg(), load_train_cfg()), [])
+
+    def test_resume_allows_the_same_prompt_layout(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        from omegaconf import OmegaConf
+
+        from sam2_segmentation_trainer.train import check_resume_layout
+
+        with TemporaryDirectory() as tmp:
+            run = Path(tmp) / "runs" / "sam2_em_v5"
+            run.mkdir(parents=True)
+            (run / "last.pt").write_bytes(b"weights")
+            # Other settings may change on resume; only the prompt layout is pinned.
+            OmegaConf.save(load_train_cfg(["training.num_epochs=20", "prompt.edge_tau_px=6"]), run / "config.yaml")
+            check_resume_layout(run, load_train_cfg())
+            with self.assertRaises(RuntimeError):
+                check_resume_layout(run, load_train_cfg(["prompt.variants_per_sample=3"]))
+            with self.assertRaises(RuntimeError):
+                check_resume_layout(
+                    run, load_train_cfg(["prompt.prob_points_only=0.15", "prompt.prob_circle_seed=0.05"])
+                )
+
+    def test_resume_check_skips_a_run_without_a_checkpoint(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        from sam2_segmentation_trainer.train import check_resume_layout
+
+        with TemporaryDirectory() as tmp:
+            run = self._old_layout_run(Path(tmp))
+            (run / "last.pt").unlink()
+            check_resume_layout(run, load_train_cfg())  # nothing to resume, so nothing to refuse
+            (run / "last.pt.bak").write_bytes(b"weights")
+            with self.assertRaises(RuntimeError):
+                check_resume_layout(run, load_train_cfg())
 
     def test_refresh_flag_disables_resume(self) -> None:
         from sam2_segmentation_trainer.train import parse_train_args

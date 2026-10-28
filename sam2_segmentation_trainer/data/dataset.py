@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import zlib
 from pathlib import Path
 from typing import Any, Sequence
@@ -23,6 +24,16 @@ from annotation_crops.negatives import (
 from annotation_crops.prompt_encoding import EDGE_TAU_DEPTH_FRAC, CircleAnnotationTrust
 
 from sam2_segmentation_trainer.data.approved import as_approved, is_approved
+from sam2_segmentation_trainer.data.circle_seed_trust import (
+    DEFAULT_OVERSIZE_RANGE,
+    OVERSIZE_STREAM,
+    SeedCircle,
+    check_oversize_range,
+    oversize_circle,
+    seed_taper,
+    seed_taper_weight,
+    tapered_seed_mask_input,
+)
 from sam2_segmentation_trainer.data.augment import (
     build_train_transform,
     build_val_transform,
@@ -31,6 +42,7 @@ from sam2_segmentation_trainer.data.augment import (
 from sam2_segmentation_trainer.data.manifest import CropExample
 from sam2_segmentation_trainer.data.meta import SampleMeta
 from sam2_segmentation_trainer.data.prompts import (
+    CIRCLE_PROMPT_TYPES,
     PromptConfig,
     PromptType,
     FULL_TILE_PROMPTS,
@@ -40,6 +52,7 @@ from sam2_segmentation_trainer.data.prompts import (
     negative_region_canvases,
     inscribed_circle_xyr,
     interior_point_xy,
+    pull_through_circle,
     target_depth,
 )
 from sam2_segmentation_trainer.data.fulltile import is_full_tile
@@ -57,11 +70,14 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 VAL_PROMPTS = (
     "centroid", "point", "circle_mask", "correction", "near_correct", "circle_mask_noneg", "circle_annotator",
+    "circle_oversize",
 )
 """Validation prompts: the legacy mask centroid, the deepest interior point, the inscribed circle seed
 (production), a mask to correct, a near-correct mask (the "do no harm" check), the circle seed with every
-negative region and background point removed (how much the model leans on neighbors being sent) and an
-annotator-like circle seed (a random centre depth and radius, see ``annotator_circle``).
+negative region and background point removed (how much the model leans on neighbors being sent), an
+annotator-like circle seed (a random centre depth and radius, see ``annotator_circle``) and an oversized circle
+(evaluation only, never a default: the inscribed circle's radius times a random factor, see
+:func:`~sam2_segmentation_trainer.data.circle_seed_trust.oversize_circle`).
 
 New families go at the END: a family's number is its position, and its prompt seed uses that number."""
 
@@ -73,17 +89,27 @@ VAL_MIXED_TYPES = {
     "correction": PromptType.CORRECTION,
     "near_correct": PromptType.NEAR_CORRECT,
     "circle_mask_noneg": PromptType.CIRCLE_SEED,
-    "circle_annotator": PromptType.CIRCLE_SEED,
+    "circle_annotator": PromptType.CIRCLE_ANNOTATOR,
+    "circle_oversize": PromptType.CIRCLE_SEED,
 }
 """Validation prompts that go through the mixed pipeline, and the prompt family each forces."""
+
+ADJACENT_PICK_STREAM = 4
+"""Trailing number of the generator ``[seed, epoch, index, 0, 4]`` that picks which linked neighbour outline a
+sample's adjacent polygon seed uses, and then its erosion (the variant streams end in 1, 2 and 3, or in the variant
+number)."""
+
+ADJACENT_REDRAW_STREAM = 5
+"""Trailing number of the generator ``[seed, epoch, index, k, 5]`` that re-draws variant ``k`` when the mix drew
+``adjacent_poly_seed`` but the projected outline failed ``prompt.adjacent_poly.overlap_min``."""
 
 NO_NEGATIVE_PROMPTS = frozenset({"circle_mask_noneg"})
 """Validation prompts whose prompt carries no negative context (the loss weights and metrics still see the neighbors)."""
 
-CIRCLE_PROMPTS = frozenset({"circle_mask", "circle_mask_noneg", "circle_annotator"})
+CIRCLE_PROMPTS = frozenset({"circle_mask", "circle_mask_noneg", "circle_annotator", "circle_oversize"})
 """Validation prompts that need the target's circle."""
 
-FAMILIES_ONLY_PROMPTS = frozenset({"circle_annotator"})
+FAMILIES_ONLY_PROMPTS = frozenset({"circle_annotator", "circle_oversize"})
 """Validation prompts built only by the families path (``val_families``): the one-prompt path has no such prompt."""
 
 
@@ -132,6 +158,89 @@ class EpochCounter:
         return int(self._value.value)
 
 
+WORKER_THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+"""Thread-count variables set to 1 in every DataLoader worker (for any process a worker starts)."""
+
+_OPENBLAS_SET_THREADS = (
+    "scipy_openblas_set_num_threads64_",  # numpy's scipy-openblas64
+    "scipy_openblas_set_num_threads",  # scipy's scipy-openblas
+    "openblas_set_num_threads64_",
+    "openblas_set_num_threads",  # OpenCV's bundled OpenBLAS
+)
+
+
+def _loaded_openblas_paths() -> list[str]:
+    """Paths of the OpenBLAS libraries loaded in this process (Linux ``/proc/self/maps``; empty elsewhere)."""
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as maps:
+            paths = {line.split()[-1] for line in maps if "openblas" in line.lower() and "/" in line}
+    except OSError:
+        return []
+    return sorted(path for path in paths if path.startswith("/"))
+
+
+def limit_openblas_threads(threads: int = 1) -> int:
+    """Set every loaded OpenBLAS (numpy's, scipy's, OpenCV's each bundle one) to ``threads`` threads.
+
+    The environment variables are read only when a library loads, and workers fork from a parent that has loaded
+    them all, so this calls each library's own setter. Returns how many libraries were set.
+    """
+    import ctypes
+
+    count = 0
+    for path in _loaded_openblas_paths():
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError:
+            continue
+        for name in _OPENBLAS_SET_THREADS:
+            setter = getattr(lib, name, None)
+            if setter is not None:
+                setter(int(threads))
+                count += 1
+                break
+    return count
+
+
+def limit_worker_threads(_worker_id: int | None = None) -> None:
+    """``worker_init_fn`` of every DataLoader over :class:`EMSegDataset`: one thread per worker.
+
+    Each worker runs its own sample, so library thread pools only oversubscribe the CPU: with 4 workers on 32 cores,
+    OpenBLAS's pool alone cut the training loader from about 8.9 to 4.0 samples/s on set v3. Sets OpenBLAS (every
+    copy loaded), OpenCV and torch to one thread and the OMP/MKL/OpenBLAS variables to 1, without depending on how
+    the trainer was launched. The main process keeps its own threading.
+    """
+    for name in WORKER_THREAD_ENV:
+        os.environ[name] = "1"
+    torch.set_num_threads(1)
+    try:
+        import cv2
+
+        # Calling setNumThreads in a forked child deadlocks (OpenCV's pthread pool is not fork-safe) when the parent
+        # has already run a parallel cv2 operation. The parent calls limit_main_process_cv2() before the first
+        # fork, so the children inherit 1 and skip the call.
+        if cv2.getNumThreads() != 1:
+            cv2.setNumThreads(1)
+    except ImportError:  # pragma: no cover - albumentations needs OpenCV
+        pass
+    limit_openblas_threads(1)
+
+
+def limit_main_process_cv2() -> None:
+    """Set OpenCV to one thread in the MAIN process, before any DataLoader forks workers.
+
+    Forked workers inherit the setting, so :func:`limit_worker_threads` never has to call into OpenCV's thread pool
+    from a child (that call hangs forever if the parent has ever run a parallel cv2 operation). The trainer itself
+    does not use OpenCV; only the augmentations in the workers do.
+    """
+    try:
+        import cv2
+
+        cv2.setNumThreads(1)
+    except ImportError:  # pragma: no cover
+        pass
+
+
 def _load_gray_uint8(path: Path) -> np.ndarray:
     with Image.open(path) as img:
         return np.array(img.convert("L"))
@@ -167,12 +276,25 @@ def bbox_center_xy(ann: dict[str, Any], width: int, height: int) -> tuple[float,
     return width / 2.0, height / 2.0
 
 
+_MEAN32 = np.asarray(IMAGENET_MEAN, dtype=np.float32)
+_STD32 = np.asarray(IMAGENET_STD, dtype=np.float32)
+
+
 def imagenet_normalize(rgb_uint8: np.ndarray) -> torch.Tensor:
-    arr = rgb_uint8.astype(np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-    mean = torch.tensor(IMAGENET_MEAN, dtype=tensor.dtype).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD, dtype=tensor.dtype).view(3, 1, 1)
-    return (tensor - mean) / std
+    """``[3, H, W]`` float32 ``(rgb / 255 - mean) / std`` of an ``[H, W, 3]`` uint8 image.
+
+    One float32 pass per channel, written straight into the channel-first array: the same float32 operations in the
+    same order as ``(torch.from_numpy(rgb.astype(float32) / 255).permute(2, 0, 1) - mean) / std``, so bit-identical,
+    without the float copy, the permute copy and two temporaries (about 5x faster on a 1024 tile).
+    """
+    height, width = int(rgb_uint8.shape[0]), int(rgb_uint8.shape[1])
+    out = np.empty((3, height, width), dtype=np.float32)
+    for c in range(3):
+        channel = out[c]
+        np.divide(rgb_uint8[:, :, c], np.float32(255.0), out=channel, dtype=np.float32)
+        channel -= _MEAN32[c]
+        channel /= _STD32[c]
+    return torch.from_numpy(out)
 
 
 def augment_scene(
@@ -232,7 +354,8 @@ class EMSegDataset(Dataset):
     Without ``tiles`` and ``prompt_cfg`` every sample is the original single-centroid-point prompt, which is
     what validation and evaluation use so their IoU stays comparable across runs. With both, each sample draws
     ``prompt_cfg.variants_per_sample`` prompt variants against one augmented image (points, box, box and
-    points, circle seed, subset seed, mask to correct, near-correct mask) and carries the other annotations in
+    points, the three circle seeds, adjacent polygon seed, subset seed, mask to correct, near-correct mask), all drawn
+    from the ``prob_*`` mix without replacement, and carries the other annotations in
     its tile as negative context; see :mod:`sam2_segmentation_trainer.data.prompts`. The image is encoded once
     and every variant reuses its embeddings.
 
@@ -253,6 +376,11 @@ class EMSegDataset(Dataset):
     id, not by its position, so results do not depend on batch composition, family order or which samples are in
     the pass. Items also carry ``gt_terms``, the ground-truth side of the goal metrics, computed once here in
     the worker.
+
+    Two evaluation-only options act on the families path alone (docs/circle_seed_trust_eval.md):
+    ``circle_seed_taper`` (a ``full_frac``, None for off) feeds every circle-seed family's disc as
+    ``+seed_logit * w(rho)``, the radius-relative cosine taper with ``zero_frac`` the ``circle_scale``, instead of the
+    edge confidence; ``circle_oversize_range`` is the factor range of the ``circle_oversize`` family.
     """
 
     def __init__(
@@ -278,6 +406,9 @@ class EMSegDataset(Dataset):
         approved: frozenset | set | None = None,
         approved_weight: float = 1.0,
         val_families: Sequence[str] | None = None,
+        circle_seed_taper: float | None = None,
+        circle_oversize_range: Sequence[float] = DEFAULT_OVERSIZE_RANGE,
+        elastic_warp: bool = False,
     ):
         if val_prompt is not None and val_prompt not in VAL_PROMPTS:
             raise ValueError(f"val_prompt must be one of {VAL_PROMPTS}, got {val_prompt!r}")
@@ -303,6 +434,14 @@ class EMSegDataset(Dataset):
         self.approved = as_approved(approved)
         self.approved_weight = float(approved_weight)
         self.circle_scale = float(circle_scale)
+        # Evaluation only: the families path draws circles with the validation transform, which is the identity, so a
+        # circle's centre and radius still describe its disc after augment_scene.
+        if circle_seed_taper is not None and (split != "val" or val_prompt is not None):
+            raise ValueError("circle_seed_taper is evaluation only: it needs split='val' and val_families")
+        self.circle_seed_taper = (
+            None if circle_seed_taper is None else seed_taper(float(circle_seed_taper), self.circle_scale)
+        )
+        self.circle_oversize_range = check_oversize_range(circle_oversize_range)
         self.full_tile_threshold = None if full_tile_threshold is None else float(full_tile_threshold)
         self.examples = list(examples)
         self.split = split
@@ -314,7 +453,7 @@ class EMSegDataset(Dataset):
         self.epoch = epoch
         self._mask_cache = MaskCache(prompt_cfg.cache_size if prompt_cfg is not None else 0)
         if split == "train":
-            self.transform = build_train_transform()
+            self.transform = build_train_transform(elastic_warp=elastic_warp)
         else:
             self.transform = build_val_transform()
 
@@ -432,12 +571,15 @@ class EMSegDataset(Dataset):
             mask = (mask > 127).astype(np.uint8)
         target = mask > 0
         circle_mask: np.ndarray | None = None
+        seed_circle: SeedCircle | None = None  # its centre and true radius, for the evaluation-only options
         needs_circle = any(f in CIRCLE_PROMPTS for f in self.val_families)
         if needs_circle:
             own = tiles.circle_for(key, example.location_id)
             if own is not None and own.center_in(shape):
-                disc = rasterize_circle(shape, own.center_x, own.center_y, own.seed_radius(self.circle_scale))
+                radius = own.seed_radius(self.circle_scale)
+                disc = rasterize_circle(shape, own.center_x, own.center_y, radius)
                 circle_mask = disc if disc.any() else None
+                seed_circle = SeedCircle(own.center_x, own.center_y, radius / self.circle_scale)
         regions = self._other_annotations(example, shape)
         if prompt_cfg.drop_overlapping_circles:
             regions = drop_circles_over_target(regions, target)
@@ -453,6 +595,7 @@ class EMSegDataset(Dataset):
             if fitted is None:
                 raise KeyError(f"{example.split_key} has no mask to fit a circle to")
             circle_aug = rasterize_circle(shape, *fitted)
+            seed_circle = SeedCircle(fitted[0], fitted[1], fitted[2] / self.circle_scale)
 
         sample_id = zlib.crc32(f"{example.volume}|{example.image_key}|{example.location_id}".encode("utf-8"))
         with_negatives = [f for f in self.val_families if f in VAL_MIXED_TYPES and f not in NO_NEGATIVE_PROMPTS]
@@ -460,19 +603,40 @@ class EMSegDataset(Dataset):
         variants: list[dict[str, Any]] = []
         for family in self.val_families:
             if family in VAL_MIXED_TYPES:
-                family_circle = circle_aug
-                if family == "circle_annotator":
-                    # An annotator-like circle (always: ``prob`` is a training setting). Its own generator, so no other
-                    # family's draws move; None (too small, empty) keeps the inscribed seed.
+                family_circle, family_type = circle_aug, VAL_MIXED_TYPES[family]
+                family_seed_circle = seed_circle
+                if family_type is PromptType.CIRCLE_ANNOTATOR:
+                    # An annotator-like circle, from its own generator, so no other family's draws move; None (too
+                    # small, empty) keeps the inscribed seed and the variant is built (and reported) as circle_seed.
+                    drawn: dict = {}
                     disc = annotator_circle(
                         target_aug,
                         np.random.default_rng([self.seed, sample_id, VAL_FAMILY_CODES[family], 2]),
                         prompt_cfg.circle_seed_jitter,
+                        info=drawn,
                     )
                     if disc is not None:
                         family_circle = disc
+                        # Its disc is drawn at the drawn radius, so the taper's true radius is that over the scale and
+                        # the taper claims the same disc as the default encoding.
+                        family_seed_circle = SeedCircle(
+                            drawn["col"] + 0.5, drawn["row"] + 0.5, drawn["radius"] / self.circle_scale
+                        )
+                    else:
+                        family_type = PromptType.CIRCLE_SEED
+                elif family == "circle_oversize" and seed_circle is not None:
+                    # Evaluation only: the inscribed circle grown by a random factor, from its own generator.
+                    disc, grown, _factor = oversize_circle(
+                        shape,
+                        seed_circle,
+                        self.circle_scale,
+                        np.random.default_rng([self.seed, sample_id, VAL_FAMILY_CODES[family], OVERSIZE_STREAM]),
+                        self.circle_oversize_range,
+                    )
+                    if disc.any():
+                        family_circle, family_seed_circle = disc, grown
                 prompt = build_prompt(
-                    VAL_MIXED_TYPES[family],
+                    family_type,
                     target_mask=target_aug,
                     circle_mask=family_circle,
                     regions=[] if family in NO_NEGATIVE_PROMPTS else regions_aug,
@@ -481,6 +645,11 @@ class EMSegDataset(Dataset):
                     negative_canvases=None if family in NO_NEGATIVE_PROMPTS else canvases,
                 )
                 variant = _variant_from_prompt(prompt)
+                if self.circle_seed_taper is not None and family_type in CIRCLE_PROMPT_TYPES:
+                    variant["dense_mask"] = self._tapered_dense(
+                        family_circle, family_seed_circle, [] if family in NO_NEGATIVE_PROMPTS else regions_aug,
+                        None if family in NO_NEGATIVE_PROMPTS else canvases, prompt_cfg,
+                    )
             else:
                 point = interior_point_xy(target_aug) if family == "point" else mask_centroid_xy(target_aug)
                 if point is None:
@@ -544,6 +713,25 @@ class EMSegDataset(Dataset):
         )
         return regions
 
+    def _tapered_dense(
+        self,
+        disc: np.ndarray,
+        circle: SeedCircle | None,
+        regions: list[NegativeRegion],
+        canvases,
+        prompt_cfg: PromptConfig,
+    ) -> torch.Tensor | None:
+        """The dense prompt of a circle-seed variant under ``circle_seed_taper`` (evaluation only): ``disc`` fed as
+        ``+seed_logit * w(rho)`` of ``circle``, with the same negatives :func:`build_prompt` used (validation never
+        drops any, and a circle seed merges none)."""
+        if circle is None:
+            raise ValueError("circle_seed_taper needs the seed circle's centre and radius")
+        if canvases is None:
+            canvases = negative_region_canvases(regions, prompt_cfg) if regions else []
+        weight = seed_taper_weight(disc.shape, circle, self.circle_seed_taper)
+        dense = tapered_seed_mask_input(disc, weight, canvases, prompt_cfg.seed_logit)
+        return None if dense is None else torch.from_numpy(dense)
+
     def _circle_trust(self) -> CircleAnnotationTrust:
         """The circle-annotation trust the prompts use (``prompt.circle_annotation_trust``)."""
         return (self.prompt_cfg if self.prompt_cfg is not None else PromptConfig()).circle_annotation_trust
@@ -582,31 +770,63 @@ class EMSegDataset(Dataset):
         forced: PromptType | None,
         has_adjacent: bool = False,
     ) -> list[PromptType]:
-        """The prompt family of each variant. Variant 0 is the production prompt: a circle seed, or, when the
-        sample has an adjacent-section shape, an adjacent seed with probability ``a / (a + c)``.
+        """The prompt family of each variant: every variant, the first included, is drawn from the ``prob_*`` mix
+        without replacement (no family is forced on a sample), each from its own generator
+        ``[seed, epoch, index, k, 1]``, renormalised over the families still available (:func:`choose_prompt_type`).
 
-        The others are drawn from the mix without replacement (so the ``prob_*`` shares steer variants 1 onwards
-        only); a fully masked tile has only two families to draw from, so it gets at most two variants.
+        ``adjacent_poly_seed`` is available only with an adjacent-section shape and not on a fully masked tile;
+        otherwise its share moves to the three circle peers in proportion to theirs. A fully masked tile draws only
+        points, the plain circle seed and the annotator-like circle (:data:`FULL_TILE_PROMPTS`: three families, so with
+        four variants it draws all three and the shortfall rule stops the plan there). Shortfall (unchanged
+        rule): once no family with a positive share is left, :func:`choose_prompt_type` returns points (the plain
+        circle seed when points are not allowed); if that family is already in the plan the plan stops there, else it
+        is added once (even at share 0) and the next draw stops it. So a sample can have fewer variants.
         """
         if forced is not None:
             return [forced]
         allowed = FULL_TILE_PROMPTS if full_tile else None
-        first = PromptType.CIRCLE_SEED
-        adjacent, circle = cfg.prob_adjacent_seed, cfg.prob_circle_seed
-        if has_adjacent and not full_tile and adjacent + circle > 0.0:
-            draw = np.random.default_rng([self.seed, epoch, int(index), 0, 1]).random()
-            if draw < adjacent / (adjacent + circle):
-                first = PromptType.ADJACENT_SEED
-        chosen = [first]
-        for k in range(1, cfg.variants_per_sample):
+        can_adjacent = has_adjacent and not full_tile
+        chosen: list[PromptType] = []
+        for k in range(cfg.variants_per_sample):
             rng = np.random.default_rng([self.seed, epoch, int(index), k, 1])
-            kind = choose_prompt_type(
-                cfg, rng, allowed=allowed, exclude=set(chosen) | {PromptType.ADJACENT_SEED}
-            )
+            kind = choose_prompt_type(cfg, rng, can_adjacent_poly_seed=can_adjacent, allowed=allowed, exclude=set(chosen))
             if kind in chosen:
                 break
             chosen.append(kind)
         return chosen
+
+    def _redraw_rejected_adjacent(
+        self,
+        cfg: PromptConfig,
+        index: int,
+        epoch: int,
+        types: list[PromptType],
+        *,
+        full_tile: bool,
+    ) -> tuple[list[PromptType], list[PromptType]]:
+        """``(built, requested)`` families after a projected adjacent outline failed the overlap rule.
+
+        The variant that drew ``adjacent_poly_seed`` is drawn again, from its own generator
+        ``[seed, epoch, index, k, 5]``, from the families the sample can still use (the adjacent share moves to the
+        circle peers, as when no outline exists, and the families already in the plan are excluded). It keeps
+        ``adjacent_poly_seed`` as its requested family, so ``train/prompt_fallback/adjacent_poly_seed`` counts it.
+        When nothing new is left (:func:`choose_prompt_type` returns a family already planned) the variant is
+        dropped; :meth:`_mixed_item` then records it on the sample (``dropped_prompt_types``, and the failed rule in
+        its ``adjacent_rule``), so the pass rate and the fallback count still see it.
+        """
+        built = list(types)
+        requested = list(types)
+        k = built.index(PromptType.ADJACENT_POLY_SEED)
+        rng = np.random.default_rng([self.seed, epoch, int(index), k, ADJACENT_REDRAW_STREAM])
+        kind = choose_prompt_type(
+            cfg, rng, can_adjacent_poly_seed=False,
+            allowed=FULL_TILE_PROMPTS if full_tile else None, exclude=set(built),
+        )
+        if kind in built:
+            del built[k], requested[k]
+        else:
+            built[k] = kind
+        return built, requested
 
     def _mixed_item(
         self,
@@ -646,22 +866,54 @@ class EMSegDataset(Dataset):
         regions = self._other_annotations(example, shape)
         if prompt_cfg.drop_overlapping_circles:
             regions = drop_circles_over_target(regions, target)
-        adjacent_shape = None if full_tile else tiles.adjacent_shape(key, example.location_id)
-        types = self._plan_types(
-            prompt_cfg, index, epoch, full_tile=full_tile, forced=forced, has_adjacent=adjacent_shape is not None
+        # One linked outline from a section 1-2 away, in this tile's pixel frame (None: the family is unavailable for
+        # this sample and its share moves to the circle peers). Which neighbour, when there are several, and its
+        # erosion come from its own generator [seed, epoch, index, 0, 4], so a resumed epoch draws the same one.
+        # A projected outline sits where the registration carries it and counts only when it passes the overlap rule
+        # against the (unaugmented) target; one that fails is not a prompt, and its variant is drawn again.
+        adjacent_poly = prompt_cfg.adjacent_poly
+        adjacent = (
+            None
+            if full_tile
+            else tiles.adjacent_draw(
+                key, example.location_id, target=target,
+                rng=np.random.default_rng([self.seed, epoch, int(index), 0, ADJACENT_PICK_STREAM]),
+                overlap_min=adjacent_poly.overlap_min, erode_px=adjacent_poly.erode_px,
+            )
         )
+        types = self._plan_types(
+            prompt_cfg, index, epoch, full_tile=full_tile, forced=forced, has_adjacent=adjacent is not None
+        )
+        requested = list(types)
+        adjacent_rule: str | None = None
+        dropped: list[PromptType] = []  # families the mix asked for whose variant was dropped
+        if adjacent is not None and adjacent.projected and PromptType.ADJACENT_POLY_SEED in types:
+            adjacent_rule = "pass" if adjacent.passed else "fail"
+            if not adjacent.passed:
+                types, requested = self._redraw_rejected_adjacent(
+                    prompt_cfg, index, epoch, types, full_tile=full_tile
+                )
+                if PromptType.ADJACENT_POLY_SEED not in requested:
+                    dropped.append(PromptType.ADJACENT_POLY_SEED)
+        adjacent_shape = None if adjacent is None else adjacent.raster
+        adjacent_placed = adjacent is not None and adjacent.projected
 
-        # The target, every negative and the circle go through the same geometric transform as the image, so
-        # prompts stay registered to it (elastic warps and flips included).
-        # An adjacent seed that cannot be fitted falls back to the circle seed, so it needs the circle too.
-        needs_circle = PromptType.CIRCLE_SEED in types or PromptType.ADJACENT_SEED in types
+        # The target, every negative, the circle and the adjacent outline go through the same geometric transform as
+        # the image, so prompts stay registered to it (elastic warps and flips included; a flipped target keeps the
+        # orientation of its neighbour's outline).
+        # An adjacent polygon seed that cannot be fitted falls back to the circle seed, so it needs the circle too.
+        needs_circle = any(kind in CIRCLE_PROMPT_TYPES or kind is PromptType.ADJACENT_POLY_SEED for kind in types)
         use_circle = needs_circle and circle_mask is not None
+        use_adjacent = adjacent_shape is not None and PromptType.ADJACENT_POLY_SEED in types
         image_aug, target_aug, regions_aug, extras = augment_scene(
-            self.transform, rgb, target, regions, [circle_mask] if use_circle else []
+            self.transform, rgb, target, regions,
+            ([circle_mask] if use_circle else []) + ([adjacent_shape] if use_adjacent else []),
         )
         if not target_aug.any():
             raise KeyError(f"{example.split_key} target is empty after augmentation")
         circle_aug = extras[0] if use_circle else None
+        if use_adjacent:
+            adjacent_shape = extras[-1]
         if needs_circle and (circle_aug is None or not circle_aug.any()):
             # No annotation circle in this tile (or it left the image): fit the largest circle inside the target.
             fitted = inscribed_circle_xyr(target_aug, self.circle_scale)
@@ -674,30 +926,36 @@ class EMSegDataset(Dataset):
             if len(types) > 1 and regions_aug and not no_negatives
             else None
         )
-        # Negative-context dropout applies to training variants after the first (variant 0 is the production prompt).
+        # Negative-context dropout applies to every training variant (no variant is a fixed production prompt).
         train_dropout = forced is None and self.split == "train"
-        # Annotator-like circle seeds (docs/circle_annotator_spec.md): a share of the training circle seeds, variant 0
-        # included, are replaced by a disc at a random depth and size. Never in validation or a forced prompt.
-        jitter = prompt_cfg.circle_seed_jitter
-        jitter_on = train_dropout and jitter.prob > 0.0
         depth = None  # the target's distance transform, done once for however many circles are drawn
         variants: list[dict[str, Any]] = []
-        for k, kind in enumerate(types):
-            circle_k = circle_aug
-            jittered = False
+        for k, (kind, asked) in enumerate(zip(types, requested)):
+            # The three circle peers share one seed prompt; they differ in the disc. An annotator-like or pull-through
+            # disc has its own generator (trailing 2 or 3), so no other draw moves. A disc that cannot be drawn falls
+            # back to the plain circle, and the variant is then reported as circle_seed (requested_prompt_type keeps
+            # what the mix asked for).
+            circle_k, built = circle_aug, kind
             drawn: dict = {}
-            if jitter_on and kind in (PromptType.CIRCLE_SEED, PromptType.ADJACENT_SEED):
-                # Its own generator (the trailing 2), so no other draw moves; prob 0 never gets here and draws nothing.
-                # An adjacent seed that cannot be fitted falls back to a circle, which is then this circle.
-                jrng = np.random.default_rng([self.seed, epoch, int(index), k, 2])
-                if jrng.random() < jitter.prob:
-                    if depth is None:
-                        depth = target_depth(target_aug)
-                    disc = annotator_circle(target_aug, jrng, jitter, depth, drawn)
-                    if disc is not None:
-                        circle_k, jittered = disc, True
+            if kind in (PromptType.CIRCLE_ANNOTATOR, PromptType.CIRCLE_PULL_THROUGH):
+                if depth is None:
+                    depth = target_depth(target_aug)
+                if kind is PromptType.CIRCLE_ANNOTATOR:
+                    disc = annotator_circle(
+                        target_aug, np.random.default_rng([self.seed, epoch, int(index), k, 2]),
+                        prompt_cfg.circle_seed_jitter, depth, drawn,
+                    )
+                else:
+                    disc = pull_through_circle(
+                        target_aug, np.random.default_rng([self.seed, epoch, int(index), k, 3]),
+                        prompt_cfg.circle_pull_through, depth, drawn,
+                    )
+                if disc is not None:
+                    circle_k = disc
+                else:
+                    built = PromptType.CIRCLE_SEED
             prompt = build_prompt(
-                kind,
+                built,
                 target_mask=target_aug,
                 circle_mask=circle_k,
                 regions=[] if no_negatives else regions_aug,
@@ -705,7 +963,8 @@ class EMSegDataset(Dataset):
                 rng=np.random.default_rng([self.seed, epoch, int(index), k]),
                 adjacent_shape=adjacent_shape,
                 negative_canvases=canvases,
-                negative_dropout=train_dropout and k >= 1,
+                negative_dropout=train_dropout,
+                adjacent_placed=adjacent_placed,
             )
             variants.append(
                 {
@@ -722,11 +981,25 @@ class EMSegDataset(Dataset):
                         None if prompt.input_mask is None else torch.from_numpy(prompt.input_mask.astype(np.uint8))
                     ),
                     "prompt_type": prompt.prompt_type.value,
-                    # Whether the circle this variant was given is an annotator-like one (False for other families).
-                    "circle_jittered": jittered and prompt.prompt_type is PromptType.CIRCLE_SEED,
-                    # For a jittered circle: whether the fit cap d(p) + fit_grow_px set its radius, not s * D.
+                    # What the mix asked for; differs from prompt_type when a circle fell back to the plain one, an
+                    # adjacent polygon seed could not be fitted, or a projected one failed the overlap rule.
+                    "requested_prompt_type": asked.value,
+                    # The overlap rule of a projected adjacent outline, on the variant that asked for one: "pass" or
+                    # "fail" (that variant was drawn again); None otherwise.
+                    "adjacent_rule": adjacent_rule if asked is PromptType.ADJACENT_POLY_SEED else None,
+                    # Share of the projected outline in the tile that lies on the target (else None).
+                    "adjacent_overlap": (
+                        float(adjacent.overlap)
+                        if asked is PromptType.ADJACENT_POLY_SEED and adjacent is not None and adjacent.overlap is not None
+                        else None
+                    ),
+                    # For an annotator-like circle: whether the fit cap d(p) + fit_grow_px set its radius, not s * D.
                     "circle_fit_capped": bool(
-                        jittered and prompt.prompt_type is PromptType.CIRCLE_SEED and drawn.get("capped", False)
+                        prompt.prompt_type is PromptType.CIRCLE_ANNOTATOR and drawn.get("capped", False)
+                    ),
+                    # For a pull-through circle: the fraction of the disc inside the target (else None).
+                    "circle_overlap": (
+                        float(drawn["overlap"]) if prompt.prompt_type is PromptType.CIRCLE_PULL_THROUGH else None
                     ),
                 }
             )
@@ -746,6 +1019,11 @@ class EMSegDataset(Dataset):
             "mask": torch.from_numpy(target_aug.astype(np.int64)),
             **self._weights(target_aug, regions_aug, meta),
             "variants": variants,
+            # The overlap rule of the sample's projected adjacent outline ("pass", "fail" or None), kept on the sample
+            # so a failure still counts when its variant was dropped (train/adjacent_poly/pass_rate).
+            "adjacent_rule": adjacent_rule,
+            # Families the mix asked for whose variant was dropped (train/prompt_fallback/{family}/dropped).
+            "dropped_prompt_types": [kind.value for kind in dropped],
             "orig_hw": (int(target_aug.shape[0]), int(target_aug.shape[1])),
             "sample_meta": meta,
             **meta.as_dict(),
@@ -764,7 +1042,10 @@ def collate_em(batch: list[dict[str, Any]]) -> dict[str, Any]:
     encoder takes one tensor per call; the training loop groups variants by which prompts they have.
     ``prompt_fg`` is the trust of each seed at full resolution (float16, zeros when there is none), used by the
     mask-containment loss. ``prompt_input`` is the seed or mask to correct as uint8 (None when no variant has
-    one). ``meta`` and ``orig_hw`` are repeated for each variant of a sample; ``prompt_type`` is a parallel list.
+    one). ``meta`` and ``orig_hw`` are repeated for each variant of a sample; ``prompt_type`` (the family built) and
+    ``requested_prompt_type`` (the family the mix drew; they differ after a fallback) are parallel lists.
+    ``adjacent_rule`` is per sample (the overlap rule of its projected adjacent outline, or None), and
+    ``dropped_prompt_type`` lists the families asked for whose variant was dropped, over the whole batch.
     """
     rows = [(b, variant) for b, item in enumerate(batch) for variant in item["variants"]]
     count = len(rows)
@@ -813,6 +1094,11 @@ def collate_em(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "prompt_fg": prompt_fg,
         "prompt_input": prompt_input,
         "prompt_type": [variant.get("prompt_type", "centroid") for _b, variant in rows],
+        "requested_prompt_type": [
+            variant.get("requested_prompt_type", variant.get("prompt_type", "centroid")) for _b, variant in rows
+        ],
+        "adjacent_rule": [item.get("adjacent_rule") for item in batch],
+        "dropped_prompt_type": [kind for item in batch for kind in item.get("dropped_prompt_types") or ()],
         "orig_hw": [batch[b]["orig_hw"] for b, _v in rows],
         "meta": [batch[b]["sample_meta"].as_dict() for b, _v in rows],
     }

@@ -1,22 +1,29 @@
 # @package _global_
 
 training:
+  # Pinned for the v5 run (4 prompt variants, three circle peers). With auto, resume would continue the newest
+  # last.pt, which is sam2_em_v4_centred (a 3-variant run). Resume also refuses any run whose saved config.yaml has
+  # another prompt layout (variants_per_sample, the prob_* keys and values, the circle peer sections).
   # auto + resume: continue the run with the newest last.pt.
   # auto + -refresh: start sam2_em_vN+1 from pretrained weights.
-  run_name: auto
+  run_name: sam2_em_v5
   run_name_prefix: sam2_em
   output_dir: null
   # Large checkpoints (last.pt / best_model) — default /storage4/Sam2Trainer via env.
   checkpoint_dir: null
   num_epochs: 15
-  # Batch 2 with 8 accumulation steps (effective 16), activation checkpointing off. Measured on an RTX 4500 Ada
-  # (22.5 GB), 3 prompt variants, cuDNN autotuner off, training steps only, alternating runs A B A B with the GPU
-  # clocks logged (scripts/compare_throughput.sh): this setting took 0.2765 and 0.2755 s per sample (0.553 and
-  # 0.551 s per batch, 14.8 GB peak); batch 4 with checkpointing took 0.314 and 0.339 s per sample (1.256 and
-  # 1.356 s per batch, 7.0 GB peak). So it is 15.5% faster per sample, and its slowest run beat B's fastest by
-  # 12%. SM clocks averaged about 2700 MHz in all four runs, the only throttle reason was the software power cap
-  # (in 10-30% of busy samples, in both settings), and no other process was using the GPU. Batch 4 without
-  # checkpointing does not fit (driver mapping failure in the first forward pass).
+  # Batch 2 with 8 accumulation steps (effective batch 16), activation checkpointing off. Measured Oct 27 2026 on the
+  # RTX 4500 Ada (23 GB) beside the `latest` segmentation server (2.4 GB, 512 MiB GPU cache cap), 4 prompt variants,
+  # sam2-em-train -benchmark, 150 timed batches, expandable_segments on:
+  #   batch 2 x 8, no checkpointing    0.305 s per sample, 15.6 GiB reserved, card peak 22.2 GB: under 1 GB free.
+  #                                    With Viking open as well it spilled about 1 GB into system memory and crawled,
+  #                                    so keep other GPU use light while training, or turn checkpointing on:
+  #   batch 2 x 8, 0.25 checkpointed   0.380 s per sample, 12.9 GiB reserved, card peak 20.3 GB (2.7 GB free)
+  #   batch 1 x 16, no checkpointing   0.428 s per sample,  9.6 GiB reserved
+  #   batch 4 x 4, all checkpointed    0.445 s per sample,  8.5 GiB reserved
+  # (Oct 18's batch 1 choice was measured with the server holding about 8 GB under a 14 GiB cap.)
+  # log_every_n_steps, val_images_every_n_steps and the profiler schedule count batches (micro-batches);
+  # save_every_n_steps and the LR warmup count optimizer steps (batch_size x accumulation samples).
   batch_size: 2
   num_workers: 4
   prefetch_factor: 2
@@ -59,14 +66,22 @@ training:
   export_serve_each_epoch: true
   save_every_n_steps: 200
   resume: true
-  # Epochs without a better checkpoint before training stops. "Better" follows the checkpoint rule (see
-  # val.core_recall_target): among epochs at or above the core-recall target, the lowest merge rate, spill breaking
-  # ties; if none reaches the target, the highest core recall. 0 disables early stopping.
+  # Epochs without a better checkpoint before training stops. 0 disables early stopping. An epoch is better than the
+  # best so far when at least one metric of the primary family (circle_annotator, on the per-epoch subset) is better
+  # by at least its noise floor below and none is worse by its floor; changes inside a floor are noise either way.
+  # The core-recall target (val.core_recall_target) is reported but is not a gate: the validation masks are traced
+  # annotations, not a checked validation set.
   early_stopping_patience: 2
-  # Noise floor of that rule, measured on the per-epoch subset: at the core-recall target the merge rate has to fall
-  # by at least this (or, if it moved by less, the spill has to fall by this) to count as better; below the target
-  # the core recall has to rise by at least 0.0005. Crossing the target always counts.
-  early_stopping_min_delta: 0.002
+  # Noise floors: the 95th-percentile error of a 10% subset (val.epoch_subset) of validation set v5, measured
+  # 2026-10-20 on v5's epoch-0 checkpoint over 200 random subsets (scripts/valset_size_study.py,
+  # /outputs/valset_size_v5_e0/size_study.md). The merge rate measured 0.0008; 0.002 leaves room for a model that
+  # merges more often. Metrics left out take the defaults in goal_metrics.SELECTION_FLOORS.
+  early_stopping_floors:
+    core_recall: 0.004
+    iou: 0.006
+    spill: 0.006
+    merge_rate: 0.002
+    frag: 0.012
   # MQTT warn when a step is much slower / higher-loss than the recent median.
   warn_anomaly_warmup: 30
   warn_anomaly_window: 100
@@ -97,7 +112,7 @@ differential_lr:
 prompt:
   # false: every training sample is the original single centroid point.
   enabled: true
-  # Diameter of a SEED circle (a polygon's inscribed circle, the production prompt) as a fraction of its true
+  # Diameter of a SEED circle (a polygon's inscribed circle, the plain circle_seed prompt) as a fraction of its true
   # diameter. It does not apply to circle annotations, which only ever serve as negatives (see below).
   # The exporter never scales: it writes true radii (diameter_scale 1.0); the trainer applies this on load, and
   # rescales a file from an older exporter that baked a scale in, so changing it needs no re-export.
@@ -110,21 +125,46 @@ prompt:
   circle_annotation_trust:
     full_frac: 0.5    # full -SEED_LOGIT inside this fraction of the TRUE radius
     zero_frac: 0.95   # taper reaches 0 here; the circle claims nothing beyond
-  # Annotator-like circle seeds (docs/circle_annotator_spec.md). The circle_annotator validation family always draws
-  # one with these ranges. prob (the share of TRAINING circle seeds replaced by one) is not used by training yet.
-  # Not part of the prompt encoding: it changes which circles are drawn, not how a prompt is encoded.
+  # Annotator-like circles (docs/circle_annotator_spec.md): the disc of the circle_annotator prompt type (its share is
+  # prob_circle_annotator below) and of the circle_annotator validation family. Not part of the prompt encoding: it
+  # changes which circles are drawn, not how a prompt is encoded.
   circle_seed_jitter:
-    prob: 0.7             # share of training circle seeds replaced by an annotator-like circle; 0 disables
     depth_range: [0.3, 1.0]   # centre depth as a fraction of the target's maximum depth (1 = deepest point)
     scale_range: [0.45, 1.0]  # radius as a fraction of the maximum depth, before the fit cap
     fit_grow_px: 10       # the radius may exceed the centre's own depth by this much
-    min_radius_px: 6      # a smaller circle falls back to the inscribed seed
-  # Prompt variants decoded per encoded sample. Variant 1 is always the production prompt (a circle seed; with an
-  # adjacent-section shape, an adjacent seed with probability prob_adjacent_seed / (prob_adjacent_seed +
-  # prob_circle_seed)). The others are drawn from the prob_* mix below without replacement. So the prob_* values
-  # only steer variants 2 onwards: the realised mix has a larger circle share than prob_circle_seed (see
-  # train/prompt_mix/* and train/prompt_count/* in TensorBoard). The image encoder runs once per sample.
-  variants_per_sample: 3
+    min_radius_px: 6      # a smaller circle falls back to the plain circle_seed
+  # Pull-through circles (docs/circle_annotator_spec.md, "Pull-through circles"): the disc of the circle_pull_through
+  # prompt type (its share is prob_circle_pull_through below), an annotator circle drawn across the cell edge, mostly
+  # inside. The model must ignore the part outside and expand to the full cell. No validation family.
+  circle_pull_through:
+    overlap_min: 0.60     # at least this fraction of the disc lies inside the target
+    outside_min: 0.05     # at least this fraction lies outside it (the disc really crosses the edge)
+    radius_range: [0.4, 0.9]  # radius as a fraction of the target's maximum depth
+    min_radius_px: 6      # floor on the radius
+    max_tries: 20         # radius-and-centre draws before giving up (the variant falls back to the plain circle_seed)
+  # The adjacent-section polygon seed (adjacent_poly_seed; its share is prob_adjacent_poly_seed below). projected: the
+  # linked neighbour outline is carried through the volume's registration (neighbour stos -> volume, residual
+  # correction, inverse target stos; data.registration_root / data.corrections_root) to where Viking puts a
+  # carried-forward polygon, eroded by U(erode_px) and used there, not scaled to fit. Like the pull-through circle it
+  # counts only when at least overlap_min of its area in the tile lies on the target mask; otherwise that variant is
+  # drawn again from the other families (train/prompt_fallback/adjacent_poly_seed; train/adjacent_poly/pass_rate
+  # and train/adjacent_poly/share show the rule and the realised share). Through the dataset on set v3, with 0-10 px
+  # erosion, 90% (RC2, RPC1) and 94% (RPC2) of the drawn outlines pass (docs/mask_refinement_plan.md, 3.1). A volume without the
+  # registration data falls back to centroid with a warning: the shape is moved onto the target's centroid and
+  # scaled to fit inside the cell (adjacent_fit_* below). raw: as written (a test hook).
+  adjacent_poly:
+    placement: projected
+    overlap_min: 0.60     # at least this fraction of the eroded outline's area in the tile lies on the target
+    erode_px: [0, 10]     # the carried-forward outline is eroded by U(erode_px) px before the test (capped at 0.6 of its depth)
+  # Prompt variants decoded per encoded sample. All of them, the first included, are drawn from the prob_* mix below
+  # WITHOUT replacement (no family is forced on a sample, and a family appears at most once per sample), renormalised
+  # over the families the sample can still use. So a family's realised share of the variants differs from its prob_*:
+  # rare families are over-represented and common ones under-represented (see train/prompt_mix/* and
+  # train/prompt_count/* in TensorBoard, which count the family built after any fallback, and
+  # train/prompt_fallback/*). A fully masked tile can draw only points, circle_seed and circle_annotator (no edge
+  # for a pull-through circle to cross), so it has at most three variants. The image encoder
+  # runs once per sample; each variant is one decoder pass.
+  variants_per_sample: 4
   # tau of the prompt confidence curve in pixels. Traces are about 9 px (20 nm) from the membrane on average, so
   # 8 px puts 95% confidence about 24 px inside the traced line.
   edge_tau_px: 8.0
@@ -138,22 +178,30 @@ prompt:
   prob_points_only: 0.10
   prob_box_only: 0.05
   prob_box_points: 0.05
-  # Seeds (trusted, inside the cell; the containment loss applies to their core):
-  prob_circle_seed: 0.40    # the production prompt: inscribed circle x circle_diameter_scale plus its center point
-  # A linked polygon from the adjacent section scaled to fit inside the cell (the Viking workflow). Needs the
-  # exporter's shapes.jsonl; until then its share moves to the circle seed.
-  prob_adjacent_seed: 0.15
-  prob_subset_seed: 0.10    # a part of the true mask: eroded 10-40 px, then optionally cut straight or along the cell
+  # Seeds (trusted; the containment loss applies to their core, inside the target only). Three peer circle prompts,
+  # each a disc plus its centre point:
+  prob_circle_seed: 0.10          # plain: the tile's circle or the inscribed circle x circle_diameter_scale
+  prob_circle_annotator: 0.20     # annotator-like: off-centre and smaller (circle_seed_jitter)
+  prob_circle_pull_through: 0.05  # drawn across the cell edge, mostly inside (circle_pull_through); not clipped
+  # A circle that cannot be drawn (too small a cell) falls back to the plain circle_seed.
+  # A linked polygon from the adjacent section (the Viking workflow), read from the exporter's <volume>/shapes.jsonl
+  # (one linked outline 1-2 sections away, in its own section's mosaic pixels) and placed as adjacent_poly says. For
+  # a sample without one (no link, no file, no outline reaching the tile, or a fully masked tile) its share moves to
+  # the three circle peers in proportion to their shares.
+  prob_adjacent_poly_seed: 0.15
+  prob_subset_seed: 0.15    # a part of the true mask: eroded 10-40 px, then optionally cut straight or along the cell
   # Masks to correct (suggestions that may be wrong; no containment loss):
-  prob_correction: 0.10     # grown, scaled, warped, simplified or merged with a neighbor
+  prob_correction: 0.10     # grown, eroded, scaled, warped, simplified or merged with a neighbor
   # A good human trace: outline wobble of 5-12 px on average plus 1-3 local bulges or dents of 15-30 px. The model
   # must leave it at least as good (val "do no harm").
   prob_near_correct: 0.05
+  # The centroid fallback of adjacent_poly only: the shape is scaled to fit inside the cell.
   adjacent_fit_inside: 0.98          # share of the scaled seed that must lie inside the target grown by adjacent_fit_grow_px
   adjacent_fit_grow_px: 10           # the annotator fits the seed to the visible membrane, up to this far outside the trace
   adjacent_scale_range: [0.7, 1.0]   # factor applied to the fitted scale
   erode_px: [10, 40]                 # shrink range of a subset seed (applied before any cut)
   dilate_px: [5, 50]                 # grow range of a mask to correct
+  shrink_px: [5, 50]                 # erode range of a mask to correct (the mirror of dilate_px; capped at half the mask depth)
   scale_range: [0.8, 1.25]           # wheel-style scale of a mask to correct
   correction_wobble_px: [10, 20]     # mean outline displacement of a mask to correct's wobble (local excursions up to 50 px)
   near_correct_wobble_px: [5, 12]    # MEAN outline displacement of a near-correct mask
@@ -182,7 +230,7 @@ negative:
   # 40 of 1637 examples that have circle negatives (2.4%; RC1 1.6%, RC2 0%, RPC1 3.5%, RPC2 3.0%), above the 1%
   # threshold, so it is on.
   drop_overlapping_circles: true
-  # Training variants after the first (variant 0 is the production prompt) sometimes lose their negative context,
+  # Training variants (every one of them; validation never) sometimes lose their negative context,
   # so the model does not depend on neighbors always being sent: context_dropout is the chance a variant carries
   # none (no negative area, no background points); region_dropout is then the chance each remaining neighbor is
   # dropped on its own. Drawn from the variant's own rng. The ground truth is unchanged, so the leak weight and the
@@ -240,6 +288,17 @@ data:
   approved_path: null
   # Training weight of Approved masks (2.0 to try).
   approved_weight: 1.0
+  # Elastic warp of training images (a fifth of samples, at most about 2 px of movement). Off: the training set is
+  # large. Turn on with data.elastic_warp=true on the command line. Validation never augments.
+  elastic_warp: false
+  # Validation that stays the same across runs (docs/validation_sets.md; files under {SAM2_CHECKPOINT_ROOT}/valsets,
+  # made with sam2-em-valsets). frozen_split: a name (val_v1) or a path. A NEW run starts from that split instead of
+  # building one, and locations added since it was frozen are placed by their section, so every run that names it
+  # validates on the same sections. A run that already has its own split.json keeps it. null builds a split as below.
+  frozen_split: null
+  # gold_set: a name (gold_v1) or a path. Its reviewed locations are never trained on, always join the validation
+  # subset, and are reported as their own row (val_subset_gold/..., val_full_gold/...). null: no gold row.
+  gold_set: null
   # zslab: validation is slab_count contiguous runs of sections spaced evenly through each volume, together about
   # (1 - train_split) of its examples, with guard_sections sections on each side of every slab used by neither
   # side. Adjacent sections and overlapping crop windows then never cross the split.
@@ -250,6 +309,29 @@ data:
     slab_count: 5
     guard_sections: 1
   split_name: zslab_v1
+  # PROJECTED ADJACENT SEEDS NEED BOTH OF THESE SET: registration_root (the volume share, /storage4) AND
+  # corrections_root (a directory holding <DB>/<stos group>/ correction sets; the correction set names the stos group
+  # and the VikingXML). The trainer compose file (docker/compose.cursor-dev.yaml) bind-mounts the correction service's
+  # folder read-only at /corrections (host path SAM2_CORRECTIONS_HOST), so both are set by default. In a container
+  # created before that mount existed, or with either value null or pointing at a missing folder, every volume falls
+  # back to the centroid placement, the run prints the centroid-fallback warning (and the start-up line
+  # "adjacent_poly_seed: projected for [...] / centroid fallback for [...]"), and adjacent seeds are rare.
+  # Registration data that carries adjacent-section outlines into the target's mosaic (prompt.adjacent_poly.placement
+  # projected; sam2_segmentation_trainer/data/projection.py). Read-only. null or missing: not available, so every
+  # volume falls back to the centroid placement with a warning.
+  # registration_root: one folder per volume with its VikingXML and stos files, the volume server's Data/Volumes
+  #   share (mounted in the trainer container at /storage4 by mount-network-shares.sh): <root>/<VOL>/<VikingXML>.
+  # corrections_root: the section-correction service's published residual fields, <root>/<VOL>/<stos group>/
+  #   manifest.json + <z>.vfield.npz. The manifest names the stos group and the VikingXML (volume_url), and its
+  #   provenance is recorded in training_data.json (adjacent_projection). Bind-mounted read-only from
+  #   \\wsl.localhost\Ubuntu\srv\viking\section-correction\corrections (WSL /srv/viking/section-correction/corrections)
+  #   to /corrections. A volume with no correction set, or a chained stos group (RC1 grid16), keeps centroid.
+  registration_root: /storage4
+  corrections_root: /corrections
+  # Residual correction on top of the stos: auto applies it to a volume only when it lowers the median distance from
+  # each linked neighbour's carried centroid to its target's (checked at load; on set v3 it does for RPC1 and RPC2,
+  # not for RC2, whose published field moves points about 180 px away from the links); on / off force it.
+  adjacent_residual: auto
   # location mode only. false: 90/10 inside each volume, using every usable sample.
   # true: also cap every volume to the smallest volume's count.
   even_per_volume: false
@@ -261,13 +343,14 @@ model:
   # Train the prompt encoder's mask_downscaling network (about 4.7K parameters) so it learns the continuous
   # seed / correction / negative mask prompt. Only applies with prompt.enabled. Changing it needs -refresh, not resume.
   unfreeze_mask_cnn: true
-  # Off: with batch 2 it is 15.5% faster per sample than checkpointing at batch 4 (0.276 vs 0.327 s, see
-  # training.batch_size) and peaks at 14.8 GB of 22.5. Checkpointing half of the blocks at batch 4 measured 0.296 s
-  # per sample at 15.6 GB; a quarter thrashed the allocator at 20.5 GB (0.75 s per sample). On a smaller card turn
-  # it back on (and use batch 4).
+  # Off at batch 2: 20% faster per sample than a quarter of the blocks checkpointed, but leaves under 1 GB of the card
+  # free beside the segmentation server (see training.batch_size for the Oct 27 2026 measurements). If other GPU work
+  # must run alongside training, turn it on with activation_checkpointing_fraction 0.25 (2.7 GB free). Older figures
+  # (3 variants, GPU to itself): batch 2 without checkpointing 0.276 s per sample at 14.8 GB; batch 4 with half the
+  # blocks checkpointed 0.296 s at 15.6 GB, a quarter thrashed the allocator at 20.5 GB (0.75 s per sample).
   activation_checkpointing: false
   # Share of the 48 Hiera blocks that are checkpointed (spread evenly through the trunk) when activation
-  # checkpointing is on. 1.0 = all.
+  # checkpointing is on. 1.0 = all; 0.25 is the setting measured at batch 2 above.
   activation_checkpointing_fraction: 1.0
 
 # Corrective-click training, as in SAM 2: a share of the batches predict, sample a click from where the
@@ -286,7 +369,7 @@ eval:
   # leak, merge rate, spill and fragmentation (see val:), with tolerant IoU and boundary F1 at 10 and 20 px as
   # diagnostics:
   #   circle_mask   the inscribed circle as a seed (what production starts from)
-  #   correction    a grown, scaled, warped or simplified true mask; also scored on its input mask, with the change
+  #   correction    a grown, eroded, scaled, warped or simplified true mask; also scored on its input mask, with the change
   #   near_correct  a good human trace (5-12 px wobble plus local excursions up to 30 px): "do no harm", the share
   #                 of samples whose core recall drops at most 0.5 points and whose spill rises at most 0.5%
   #   point         one foreground point at the deepest interior pixel
@@ -317,8 +400,10 @@ val:
   metric_threads: 4
   # Every epoch validates a fixed subset: this share of each volume, drawn once from the run seed and stratified by
   # volume, always holding every Approved sample, without the legacy centroid family. The best checkpoint and early
-  # stopping use it. 1.0 validates the whole split every epoch.
-  epoch_subset: 0.25
+  # stopping use it. 1.0 validates the whole split every epoch. 0.10 (about 2,700 samples on validation set v5)
+  # measures IoU within ±0.006 and core recall within ±0.004 of the whole split at the 95th percentile, at about
+  # 40% of the 0.25 subset's time (2026-10-20 study, see training.early_stopping_*_delta).
+  epoch_subset: 0.10
   # The full split, centroid included, runs every this many epochs and after the last (and before an early stop).
   # Its results are logged apart (val_full/*; the subset is val_subset/*), and its subset share is what selects.
   full_every_n_epochs: 3

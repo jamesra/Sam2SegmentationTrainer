@@ -44,9 +44,10 @@ def _square(size: int, lo: int, hi: int, lo2: int | None = None, hi2: int | None
 
 
 def _cfg(**extra) -> PromptConfig:
-    # Only the circle seed (variant 0) and points, so every draw is a known family.
+    # Only the plain circle seed and points, so every draw is a known family.
     base = dict(
-        prob_circle_seed=0.5, prob_points_only=0.5, prob_adjacent_seed=0.0, prob_box_only=0.0,
+        prob_circle_seed=0.5, prob_circle_annotator=0.0, prob_circle_pull_through=0.0,
+        prob_points_only=0.5, prob_adjacent_poly_seed=0.0, prob_box_only=0.0,
         prob_box_points=0.0, prob_subset_seed=0.0, prob_correction=0.0, prob_near_correct=0.0,
         bg_point_prob_circle=1.0, bg_point_prob_polygon=1.0,
     )
@@ -226,13 +227,12 @@ class DatasetDropoutTests(unittest.TestCase):
                 if item["sample_meta"].has_negatives and len(item["variants"]) > 1:
                     yield item
 
-    def test_variant_zero_keeps_its_negatives_and_the_others_lose_them(self) -> None:
+    def test_every_training_variant_can_lose_its_negatives(self) -> None:
+        # No variant is a fixed production prompt, so the first variant drops its context like the others.
         cfg = _cfg(context_dropout=1.0, variants_per_sample=3)
         seen = 0
         for item in self._items_with_negatives(self._dataset(cfg)):
-            first, *others = item["variants"]
-            self.assertLess(float(first["dense_mask"].min()), -1.0)  # variant 0 is the production prompt
-            for variant in others:
+            for variant in item["variants"]:
                 dense = variant["dense_mask"]
                 self.assertTrue(dense is None or float(dense.min()) >= 0.0)
                 self.assertTrue((variant["point_label"] == 1).all())

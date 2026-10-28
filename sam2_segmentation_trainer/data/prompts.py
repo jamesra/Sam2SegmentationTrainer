@@ -36,10 +36,11 @@ from annotation_crops.prompt_encoding import (
 )
 from sam2_segmentation_trainer.data.refine import (
     correction_mask,
-    fit_adjacent_seed,
+    fit_adjacent_poly_seed,
     near_correct_mask,
     subset_seed,
 )
+from sam2_segmentation_trainer.data.shapes import ADJACENT_PLACEMENTS
 
 __all__ = ["LOW_RES"]
 
@@ -57,17 +58,28 @@ class PromptType(str, Enum):
     BOX = "box"
     BOX_POINTS = "box_points"
     CIRCLE_SEED = "circle_seed"
-    ADJACENT_SEED = "adjacent_seed"
+    CIRCLE_ANNOTATOR = "circle_annotator"
+    CIRCLE_PULL_THROUGH = "circle_pull_through"
+    ADJACENT_POLY_SEED = "adjacent_poly_seed"
     SUBSET_SEED = "subset_seed"
     CORRECTION = "correction"
     NEAR_CORRECT = "near_correct"
 
 
-SEED_PROMPTS = frozenset({PromptType.CIRCLE_SEED, PromptType.ADJACENT_SEED, PromptType.SUBSET_SEED})
+CIRCLE_PROMPT_TYPES = (PromptType.CIRCLE_SEED, PromptType.CIRCLE_ANNOTATOR, PromptType.CIRCLE_PULL_THROUGH)
+"""The three peer circle-seed families, in mix order: the plain circle (the tile's circle or the inscribed one x
+``circle_diameter_scale``), an annotator-like circle (:func:`annotator_circle`) and a circle drawn across the cell edge
+(:func:`pull_through_circle`). Each has its own ``prob_*`` share; a circle that cannot be drawn falls back to the plain
+one and is reported as ``circle_seed``."""
+
+SEED_PROMPTS = frozenset({*CIRCLE_PROMPT_TYPES, PromptType.ADJACENT_POLY_SEED, PromptType.SUBSET_SEED})
 """Families whose dense mask is a trusted seed (the mask-containment loss applies to their core)."""
 
-FULL_TILE_PROMPTS = frozenset({PromptType.POINTS, PromptType.CIRCLE_SEED})
-"""Prompt types a fully masked tile may draw: it has no edge to refine, so no box, correction or cut seed."""
+FULL_TILE_PROMPTS = frozenset({PromptType.POINTS, PromptType.CIRCLE_SEED, PromptType.CIRCLE_ANNOTATOR})
+"""Prompt types a fully masked tile may draw: it has no edge to refine, so no box, correction or cut seed. No
+pull-through circle either: there is no edge to cross, so it would always fall back to the plain circle and decode
+the circle_seed prompt a second time. Its share moves to the other full-tile families, and with
+``variants_per_sample`` above three the shortfall rule stops the plan at three variants."""
 
 
 def _pair(value: Any) -> tuple[float, float]:
@@ -81,12 +93,10 @@ class CircleSeedJitter:
 
     Annotators draw circles that are smaller than the inscribed circle and often off its centre
     (docs/circle_annotator_spec.md). :func:`annotator_circle` draws one: a centre at a random depth and a random
-    radius. ``prob`` is the share of *training* circle seeds replaced by one; the ``circle_annotator`` validation
-    family ignores it and always draws one.
+    radius. Training draws one when the mix picks ``circle_annotator`` (``prompt.prob_circle_annotator``); the
+    ``circle_annotator`` validation family always draws one.
     """
 
-    prob: float = 0.7
-    """Share of training circle seeds replaced by an annotator-like circle. 0 disables it and draws nothing."""
     depth_range: tuple[float, float] = (0.3, 1.0)
     """Centre depth as a fraction of the target's maximum depth (1 is the deepest point, 0 the edge)."""
     scale_range: tuple[float, float] = (0.45, 1.0)
@@ -96,10 +106,12 @@ class CircleSeedJitter:
     min_radius_px: float = 6.0
     """A smaller circle falls back to the inscribed seed."""
 
-    _KEYS = ("prob", "depth_range", "scale_range", "fit_grow_px", "min_radius_px")
+    _KEYS = ("depth_range", "scale_range", "fit_grow_px", "min_radius_px")
+    _RETIRED_KEYS = ("prob",)
+    """Keys an older config may still carry; ignored. ``prob`` was the share of training circle seeds replaced by an
+    annotator-like circle, before ``circle_annotator`` became a prompt type with its own ``prob_circle_annotator``."""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "prob", float(self.prob))
         object.__setattr__(self, "depth_range", _pair(self.depth_range))
         object.__setattr__(self, "scale_range", _pair(self.scale_range))
         object.__setattr__(self, "fit_grow_px", float(self.fit_grow_px))
@@ -108,8 +120,6 @@ class CircleSeedJitter:
 
     def validate(self) -> None:
         """Raise ValueError when a value is outside its range (``prompt.circle_seed_jitter.*``)."""
-        if not 0.0 <= self.prob <= 1.0:
-            raise ValueError(f"prompt.circle_seed_jitter.prob must be within [0, 1], got {self.prob}")
         low, high = self.depth_range
         if not 0.0 < low <= high <= 1.0:
             raise ValueError(f"prompt.circle_seed_jitter.depth_range must satisfy 0 < low <= high <= 1, got {self.depth_range}")
@@ -123,10 +133,11 @@ class CircleSeedJitter:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any] | None) -> "CircleSeedJitter":
-        """From a config mapping; a missing key keeps its default, None gives the defaults, an unknown key is refused."""
+        """From a config mapping; a missing key keeps its default, None gives the defaults, a retired key (``prob``)
+        is ignored and any other unknown key is refused."""
         if not values:
             return cls()
-        unknown = [key for key in values if key not in cls._KEYS]
+        unknown = [key for key in values if key not in cls._KEYS and key not in cls._RETIRED_KEYS]
         if unknown:
             raise ValueError(f"unknown prompt.circle_seed_jitter key(s) {unknown}; choose from {list(cls._KEYS)}")
         return cls(**{key: values[key] for key in cls._KEYS if key in values})
@@ -136,29 +147,150 @@ DEFAULT_CIRCLE_SEED_JITTER = CircleSeedJitter()
 
 
 @dataclass(frozen=True, slots=True)
+class CirclePullThrough:
+    """An annotator circle drawn across the cell edge (``prompt.circle_pull_through``).
+
+    :func:`pull_through_circle` draws a disc that crosses the target boundary with most of it inside. The model
+    learns to ignore the part outside the cell and to grow the mask from the larger, inside part to the whole cell.
+    Training draws one when the mix picks ``circle_pull_through`` (``prompt.prob_circle_pull_through``); these keys
+    only shape the disc (docs/circle_annotator_spec.md, "Pull-through circles").
+    """
+
+    overlap_min: float = 0.60
+    """At least this fraction of the disc's area lies inside the target."""
+    outside_min: float = 0.05
+    """At least this fraction of the disc's area lies outside the target (the disc really crosses the edge)."""
+    radius_range: tuple[float, float] = (0.4, 0.9)
+    """Radius as a fraction of the target's maximum depth."""
+    min_radius_px: float = 6.0
+    """Floor on the radius: a smaller drawn radius is raised to this."""
+    max_tries: int = 20
+    """Radius-and-centre draws tried before giving up (the caller then keeps the normal circle)."""
+
+    _KEYS = ("overlap_min", "outside_min", "radius_range", "min_radius_px", "max_tries")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "overlap_min", float(self.overlap_min))
+        object.__setattr__(self, "outside_min", float(self.outside_min))
+        object.__setattr__(self, "radius_range", _pair(self.radius_range))
+        object.__setattr__(self, "min_radius_px", float(self.min_radius_px))
+        object.__setattr__(self, "max_tries", int(self.max_tries))
+        self.validate()
+
+    def validate(self) -> None:
+        """Raise ValueError when a value is outside its range (``prompt.circle_pull_through.*``)."""
+        if not 0.0 < self.overlap_min <= 1.0:
+            raise ValueError(f"prompt.circle_pull_through.overlap_min must be within (0, 1], got {self.overlap_min}")
+        if not 0.0 <= self.outside_min < 1.0:
+            raise ValueError(f"prompt.circle_pull_through.outside_min must be within [0, 1), got {self.outside_min}")
+        if self.overlap_min + self.outside_min > 1.0 + 1e-9:
+            raise ValueError(
+                "prompt.circle_pull_through.overlap_min + outside_min must be <= 1, "
+                f"got {self.overlap_min} + {self.outside_min}"
+            )
+        low, high = self.radius_range
+        if not 0.0 < low <= high:
+            raise ValueError(f"prompt.circle_pull_through.radius_range must satisfy 0 < low <= high, got {self.radius_range}")
+        if not self.min_radius_px >= 1.0:
+            raise ValueError(f"prompt.circle_pull_through.min_radius_px must be >= 1, got {self.min_radius_px}")
+        if self.max_tries < 1:
+            raise ValueError(f"prompt.circle_pull_through.max_tries must be >= 1, got {self.max_tries}")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "CirclePullThrough":
+        """From a config mapping; a missing key keeps its default, None gives the defaults, an unknown key is refused."""
+        if not values:
+            return cls()
+        unknown = [key for key in values if key not in cls._KEYS]
+        if unknown:
+            raise ValueError(f"unknown prompt.circle_pull_through key(s) {unknown}; choose from {list(cls._KEYS)}")
+        return cls(**{key: values[key] for key in cls._KEYS if key in values})
+
+
+DEFAULT_CIRCLE_PULL_THROUGH = CirclePullThrough()
+
+
+@dataclass(frozen=True, slots=True)
+class AdjacentPoly:
+    """How the adjacent-section polygon seed is placed and when it counts (``prompt.adjacent_poly``).
+
+    With ``placement: projected`` the linked neighbour outline is carried through the volume's registration into the
+    target's mosaic (:mod:`sam2_segmentation_trainer.data.projection`), eroded by ``U(erode_px)`` pixels and used where
+    it lands, as the pull-through circle is: it counts only when at least ``overlap_min`` of its area in the tile lies
+    on the target mask; otherwise the variant is drawn again from the other families (``train/prompt_fallback``).
+    A volume without registration data falls back to ``centroid`` (the outline is fitted inside the cell by
+    ``prompt.adjacent_fit_*``).
+    """
+
+    placement: str = "projected"
+    """``projected`` (the default), ``centroid`` (shape only, fitted inside the cell) or ``raw`` (a test hook)."""
+    overlap_min: float = 0.60
+    """At least this fraction of the eroded outline's area in the tile lies on the target mask."""
+    erode_px: tuple[float, float] = (0.0, 10.0)
+    """The carried-forward outline is eroded by ``U(erode_px)`` pixels before the overlap test (capped at 0.6 of its
+    own depth so it cannot vanish)."""
+
+    _KEYS = ("placement", "overlap_min", "erode_px")
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "placement", str(self.placement))
+        object.__setattr__(self, "overlap_min", float(self.overlap_min))
+        object.__setattr__(self, "erode_px", _pair(self.erode_px))
+        self.validate()
+
+    def validate(self) -> None:
+        """Raise ValueError when a value is outside its range (``prompt.adjacent_poly.*``)."""
+        if self.placement not in ADJACENT_PLACEMENTS:
+            raise ValueError(f"prompt.adjacent_poly.placement must be one of {ADJACENT_PLACEMENTS}, got {self.placement!r}")
+        if not 0.0 < self.overlap_min <= 1.0:
+            raise ValueError(f"prompt.adjacent_poly.overlap_min must be within (0, 1], got {self.overlap_min}")
+        low, high = self.erode_px
+        if not 0.0 <= low <= high:
+            raise ValueError(f"prompt.adjacent_poly.erode_px must satisfy 0 <= low <= high, got {self.erode_px}")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any] | None) -> "AdjacentPoly":
+        """From a config mapping; a missing key keeps its default, None gives the defaults, an unknown key is refused."""
+        if not values:
+            return cls()
+        unknown = [key for key in values if key not in cls._KEYS]
+        if unknown:
+            raise ValueError(f"unknown prompt.adjacent_poly key(s) {unknown}; choose from {list(cls._KEYS)}")
+        return cls(**{key: values[key] for key in cls._KEYS if key in values})
+
+
+DEFAULT_ADJACENT_POLY = AdjacentPoly()
+
+
+@dataclass(frozen=True, slots=True)
 class PromptConfig:
     """Sampling settings from the ``prompt:`` and ``negative:`` sections of the training config."""
 
     prob_points_only: float = 0.10
     prob_box_only: float = 0.05
     prob_box_points: float = 0.05
-    prob_circle_seed: float = 0.40
-    prob_adjacent_seed: float = 0.15
-    prob_subset_seed: float = 0.10
+    prob_circle_seed: float = 0.10
+    prob_circle_annotator: float = 0.20
+    prob_circle_pull_through: float = 0.05
+    prob_adjacent_poly_seed: float = 0.15
+    prob_subset_seed: float = 0.15
     prob_correction: float = 0.10
     prob_near_correct: float = 0.05
-    variants_per_sample: int = 3
+    variants_per_sample: int = 4
     edge_tau_px: float = EDGE_TAU_PX
     edge_tau_depth_frac: float = EDGE_TAU_DEPTH_FRAC
     seed_logit: float = SEED_LOGIT
     correction_logit: float = CORRECTION_LOGIT
     circle_annotation_trust: CircleAnnotationTrust = DEFAULT_CIRCLE_TRUST
     circle_seed_jitter: CircleSeedJitter = DEFAULT_CIRCLE_SEED_JITTER
+    circle_pull_through: CirclePullThrough = DEFAULT_CIRCLE_PULL_THROUGH
+    adjacent_poly: AdjacentPoly = DEFAULT_ADJACENT_POLY
     adjacent_fit_inside: float = 0.98
     adjacent_fit_grow_px: float = 10.0
     adjacent_scale_range: tuple[float, float] = (0.7, 1.0)
     erode_px: tuple[float, float] = (10.0, 40.0)
     dilate_px: tuple[float, float] = (5.0, 50.0)
+    shrink_px: tuple[float, float] = (5.0, 50.0)
     scale_range: tuple[float, float] = (0.8, 1.25)
     correction_wobble_px: tuple[float, float] = (10.0, 20.0)
     near_correct_wobble_px: tuple[float, float] = (5.0, 12.0)
@@ -184,11 +316,18 @@ class PromptConfig:
             PromptType.BOX: self.prob_box_only,
             PromptType.BOX_POINTS: self.prob_box_points,
             PromptType.CIRCLE_SEED: self.prob_circle_seed,
-            PromptType.ADJACENT_SEED: self.prob_adjacent_seed,
+            PromptType.CIRCLE_ANNOTATOR: self.prob_circle_annotator,
+            PromptType.CIRCLE_PULL_THROUGH: self.prob_circle_pull_through,
+            PromptType.ADJACENT_POLY_SEED: self.prob_adjacent_poly_seed,
             PromptType.SUBSET_SEED: self.prob_subset_seed,
             PromptType.CORRECTION: self.prob_correction,
             PromptType.NEAR_CORRECT: self.prob_near_correct,
         }
+
+    def circle_share(self) -> float:
+        """Total share of the three circle peers (:data:`CIRCLE_PROMPT_TYPES`)."""
+        probs = self.probabilities()
+        return sum(probs[kind] for kind in CIRCLE_PROMPT_TYPES)
 
     def validate(self) -> None:
         """Raise ValueError when probabilities are negative or do not sum to 1, or a range is inverted."""
@@ -205,6 +344,8 @@ class PromptConfig:
         if self.variants_per_sample < 1:
             raise ValueError("prompt.variants_per_sample must be >= 1")
         self.circle_seed_jitter.validate()
+        self.circle_pull_through.validate()
+        self.adjacent_poly.validate()
         if self.edge_tau_px < 0.0:
             raise ValueError("prompt.edge_tau_px must be >= 0 (0 disables the edge curve)")
         if self.seed_logit <= 0.0 or self.correction_logit <= 0.0:
@@ -219,6 +360,7 @@ class PromptConfig:
             "adjacent_scale_range",
             "erode_px",
             "dilate_px",
+            "shrink_px",
             "scale_range",
             "correction_wobble_px",
             "near_correct_wobble_px",
@@ -261,6 +403,10 @@ class PromptConfig:
                 kwargs[name] = CircleAnnotationTrust.from_mapping(raw)  # raises on full_frac >= zero_frac
             elif isinstance(default, CircleSeedJitter):
                 kwargs[name] = CircleSeedJitter.from_mapping(raw)  # raises on an inverted range or an unknown key
+            elif isinstance(default, CirclePullThrough):
+                kwargs[name] = CirclePullThrough.from_mapping(raw)  # raises on a value out of range or an unknown key
+            elif isinstance(default, AdjacentPoly):
+                kwargs[name] = AdjacentPoly.from_mapping(raw)  # raises on a value out of range or an unknown key
             elif isinstance(default, tuple):
                 kwargs[name] = _pair(raw)
             elif isinstance(default, bool):
@@ -422,6 +568,78 @@ def annotator_circle(
 _CENTRE_DEPTH_TOLERANCE = 0.05
 """How far, as a fraction of the maximum depth, a candidate centre's depth may be from the drawn depth."""
 
+PULL_THROUGH_CENTRE_DEPTH = (0.25, 0.9)
+"""A pull-through circle's centre is a target pixel whose depth lies in this range times the radius, so the disc
+reaches past the nearest edge (depth < radius) without being mostly outside (depth well above zero)."""
+
+
+def _disc_counts(mask: np.ndarray, row: int, col: int, radius: float) -> tuple[int, int]:
+    """(pixels of the disc in the tile, of those inside ``mask``) for the disc :func:`rasterize_circle` draws at the
+    centre of pixel (row, col), counted in a window around it with the same float32 arithmetic, so the counts are the
+    full raster's."""
+    height, width = mask.shape
+    reach = int(np.ceil(radius)) + 1
+    r0, r1 = max(0, row - reach), min(height, row + reach + 1)
+    c0, c1 = max(0, col - reach), min(width, col + reach + 1)
+    xs = np.arange(c0, c1, dtype=np.float32) + np.float32(0.5)
+    ys = np.arange(r0, r1, dtype=np.float32) + np.float32(0.5)
+    dx2 = (xs - np.float32(col + 0.5)) ** 2
+    dy2 = (ys - np.float32(row + 0.5)) ** 2
+    disc = (dy2[:, None] + dx2[None, :]) <= np.float32(radius) ** 2
+    return int(disc.sum()), int((disc & mask[r0:r1, c0:c1]).sum())
+
+
+def pull_through_circle(
+    target: np.ndarray,
+    rng: np.random.Generator,
+    cfg: CirclePullThrough,
+    depth: np.ndarray | None = None,
+    info: dict | None = None,
+) -> np.ndarray | None:
+    """Boolean disc for a circle drawn across the edge of the boolean ``target``, or None (the caller keeps the normal
+    circle).
+
+    The disc is not clipped to the target: at least ``cfg.overlap_min`` of its area lies inside the target and at
+    least ``cfg.outside_min`` outside (areas are pixels of the disc inside the tile). Each try draws, in this fixed
+    order, the radius ``U(cfg.radius_range) * D`` (D the target's maximum depth, raised to ``cfg.min_radius_px``), then
+    a centre among target pixels whose depth lies in ``PULL_THROUGH_CENTRE_DEPTH`` times the radius (no centre draw
+    when there is none). Up to ``cfg.max_tries`` tries; the first disc that meets both fractions is returned. Tests
+    pin the order; do not reorder it. Depth counts the tile edge as background, like :func:`annotator_circle`.
+
+    ``depth`` is :func:`target_depth` of ``target`` when the caller already has it. ``info``, when given, is filled
+    for the returned disc with ``row``/``col`` of the centre, ``radius``, ``depth_at_centre``, ``max_depth``,
+    ``overlap`` (fraction of the disc inside the target) and ``tries``; it is left unchanged when None is returned.
+    """
+    mask = np.asarray(target, dtype=bool)
+    if not mask.any():
+        return None
+    if depth is None:
+        depth = _padded_depth(mask)
+    deepest = float(depth.max())
+    if deepest <= 0.0:
+        return None
+    low, high = PULL_THROUGH_CENTRE_DEPTH
+    pixels = np.flatnonzero(mask.ravel())  # target pixels in raster order, and their depths
+    pixel_depth = depth.ravel()[pixels]
+    for attempt in range(1, cfg.max_tries + 1):
+        radius = max(float(rng.uniform(cfg.radius_range[0], cfg.radius_range[1])) * deepest, cfg.min_radius_px)
+        candidates = pixels[(pixel_depth >= low * radius) & (pixel_depth <= high * radius)]
+        if candidates.size == 0:
+            continue
+        row, col = divmod(int(candidates[rng.integers(candidates.size)]), mask.shape[1])
+        area, inside = _disc_counts(mask, row, col, radius)
+        if area == 0:
+            continue
+        overlap = inside / area
+        if overlap >= cfg.overlap_min and 1.0 - overlap >= cfg.outside_min:
+            if info is not None:
+                info.update(
+                    row=row, col=col, radius=radius, depth_at_centre=float(depth[row, col]), max_depth=deepest,
+                    overlap=float(overlap), tries=attempt,
+                )
+            return rasterize_circle(mask.shape, col + 0.5, row + 0.5, radius)
+    return None
+
 
 def interior_point_xy(mask: np.ndarray) -> tuple[float, float] | None:
     """The deepest interior pixel of a boolean mask as (x, y), or None for an empty mask.
@@ -484,24 +702,32 @@ def choose_prompt_type(
     rng: np.random.Generator,
     *,
     can_circle_seed: bool = True,
-    can_adjacent_seed: bool = False,
+    can_adjacent_poly_seed: bool = False,
     allowed: Collection[PromptType] | None = None,
     exclude: Collection[PromptType] = (),
 ) -> PromptType:
     """Draw a prompt type, dropping types the sample cannot support and renormalizing the rest.
 
-    ``circle_seed`` needs a circle; ``adjacent_seed`` needs a linked polygon from a neighbouring section. While
-    no adjacent shape is available its probability moves to the circle seed, as the plan says. With ``allowed``
-    every other type is dropped too (fully masked tiles use only points and circle seeds), and ``exclude`` drops
-    types already drawn for another variant of the same sample. If nothing is left the sample gets a points
-    prompt when that is allowed, else a circle seed.
+    The circle seeds (:data:`CIRCLE_PROMPT_TYPES`) need a circle; ``adjacent_poly_seed`` needs a linked polygon from
+    a neighbouring section. While no adjacent shape is available its probability moves to the circle seeds, as the
+    plan says, split among the three peers in proportion to their shares (all to ``circle_seed`` when they are all
+    0). With ``allowed`` every other type is dropped too (fully masked tiles use only points and circle seeds), and
+    ``exclude`` drops types already drawn for another variant of the same sample. If nothing is left the sample gets
+    a points prompt when that is allowed, else a circle seed.
     """
     weights = dict(cfg.probabilities())
-    if not can_adjacent_seed:
-        weights[PromptType.CIRCLE_SEED] += weights[PromptType.ADJACENT_SEED]
-        weights[PromptType.ADJACENT_SEED] = 0.0
+    if not can_adjacent_poly_seed:
+        moved = weights[PromptType.ADJACENT_POLY_SEED]
+        weights[PromptType.ADJACENT_POLY_SEED] = 0.0
+        circles = sum(weights[kind] for kind in CIRCLE_PROMPT_TYPES)
+        if circles > 0.0:
+            for kind in CIRCLE_PROMPT_TYPES:
+                weights[kind] += moved * weights[kind] / circles
+        else:
+            weights[PromptType.CIRCLE_SEED] += moved
     if not can_circle_seed:
-        weights[PromptType.CIRCLE_SEED] = 0.0
+        for kind in CIRCLE_PROMPT_TYPES:
+            weights[kind] = 0.0
     for kind in weights:
         if kind in exclude or (allowed is not None and kind not in allowed):
             weights[kind] = 0.0
@@ -590,13 +816,18 @@ def build_prompt(
     adjacent_shape: np.ndarray | None = None,
     negative_canvases: list[NegativeCanvas] | None = None,
     negative_dropout: bool = False,
+    adjacent_placed: bool = False,
 ) -> PromptSample:
     """Assemble the prompt for one sample from augmented masks.
 
     ``target_mask`` is the ground truth (boolean); every family is trained against it. ``circle_mask`` is the
-    target's circle, required for :attr:`PromptType.CIRCLE_SEED`. ``adjacent_shape`` is a boolean raster of the
-    linked polygon from a neighbouring section (any frame), for :attr:`PromptType.ADJACENT_SEED`; a shape that
-    cannot be fitted inside the cell falls back to the circle seed. ``regions`` are the other annotations in the
+    target's circle, required for the circle seeds (:data:`CIRCLE_PROMPT_TYPES`: the caller draws the annotator-like
+    or pull-through disc and passes it here; all three build the same seed prompt from it). ``adjacent_shape`` is a boolean raster of the
+    linked polygon from a neighbouring section, for :attr:`PromptType.ADJACENT_POLY_SEED`. With ``adjacent_placed``
+    it is already where the seed goes (the projected, eroded outline that passed ``prompt.adjacent_poly.overlap_min``)
+    and is used as it is, not clipped to the target; otherwise (the centroid fallback, any frame) it is scaled to fit
+    inside the cell by :func:`fit_adjacent_poly_seed`. A shape that is empty or cannot be fitted falls back to the
+    circle seed. ``regions`` are the other annotations in the
     tile. Whatever the type, the negatives ride along: as a negative area in the dense mask and, per the
     configured probabilities, as background points. A neighbor merged into a mask to correct is left out of the
     negative area, otherwise the prompt would label the error. With no negatives and no dense foreground the
@@ -605,7 +836,7 @@ def build_prompt(
     ``negative_canvases`` are :func:`negative_region_canvases` of ``regions``, computed once by a caller that
     builds several variants of one sample; they save an edge distance transform per region and variant.
 
-    ``negative_dropout`` (training variants after the first) applies ``negative.context_dropout`` and
+    ``negative_dropout`` (every training variant) applies ``negative.context_dropout`` and
     ``negative.region_dropout``: the dense negative area and the background points use only the regions that
     survive (:func:`kept_negative_indices`, drawn from ``rng`` after the family's own draws). A mask to correct can
     still merge a dropped neighbor, and the seed's containment weight still treats every neighbor as a negative.
@@ -619,9 +850,11 @@ def build_prompt(
     merged_region: NegativeRegion | None = None
     box: np.ndarray | None = None
 
-    if prompt_type is PromptType.ADJACENT_SEED:
-        if adjacent_shape is not None:
-            seed = fit_adjacent_seed(
+    if prompt_type is PromptType.ADJACENT_POLY_SEED:
+        if adjacent_shape is not None and adjacent_placed:
+            seed = np.asarray(adjacent_shape, dtype=bool)
+        elif adjacent_shape is not None:
+            seed = fit_adjacent_poly_seed(
                 adjacent_shape,
                 target_mask,
                 rng,
@@ -642,14 +875,21 @@ def build_prompt(
         count = int(rng.integers(1, cfg.box_points_max + 1))
         points = sample_points_in_mask(target_mask, count, rng, **kwargs)
         box = jittered_box(target_mask, rng, cfg.box_jitter_frac)
-    elif prompt_type is PromptType.CIRCLE_SEED:
+    elif prompt_type in CIRCLE_PROMPT_TYPES:
         if circle_mask is None or not circle_mask.any():
-            raise ValueError("circle_seed prompt needs a non-empty circle mask")
+            raise ValueError(f"{prompt_type.value} prompt needs a non-empty circle mask")
         seed = circle_mask.astype(bool)
         ys, xs = np.nonzero(seed)
         points = np.array([[xs.mean(), ys.mean()]], dtype=np.float32)
-    elif prompt_type is PromptType.ADJACENT_SEED:
-        points = sample_points_in_mask(seed, 1, rng, **kwargs)
+    elif prompt_type is PromptType.ADJACENT_POLY_SEED:
+        # A placed (projected) seed is not clipped to the target and may stick out of it, so its click is taken from
+        # the part on the target (the seed itself when none is). A fitted seed lies inside the cell already.
+        clickable = seed
+        if adjacent_placed:
+            on_target = seed & np.asarray(target_mask, dtype=bool)
+            if on_target.any():
+                clickable = on_target
+        points = sample_points_in_mask(clickable, 1, rng, **kwargs)
     elif prompt_type is PromptType.SUBSET_SEED:
         seed = subset_seed(target_mask, rng, erode_px=cfg.erode_px)
         points = sample_points_in_mask(seed, 1, rng, **kwargs)
@@ -661,6 +901,7 @@ def build_prompt(
                 rng,
                 neighbors=[r.mask for r in polygons],
                 dilate_px=cfg.dilate_px,
+                shrink_px=cfg.shrink_px,
                 scale_range=cfg.scale_range,
                 polygon_tolerance=cfg.corrupt_polygon_tolerance,
                 max_shift_px=cfg.corrupt_max_shift_px,
@@ -716,8 +957,9 @@ def build_prompt(
         if negatives:
             weight = weight * ~np.any(np.stack(negatives), axis=0)
         # The containment loss asks the model to call the trusted seed core object. Where the seed reaches past the
-        # ground truth (an annotator-like circle may, by up to fit_grow_px) that would contradict the label, so the
-        # trust counts only where the seed overlaps the target. The prompt itself is not clipped.
+        # ground truth (an annotator-like circle may, by up to fit_grow_px; a pull-through circle does by design) that
+        # would contradict the label, so the trust counts only where the seed overlaps the target. The prompt itself is
+        # not clipped.
         weight = weight * np.asarray(target_mask, dtype=bool)
         if not weight.any():
             weight = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 from scipy.ndimage import binary_erosion, distance_transform_edt, label
@@ -10,7 +11,7 @@ from sam2_segmentation_trainer.data.refine import (
     SUBSET_KINDS,
     _depth,
     correction_mask,
-    fit_adjacent_seed,
+    fit_adjacent_poly_seed,
     grow_mask,
     local_excursions,
     near_correct_mask,
@@ -93,7 +94,28 @@ class CorrectionTests(unittest.TestCase):
             for s in range(100)
         )
         self.assertGreater(merged_seen, 5)
-        self.assertEqual(len(CORRECTION_KINDS), 5)
+        self.assertEqual(len(CORRECTION_KINDS), 6)
+
+    def test_erode_is_the_mirror_of_grow(self) -> None:
+        mask = _blob()
+        with mock.patch("sam2_segmentation_trainer.data.refine.CORRECTION_KINDS", ("erode",)):
+            for seed in range(30):
+                out, merged = correction_mask(mask, np.random.default_rng(seed), shrink_px=(5.0, 20.0))
+                self.assertIsNone(merged)
+                self.assertTrue(out.any())
+                self.assertFalse((out & ~mask).any())  # only removes pixels
+                self.assertLess(int(out.sum()), int(mask.sum()))
+                # Shrunk by at most the top of the range: nothing inside deeper than that is removed.
+                deep = distance_transform_edt(np.pad(mask, 1))[1:-1, 1:-1] > 20.0
+                self.assertTrue(out[deep].all())
+
+    def test_erode_never_empties_a_thin_mask(self) -> None:
+        mask = np.zeros((40, 80), dtype=bool)
+        mask[18:22, 5:75] = True
+        with mock.patch("sam2_segmentation_trainer.data.refine.CORRECTION_KINDS", ("erode",)):
+            for seed in range(20):
+                out, _ = correction_mask(mask, np.random.default_rng(seed), shrink_px=(30.0, 50.0))
+                self.assertTrue(out.any())
 
     def test_a_merge_prefers_neighbors_within_reach(self) -> None:
         mask = _blob()
@@ -227,7 +249,7 @@ class AdjacentSeedTests(unittest.TestCase):
         shape = np.zeros((50, 50), dtype=bool)
         shape[5:45, 20:30] = True  # a tall thin profile, in another frame
         for seed in range(10):
-            out = fit_adjacent_seed(shape, target, np.random.default_rng(seed))
+            out = fit_adjacent_poly_seed(shape, target, np.random.default_rng(seed))
             self.assertIsNotNone(out)
             # At least 98% fit inside the target grown by 10 px (the annotator fits to the visible membrane).
             grown = grow_mask(target, 10.0)
@@ -241,17 +263,17 @@ class AdjacentSeedTests(unittest.TestCase):
         shape[:, :] = True
         outside = []
         for seed in range(20):
-            out = fit_adjacent_seed(shape, target, np.random.default_rng(seed), scale_range=(1.0, 1.0))
+            out = fit_adjacent_poly_seed(shape, target, np.random.default_rng(seed), scale_range=(1.0, 1.0))
             self.assertIsNotNone(out)
             outside.append(int((out & ~target).sum()))
         self.assertGreater(max(outside), 0)
-        flat = fit_adjacent_seed(shape, target, np.random.default_rng(0), scale_range=(1.0, 1.0), grow_px=0.0)
+        flat = fit_adjacent_poly_seed(shape, target, np.random.default_rng(0), scale_range=(1.0, 1.0), grow_px=0.0)
         self.assertLess(int((flat & ~target).sum()), 0.03 * int(flat.sum()) + 1)
 
     def test_empty_shape_or_target(self) -> None:
         target = _blob()
-        self.assertIsNone(fit_adjacent_seed(np.zeros((8, 8), bool), target, np.random.default_rng(0)))
-        self.assertIsNone(fit_adjacent_seed(target, np.zeros_like(target), np.random.default_rng(0)))
+        self.assertIsNone(fit_adjacent_poly_seed(np.zeros((8, 8), bool), target, np.random.default_rng(0)))
+        self.assertIsNone(fit_adjacent_poly_seed(target, np.zeros_like(target), np.random.default_rng(0)))
 
 
 if __name__ == "__main__":

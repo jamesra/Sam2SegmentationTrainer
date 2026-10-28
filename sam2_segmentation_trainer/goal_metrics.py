@@ -18,8 +18,8 @@ band of ``b`` px (``val.core_band_px``, 10) around the traced edge:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Sequence
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from scipy.ndimage import label
@@ -218,77 +218,98 @@ def sample_no_harm(record: dict[str, Any]) -> bool:
     return bool(recall_ok and spill_ok)
 
 
-@dataclass(slots=True)
-class SelectionKey:
-    """Orders epochs for ``best_model.pt`` and early stopping (docs/mask_refinement_plan.md, section 6).
+SELECTION_METRICS: dict[str, int] = {"core_recall": 1, "iou": 1, "spill": -1, "merge_rate": -1, "frag": -1}
+"""The primary family's metrics that select ``best_model.pt`` and drive early stopping, with the direction that is
+better (+1 higher, -1 lower). ``iou`` is the tolerant IoU of ``validation.ModeResult``; the rest are
+:class:`GoalSummary` fields. The core-recall target is not a gate: the validation masks are traced annotations, not
+a checked validation set, so no single threshold on them decides."""
 
-    Among epochs whose pooled core recall reaches the target, the lowest merge rate wins, with spill breaking
-    ties. If none reaches the target, the highest core recall wins. Every epoch that reaches the target beats
-    every epoch that does not. Compare keys with ``>``.
-    """
-
-    gated: bool
-    primary: float
-    secondary: float = 0.0
-    values: tuple[float, float, float] = field(init=False)
-
-    def __post_init__(self) -> None:
-        # Rounded so float noise in the last digits does not count as an improvement and reset the patience.
-        self.values = (1.0 if self.gated else 0.0, round(self.primary, 4), round(self.secondary, 4))
-
-    def __gt__(self, other: "SelectionKey") -> bool:
-        return self.values > other.values
-
-    def to_list(self) -> list[float]:
-        return list(self.values)
-
-    @classmethod
-    def from_list(cls, values: Sequence[float]) -> "SelectionKey":
-        gate, primary, secondary = (float(v) for v in values)
-        return cls(gated=gate >= 0.5, primary=primary, secondary=secondary)
-
-
-def selection_key(summary: GoalSummary, target: float = CORE_RECALL_TARGET) -> SelectionKey:
-    """The key of one epoch from the primary family's pooled metrics."""
-    if summary.core_recall >= target:
-        return SelectionKey(True, -summary.merge_rate, -summary.spill)
-    return SelectionKey(False, summary.core_recall, 0.0)
-
-
-EARLY_STOPPING_MIN_DELTA = 0.002
-"""Default noise floor of the merge rate and spill in :func:`improves` (``training.early_stopping_min_delta``)."""
-
-RECALL_MIN_DELTA = 0.0005
-"""Core recall below the gate must improve by at least this to count as better."""
+SELECTION_FLOORS: dict[str, float] = {
+    "core_recall": 0.004,
+    "iou": 0.006,
+    "spill": 0.006,
+    "merge_rate": 0.002,
+    "frag": 0.012,
+}
+"""Default noise floor of each selection metric (``training.early_stopping_floors``): the 95th-percentile error of a
+10% subset of validation set v5 for circle_annotator, measured 2026-10-20 on v5's epoch-0 checkpoint over 200 random
+subsets (scripts/valset_size_study.py). The merge rate's measured error was 0.0008 at that model's low rate; 0.002
+leaves room for a model that merges more often."""
 
 _EPS = 1e-12
 
 
+@dataclass(slots=True)
+class SelectionKey:
+    """One epoch's selection metrics (:data:`SELECTION_METRICS`), for ``best_model.pt`` and early stopping
+    (docs/mask_refinement_plan.md, section 6). Compare keys with :func:`improves`."""
+
+    metrics: dict[str, float]
+
+    def __post_init__(self) -> None:
+        missing = [name for name in SELECTION_METRICS if name not in self.metrics]
+        if missing:
+            raise ValueError(f"selection key lacks {', '.join(missing)}")
+        # Rounded so float noise in the last digits does not count as a change.
+        self.metrics = {name: round(float(self.metrics[name]), 4) for name in SELECTION_METRICS}
+
+    def to_dict(self) -> dict[str, float]:
+        return dict(self.metrics)
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, float]) -> "SelectionKey":
+        return cls(dict(values))
+
+
+def selection_key(summary: GoalSummary, iou: float) -> SelectionKey:
+    """The key of one epoch from the primary family's pooled goal metrics and its tolerant IoU."""
+    return SelectionKey(
+        {
+            "core_recall": summary.core_recall,
+            "iou": iou,
+            "spill": summary.spill,
+            "merge_rate": summary.merge_rate,
+            "frag": summary.frag,
+        }
+    )
+
+
+def selection_changes(
+    new: SelectionKey, best: SelectionKey, floors: Mapping[str, float] = SELECTION_FLOORS
+) -> tuple[list[str], list[str]]:
+    """The metrics of ``new`` that are better and worse than ``best`` by at least their noise floor."""
+    better, worse = [], []
+    for name, sign in SELECTION_METRICS.items():
+        gain = sign * (new.metrics[name] - best.metrics[name])
+        floor = float(floors.get(name, SELECTION_FLOORS[name]))
+        if gain >= floor - _EPS:
+            better.append(name)
+        elif gain <= -floor + _EPS:
+            worse.append(name)
+    return better, worse
+
+
 def improves(
-    new: SelectionKey,
-    best: SelectionKey | None,
-    min_delta: float = EARLY_STOPPING_MIN_DELTA,
-    recall_delta: float = RECALL_MIN_DELTA,
+    new: SelectionKey, best: SelectionKey | None, floors: Mapping[str, float] = SELECTION_FLOORS
 ) -> bool:
-    """Whether ``new`` counts as better than ``best`` once the noise floor is applied.
-
-    Compare with :func:`selection_key`'s ordering, but a change smaller than the noise floor is not an
-    improvement and does not reset the patience:
-
-    * reaching the core-recall gate beats not reaching it, whatever the other numbers;
-    * both at the gate: the merge rate must fall by at least ``min_delta``; if it moves by less than that either
-      way, the spill must fall by at least ``min_delta``;
-    * both below the gate: the core recall must rise by at least ``recall_delta``.
-    """
+    """Whether ``new`` counts as better than ``best``: at least one selection metric is better by its noise floor
+    and none is worse by its noise floor. A change inside the floor is noise either way, so it neither counts nor
+    blocks. A trade (one metric better, another worse, both beyond their floors) is not an improvement."""
     if best is None:
         return True
-    if new.gated != best.gated:
-        return new.gated
-    if new.gated:
-        merge_gain = new.primary - best.primary  # the keys store the negated merge rate
-        if merge_gain >= min_delta - _EPS:
-            return True
-        if merge_gain <= -min_delta + _EPS:
-            return False
-        return (new.secondary - best.secondary) >= min_delta - _EPS
-    return (new.primary - best.primary) >= recall_delta - _EPS
+    better, worse = selection_changes(new, best, floors)
+    return bool(better) and not worse
+
+
+def describe_selection(
+    new: SelectionKey, best: SelectionKey | None, floors: Mapping[str, float] = SELECTION_FLOORS
+) -> str:
+    """One line for the log: which metrics moved beyond their noise floor against the best epoch."""
+    if best is None:
+        return "first validated epoch"
+    better, worse = selection_changes(new, best, floors)
+
+    def moved(names: list[str]) -> str:
+        return ", ".join(f"{n} {best.metrics[n]:.4f} -> {new.metrics[n]:.4f}" for n in names) or "none"
+
+    return f"against the best epoch, better beyond the noise floor: {moved(better)}; worse: {moved(worse)}"

@@ -296,6 +296,20 @@ def predict_masks_mixed(
     )
 
 
+def to_device_async(tensor: torch.Tensor, device) -> torch.Tensor:
+    """Copy ``tensor`` to ``device`` without making the CPU wait for the GPU.
+
+    A copy to the GPU from ordinary (pageable) host memory first waits for all GPU work already queued, so the
+    training loop loses its lead on the GPU and the GPU then idles while the next operations are issued. A tensor
+    built on the CPU during a step (an index list, a stack of the loader's tensors) is therefore pinned before the
+    copy, which lets the copy queue behind that work instead.
+    """
+    device = torch.device(device)
+    if device.type == "cuda" and tensor.device.type == "cpu" and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    return tensor.to(device, non_blocking=True)
+
+
 def _stack_on(masks: Sequence[torch.Tensor], device) -> torch.Tensor:
     """Stack ``[256, 256]`` mask prompts on ``device``, whichever device each one is on.
 
@@ -303,8 +317,8 @@ def _stack_on(masks: Sequence[torch.Tensor], device) -> torch.Tensor:
     CPU), and ``torch.stack`` refuses a mix. A list on one device keeps the single stack-then-copy.
     """
     if all(m.device.type == "cpu" for m in masks):
-        return torch.stack(list(masks)).to(device, non_blocking=True)
-    return torch.stack([m.to(device, non_blocking=True) for m in masks])
+        return to_device_async(torch.stack(list(masks)), device)
+    return torch.stack([to_device_async(m, device) for m in masks])
 
 
 def decode_grouped(
@@ -336,9 +350,9 @@ def decode_grouped(
     device = image_embed.device
     pieces: list[tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
     for (has_box, has_dense), members in groups.items():
-        sel = torch.tensor(members, device=device, dtype=torch.long)
+        sel = to_device_async(torch.tensor(members, dtype=torch.long), device)
         group_boxes = (
-            torch.stack([boxes[i] for i in members]).to(device, non_blocking=True) if has_box else None
+            to_device_async(torch.stack([boxes[i] for i in members]), device) if has_box else None
         )
         group_dense = (
             _stack_on([dense_masks[i] for i in members], device).unsqueeze(1)
@@ -368,7 +382,7 @@ def decode_grouped(
     iou_preds = first_iou.new_empty((batch, *first_iou.shape[1:]))
     low_res = first_low.new_empty((batch, *first_low.shape[1:])) if return_low_res else None
     for members, logits, iou, low in pieces:
-        index = torch.tensor(members, device=device, dtype=torch.long)
+        index = to_device_async(torch.tensor(members, dtype=torch.long), device)
         pred_logits = pred_logits.index_copy(0, index, logits)
         iou_preds = iou_preds.index_copy(0, index, iou)
         if return_low_res:

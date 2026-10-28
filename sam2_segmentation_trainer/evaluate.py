@@ -14,11 +14,20 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
-from sam2_segmentation_trainer.data.dataset import FAMILIES_ONLY_PROMPTS, VAL_PROMPTS, EMSegDataset, collate_em
+from sam2_segmentation_trainer.data.circle_seed_trust import DEFAULT_OVERSIZE_RANGE, oversize_factor_range
+from sam2_segmentation_trainer.data.dataset import (
+    FAMILIES_ONLY_PROMPTS,
+    VAL_PROMPTS,
+    EMSegDataset,
+    collate_em,
+    limit_main_process_cv2,
+    limit_worker_threads,
+)
 from sam2_segmentation_trainer.data.manifest import index_volumes
 from sam2_segmentation_trainer.data.prompts import PromptConfig
-from sam2_segmentation_trainer.data.splits import load_split
+from sam2_segmentation_trainer.data.splits import include_new_keys, load_split
 from sam2_segmentation_trainer.data.tiles import build_tile_context
+from sam2_segmentation_trainer.data.valsets import partition_with_gold, resolve_split_path
 from sam2_segmentation_trainer.encoding_record import ResolvedEncoding, read_record, resolve_encoding
 from sam2_segmentation_trainer.export_serve import load_finetuned_model
 from sam2_segmentation_trainer.interactive import simulate_clicks, summarize_noc
@@ -68,6 +77,62 @@ class EvalRequest:
     """Score the full validation split with the training validation suite (every family's goal metrics)."""
     overrides: tuple[str, ...] = ()
     """Config overrides (``section.key=value``) for the ``goal`` run, like the trainer's command line."""
+    records: bool = False
+    """With ``goal``: also write every per-sample record to ``records.jsonl.gz`` (see :func:`write_records`)."""
+    circle_seed_taper: float | None = None
+    """With ``goal``, evaluation only: feed circle seeds by the radius-relative taper with this ``full_frac`` (its
+    ``zero_frac`` is the resolved diameter scale) instead of the edge confidence; None keeps the model's encoding.
+    See docs/circle_seed_trust_eval.md."""
+    circle_oversize_range: tuple[float, float] = DEFAULT_OVERSIZE_RANGE
+    """With ``goal``: the factor range of the ``circle_oversize`` family's radius over the inscribed circle's."""
+
+
+RECORDS_FILE = "records.jsonl.gz"
+"""Per-sample validation records of a ``--goal --records`` run, one JSON object per line."""
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"{type(value).__name__} is not JSON serializable")
+
+
+def write_records(path: Path, records: dict[str, list[dict]]) -> int:
+    """Write ``{family: [record, ...]}`` as gzip JSON lines, one per (family, sample); returns the line count.
+
+    Each line is the record from ``validation.score_sample`` plus ``family``. ``key`` becomes
+    ``[volume, image_key, location_id]``. The records keep the raw pixel counts, so ``validation.summarize_mode``
+    pools any subset of them exactly as a training run does.
+    """
+    import gzip
+
+    count = 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8") as handle:
+        for family, rows in records.items():
+            for record in rows:
+                handle.write(json.dumps({"family": family, **record}, default=_json_default) + "\n")
+                count += 1
+    tmp.replace(path)
+    return count
+
+
+def read_records(path: Path) -> dict[str, list[dict]]:
+    """Read :func:`write_records` output back as ``{family: [record, ...]}`` with ``key`` as a tuple again."""
+    import gzip
+
+    records: dict[str, list[dict]] = {}
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            record = json.loads(line)
+            family = record.pop("family")
+            volume, image_key, location_id = record["key"]
+            record["key"] = (str(volume), str(image_key), int(location_id))
+            records.setdefault(family, []).append(record)
+    return records
 
 
 def resolve_request_encoding(request: EvalRequest) -> ResolvedEncoding:
@@ -99,8 +164,10 @@ def _evaluate_noc(request: EvalRequest, val_ex, tiles, model, device, prompt_cfg
         val_ex, split="val", image_size=request.image_size, tiles=tiles, val_prompt="point",
         core_band_px=request.core_band_px, prompt_cfg=prompt_cfg,
     )
+    limit_main_process_cv2()
     loader = DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=request.num_workers, collate_fn=collate_em
+        dataset, batch_size=1, shuffle=False, num_workers=request.num_workers, collate_fn=collate_em,
+        worker_init_fn=limit_worker_threads,
     )
     rows: list[dict] = []
     volumes: list[str] = []
@@ -148,41 +215,75 @@ def evaluate_goal(request: EvalRequest) -> dict:
     examples, _wrong_size = take_model_sized(examples, request.image_size)
     if request.split_path.is_file():
         split = load_split(request.split_path)
+        if split.val_z:
+            # As the trainer does: locations added since the split was written join by their section.
+            split = include_new_keys(
+                split, examples, train_fraction=float(cfg.data.train_split), seed=int(cfg.training.seed)
+            )
     else:
         split, _even = train.make_split_from_cfg(cfg, examples, request.volumes, bool(cfg.data.get("even_per_volume", False)))
         request.split_path.parent.mkdir(parents=True, exist_ok=True)
         save_split(split, request.split_path)
         print(f"wrote split {request.split_path}")
-    _train_ex, val_ex = split.partition(examples)
+    gold = train.load_gold_set(cfg)
+    _train_ex, val_ex = partition_with_gold(gold, *split.partition(examples))
     tiles = build_tile_context(examples, **train._circle_guard(cfg, prompt_cfg))
     approved = train.load_approved_set(cfg, request.data_dir)
     suite = train.build_validation_suite(
-        cfg, val_ex, tiles, approved=approved, prompt_cfg=prompt_cfg, num_workers=request.num_workers
+        cfg, val_ex, tiles, approved=approved, gold=gold, prompt_cfg=prompt_cfg, num_workers=request.num_workers,
+        circle_seed_taper=request.circle_seed_taper, circle_oversize_range=request.circle_oversize_range,
     )
+    circle_seed = _circle_seed_options(request, suite)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _load_model(request, device)
     print(f"scoring {len(suite.dataset)} validation samples, families {suite.modes}")
-    outcome = suite.run(model, device, request.image_size, request.threshold, full=True)
+    if circle_seed and circle_seed["taper"] is not None:
+        print(f"circle seeds fed by the radius-relative taper {circle_seed['taper']} (evaluation only)")
+    outcome = suite.run(model, device, request.image_size, request.threshold, full=True, keep_records=request.records)
     results = outcome.full or outcome.subset
     target = suite.core_recall_target
     print(format_summary(0, results, suite.primary, target, label="full", detail=True))
     summary = {
         "model": "zero-shot" if request.finetuned is None else str(request.finetuned),
         "split": str(request.split_path),
+        "gold_set": None if gold is None else gold.name,
         "samples": len(suite.dataset),
         "core_band_px": suite.core_band_px,
         "core_recall_target": target,
+        # The draw of the per-epoch subset, so a records study can reproduce the run's own subset.
+        "subset_seed": suite.seed,
+        "epoch_subset": suite.epoch_subset,
         "families": {mode: dataclasses.asdict(result) for mode, result in results.items()},
     }
+    if circle_seed:
+        summary["circle_seed"] = circle_seed
     request.out_dir.mkdir(parents=True, exist_ok=True)
     (request.out_dir / "goal_metrics.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    if request.records and outcome.records is not None:
+        lines = write_records(request.out_dir / RECORDS_FILE, outcome.records)
+        print(f"wrote {lines} per-sample records to {request.out_dir / RECORDS_FILE}")
     return summary
+
+
+def _circle_seed_options(request: EvalRequest, suite) -> dict:
+    """The evaluation-only circle-seed settings of a ``--goal`` run, for ``goal_metrics.json``: the seed taper (None
+    when off) and, when ``circle_oversize`` is scored, its factor range. Empty when neither is used, so a default run
+    writes the same file as before."""
+    taper = suite.dataset.circle_seed_taper
+    if taper is None and "circle_oversize" not in suite.modes:
+        return {}
+    return {
+        "taper": None if taper is None else taper.as_dict(),
+        "oversize_range": list(request.circle_oversize_range) if "circle_oversize" in suite.modes else None,
+    }
 
 
 def evaluate(request: EvalRequest) -> dict:
     """Score the val split under each prompt. Returns ``{prompt: summary}`` and writes ``metrics.json``."""
     if request.goal:
         return evaluate_goal(request)
+    if request.circle_seed_taper is not None:
+        raise ValueError("--circle-seed-taper is scored only by --goal (the trainer's validation suite)")
     unknown = [p for p in request.prompts if p not in VAL_PROMPTS]
     if unknown:
         raise ValueError(f"unknown prompt(s) {unknown}; choose from {list(VAL_PROMPTS)}")
@@ -209,12 +310,14 @@ def evaluate(request: EvalRequest) -> dict:
             circle_scale=resolved.circle_diameter_scale,
             prompt_cfg=prompt_cfg,
         )
+        limit_main_process_cv2()
         loader = DataLoader(
             dataset,
             batch_size=1,
             shuffle=False,
             num_workers=request.num_workers,
             collate_fn=collate_em,
+            worker_init_fn=limit_worker_threads,
         )
         records = []
         grids_written = 0
@@ -257,9 +360,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--volumes", default="RC1,RC2,RPC1,RPC2")
     parser.add_argument(
         "--split",
-        type=Path,
         default=None,
-        help="split.json to score (use the run's own <run>/split.json); default <out>/splits/zslab_v1.json",
+        help="split.json to score (use the run's own <run>/split.json), or a frozen split's name (v5, under "
+        "{SAM2_CHECKPOINT_ROOT}/valsets/splits); default <out>/splits/zslab_v1.json. With --goal, add "
+        "--set data.gold_set=<name> for the gold row",
     )
     parser.add_argument(
         "--prompts",
@@ -277,6 +381,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Score the FULL validation split with the trainer's validation suite and print every prompt family's "
         "goal metrics (core recall, merge, spill, ...); writes goal_metrics.json. Needs --split (created from the "
         "config when the file is missing, so the new run's own split.json can be given before the run starts).",
+    )
+    parser.add_argument(
+        "--records",
+        action="store_true",
+        help=f"With --goal: also write every per-sample record to <out>/{RECORDS_FILE} (for "
+        "scripts/valset_size_study.py, which measures how large the per-epoch validation subset must be)",
     )
     parser.add_argument(
         "--set",
@@ -315,6 +425,24 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override prompt.circle_annotation_trust.zero_frac (default: the model's record, else the library default)",
     )
+    parser.add_argument(
+        "--circle-seed-taper",
+        type=float,
+        default=None,
+        metavar="FULL_FRAC",
+        help="With --goal, evaluation only: feed every circle-seed family as +seed_logit x w(rho), the radius-relative "
+        "cosine taper (full trust inside FULL_FRAC of the true radius, 0 at the diameter scale), instead of the edge "
+        "confidence; the disc, negatives and overlap rule are unchanged. Try 0.5. See docs/circle_seed_trust_eval.md",
+    )
+    parser.add_argument(
+        "--circle-oversize-range",
+        type=oversize_factor_range,
+        default=DEFAULT_OVERSIZE_RANGE,
+        metavar="LOW,HIGH",
+        help="Factor range of the circle_oversize family's radius over the inscribed circle's (default "
+        f"{DEFAULT_OVERSIZE_RANGE[0]},{DEFAULT_OVERSIZE_RANGE[1]}); score it with --goal --set "
+        "eval.val_prompts=[circle_mask,circle_annotator,circle_oversize]",
+    )
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--out", type=Path, default=None)
@@ -327,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
 
     data_dir = data_root(args.root)
     out_root = output_root()
-    split_path = args.split or (out_root / "splits" / "zslab_v1.json")
+    split_path = resolve_split_path(args.split) if args.split else (out_root / "splits" / "zslab_v1.json")
     out_dir = args.out or (out_root / ("eval_zero_shot" if args.zero_shot else "eval"))
     base = args.base_checkpoint or pretrained_checkpoint(out_root)
     volumes = [v.strip() for v in args.volumes.split(",") if v.strip()]
@@ -357,6 +485,9 @@ def main(argv: list[str] | None = None) -> int:
             core_recall_target=args.core_recall_target,
             goal=args.goal,
             overrides=tuple(args.overrides),
+            records=args.records,
+            circle_seed_taper=args.circle_seed_taper,
+            circle_oversize_range=args.circle_oversize_range,
         )
     )
     print(json.dumps(summary, indent=2))

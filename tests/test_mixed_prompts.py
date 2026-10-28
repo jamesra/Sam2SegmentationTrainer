@@ -12,7 +12,7 @@ from torch import nn
 from annotation_crops.negatives import CIRCLE_FILE_NAME
 from sam2_segmentation_trainer.data.dataset import EMSegDataset, EpochCounter, collate_em
 from sam2_segmentation_trainer.data.manifest import index_volumes
-from sam2_segmentation_trainer.data.prompts import PromptConfig, PromptType
+from sam2_segmentation_trainer.data.prompts import FULL_TILE_PROMPTS, PromptConfig, PromptType
 from sam2_segmentation_trainer.data.tiles import TileContext, build_tile_context
 from sam2_segmentation_trainer.losses import (
     containment_warmup_scale,
@@ -40,7 +40,9 @@ _ZERO = {
     "prob_box_only": 0.0,
     "prob_box_points": 0.0,
     "prob_circle_seed": 0.0,
-    "prob_adjacent_seed": 0.0,
+    "prob_circle_annotator": 0.0,
+    "prob_circle_pull_through": 0.0,
+    "prob_adjacent_poly_seed": 0.0,
     "prob_subset_seed": 0.0,
     "prob_correction": 0.0,
     "prob_near_correct": 0.0,
@@ -129,19 +131,18 @@ class MixedDatasetTests(unittest.TestCase):
         self.assertIsNone(variant["boxes"])
 
     def test_tile_without_neighbors_uses_no_mask_embedding(self) -> None:
-        # Variant 1 is always the circle seed, so ask for the points variant through a second one.
+        # No family is forced on a sample, so points at probability 1 is the only variant.
         ds = self._dataset(_cfg(prob_points_only=1.0, variants_per_sample=2))
         item = self._item(ds, self.alone[0].location_id, self.alone_key)
-        first, second = item["variants"]
-        self.assertEqual(first["prompt_type"], "circle_seed")
-        self.assertEqual(second["prompt_type"], "points")
-        self.assertIsNone(second["dense_mask"])
-        self.assertTrue((second["point_label"] == 1).all())
+        (only,) = item["variants"]  # nothing else has a share: the plan stops after it
+        self.assertEqual(only["prompt_type"], "points")
+        self.assertIsNone(only["dense_mask"])
+        self.assertTrue((only["point_label"] == 1).all())
 
     def test_points_prompt_adds_background_points_in_the_neighbor(self) -> None:
-        ds = self._dataset(_cfg(prob_points_only=1.0, bg_point_prob_polygon=1.0, variants_per_sample=2))
+        ds = self._dataset(_cfg(prob_points_only=1.0, bg_point_prob_polygon=1.0))
         item = self._item(ds, self.shared[0].location_id)
-        points = item["variants"][1]
+        points = item["variants"][0]
         labels = points["point_label"]
         self.assertTrue((labels == 0).any() and (labels == 1).any())
         for (x, y), label in zip(points["point"].tolist(), labels.tolist()):
@@ -149,9 +150,9 @@ class MixedDatasetTests(unittest.TestCase):
                 self.assertTrue(2 <= x < 6 and 2 <= y < 6)
 
     def test_box_prompt_contains_the_object(self) -> None:
-        ds = self._dataset(_cfg(prob_box_only=1.0, variants_per_sample=2))
+        ds = self._dataset(_cfg(prob_box_only=1.0))
         item = self._item(ds, self.alone[0].location_id, self.alone_key)
-        variant = item["variants"][1]
+        variant = item["variants"][0]
         box = variant["boxes"].tolist()
         self.assertTrue(box[0] <= 8 and box[1] <= 8 and box[2] >= 24 and box[3] >= 24)
         self.assertEqual(variant["point"].shape[0], 0)
@@ -206,32 +207,35 @@ class MixedDatasetTests(unittest.TestCase):
         self.assertEqual(counter.get(), 3)
 
     def test_variants_share_one_image_and_draw_without_replacement(self) -> None:
-        cfg = PromptConfig(variants_per_sample=3)
-        ds = self._dataset(cfg)
+        ds = self._dataset(PromptConfig())
         for index in range(len(ds)):
-            kinds = [v["prompt_type"] for v in ds[index]["variants"]]
-            self.assertEqual(len(kinds), 3)
-            self.assertEqual(kinds[0], "circle_seed")
-            self.assertEqual(len(set(kinds)), 3)
+            requested = [v["requested_prompt_type"] for v in ds[index]["variants"]]
+            self.assertEqual(len(requested), 4)
+            self.assertEqual(len(set(requested)), 4)
 
-    def test_variant_zero_is_an_adjacent_seed_only_when_a_shape_exists(self) -> None:
-        cfg = PromptConfig(variants_per_sample=3)
+    def test_an_adjacent_poly_seed_is_drawn_only_when_a_shape_exists_at_any_position(self) -> None:
+        cfg = PromptConfig()
         ds = self._dataset(cfg)
-        none = [ds._plan_types(cfg, i, 0, full_tile=False, forced=None)[0] for i in range(300)]
-        self.assertEqual(set(none), {PromptType.CIRCLE_SEED})
+        none = [ds._plan_types(cfg, i, 0, full_tile=False, forced=None) for i in range(300)]
+        self.assertFalse(any(PromptType.ADJACENT_POLY_SEED in plan for plan in none))
         with_shape = [ds._plan_types(cfg, i, 0, full_tile=False, forced=None, has_adjacent=True) for i in range(600)]
-        share = sum(plan[0] is PromptType.ADJACENT_SEED for plan in with_shape) / len(with_shape)
-        expected = cfg.prob_adjacent_seed / (cfg.prob_adjacent_seed + cfg.prob_circle_seed)
-        self.assertAlmostEqual(share, expected, delta=0.07)
+        positions = {plan.index(PromptType.ADJACENT_POLY_SEED) for plan in with_shape if PromptType.ADJACENT_POLY_SEED in plan}
+        self.assertEqual(positions, {0, 1, 2, 3}, "no position is reserved for any family")
+        first = sum(plan[0] is PromptType.ADJACENT_POLY_SEED for plan in with_shape) / len(with_shape)
+        self.assertAlmostEqual(first, cfg.prob_adjacent_poly_seed, delta=0.05)  # the first draw is the plain mix
         for plan in with_shape:
             self.assertEqual(len(set(plan)), len(plan))
-            self.assertNotIn(PromptType.ADJACENT_SEED, plan[1:])
-        full = ds._plan_types(cfg, 0, 0, full_tile=True, forced=None, has_adjacent=True)
-        self.assertNotIn(PromptType.ADJACENT_SEED, full)
+        full = [ds._plan_types(cfg, i, 0, full_tile=True, forced=None, has_adjacent=True) for i in range(50)]
+        for plan in full:
+            self.assertNotIn(PromptType.ADJACENT_POLY_SEED, plan)
+            # Points, circle_seed and circle_annotator: no pull-through on a full tile, so 3 of the 4 variants.
+            self.assertEqual(len(plan), 3)
+            self.assertEqual(set(plan), set(FULL_TILE_PROMPTS))
+            self.assertNotIn(PromptType.CIRCLE_PULL_THROUGH, plan)
 
-    def test_a_stub_shape_makes_an_adjacent_seed_item(self) -> None:
+    def test_a_stub_shape_makes_an_adjacent_poly_seed_item(self) -> None:
         class StubTiles(TileContext):
-            def adjacent_shape(self, key, location_id):
+            def adjacent_shape(self, key, location_id, **_kwargs):
                 shape = np.zeros((32, 32), dtype=bool)
                 shape[11:21, 11:21] = True
                 return shape
@@ -240,11 +244,11 @@ class MixedDatasetTests(unittest.TestCase):
         ds = EMSegDataset(
             self.examples, split="val", image_size=32, seed=7,
             tiles=StubTiles(neighbors=base.neighbors, circles=base.circles),
-            prompt_cfg=_cfg(prob_adjacent_seed=1.0),
+            prompt_cfg=_cfg(prob_adjacent_poly_seed=1.0),
         )
         item = self._item(ds, self.alone[0].location_id, self.alone_key)
         (variant,) = item["variants"]
-        self.assertEqual(variant["prompt_type"], "adjacent_seed")
+        self.assertEqual(variant["prompt_type"], "adjacent_poly_seed")
         self.assertIsNotNone(variant["prompt_fg"])
 
     def test_leak_weight_multiplies_the_loss_weight_on_neighbor_cores(self) -> None:

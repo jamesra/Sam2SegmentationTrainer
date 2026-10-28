@@ -7,6 +7,7 @@ These are copies of the planning documents kept in the Sam2 claude.ai project, s
 | *Overall training plan* | `overall_training_plan.md` | Goals, the exporter's circle file, the trainer data pipeline, the prompt mix, model and loss changes, the gallery, and the configuration |
 | *claude/Mask refinement and edge tolerance plan* | `mask_refinement_plan.md` | Edge-tolerant prompts and loss, the refinement prompt families, goal-driven validation, and the phased implementation order. The working plan for the trainer, kept in step with the code |
 | *claude/Training plan assessment* | `training_plan_assessment.md` | Review of the overall plan: weaknesses, decisions (z-slab split, circle scale, negative-only removal, fully masked tiles) and measurements |
+| *Prompt families at a glance* | `prompt_overview.md` | One three-panel image per prompt family (input, input plus prediction, ground truth) with what it simulates and its training probability |
 | *claude/SAM3 evaluation* | `sam3_evaluation.md` | Whether to move from SAM 2 to SAM 3 |
 | *claude/uSAM evaluation* | `usam_evaluation.md` | Whether to move from SAM 2 to μSAM |
 

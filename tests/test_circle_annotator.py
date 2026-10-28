@@ -226,20 +226,22 @@ class CircleSeedJitterConfigTests(unittest.TestCase):
     def test_the_defaults_are_the_specs(self) -> None:
         jitter = CircleSeedJitter()
         self.assertEqual(
-            (jitter.prob, jitter.depth_range, jitter.scale_range, jitter.fit_grow_px, jitter.min_radius_px),
-            (0.7, (0.3, 1.0), (0.45, 1.0), 10.0, 6.0),
+            (jitter.depth_range, jitter.scale_range, jitter.fit_grow_px, jitter.min_radius_px),
+            ((0.3, 1.0), (0.45, 1.0), 10.0, 6.0),
         )
+        self.assertFalse(hasattr(jitter, "prob"), "the mix owns the probability (prob_circle_annotator)")
         self.assertEqual(PromptConfig().circle_seed_jitter, jitter)
 
     def test_the_shipped_config_carries_the_block_with_those_defaults(self) -> None:
         cfg = load_train_cfg()
         self.assertEqual(PromptConfig.from_cfg(cfg).circle_seed_jitter, CircleSeedJitter())
-        self.assertEqual(float(cfg.prompt.circle_seed_jitter.prob), 0.7)
+        self.assertNotIn("prob", cfg.prompt.circle_seed_jitter)
+        self.assertEqual(float(cfg.prompt.prob_circle_annotator), 0.20)
 
     def test_a_config_block_is_read_and_a_missing_key_keeps_its_default(self) -> None:
-        cfg = OmegaConf.create({"prompt": {"circle_seed_jitter": {"prob": 0.25, "depth_range": [0.4, 0.9]}}})
+        cfg = OmegaConf.create({"prompt": {"circle_seed_jitter": {"depth_range": [0.4, 0.9]}}})
         jitter = PromptConfig.from_cfg(cfg).circle_seed_jitter
-        self.assertEqual((jitter.prob, jitter.depth_range), (0.25, (0.4, 0.9)))
+        self.assertEqual(jitter.depth_range, (0.4, 0.9))
         self.assertEqual(jitter.scale_range, (0.45, 1.0))
 
     def test_a_config_without_the_block_loads_with_the_defaults(self) -> None:
@@ -247,7 +249,6 @@ class CircleSeedJitterConfigTests(unittest.TestCase):
 
     def test_each_rule_is_enforced(self) -> None:
         bad = [
-            {"prob": -0.1}, {"prob": 1.1},
             {"depth_range": [0.0, 1.0]}, {"depth_range": [0.8, 0.5]}, {"depth_range": [0.3, 1.2]},
             {"scale_range": [0.0, 1.0]}, {"scale_range": [0.9, 0.5]},
             {"fit_grow_px": -1}, {"min_radius_px": 0.5},
@@ -256,8 +257,28 @@ class CircleSeedJitterConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=str(values)):
                 PromptConfig.from_cfg(OmegaConf.create({"prompt": {"circle_seed_jitter": values}}))
         # The bounds themselves are allowed.
-        CircleSeedJitter(prob=0.0, depth_range=(1.0, 1.0), scale_range=(0.5, 5.0), fit_grow_px=0, min_radius_px=1)
-        CircleSeedJitter(prob=1.0)
+        CircleSeedJitter(depth_range=(1.0, 1.0), scale_range=(0.5, 5.0), fit_grow_px=0, min_radius_px=1)
+
+    def test_an_old_configs_retired_prob_key_is_ignored(self) -> None:
+        # Configs saved before circle_annotator became a prompt type carry circle_seed_jitter.prob; it is ignored.
+        old = {"prob": 0.7, "depth_range": [0.3, 1.0], "scale_range": [0.45, 1.0], "fit_grow_px": 10, "min_radius_px": 6}
+        self.assertEqual(CircleSeedJitter.from_mapping(old), CircleSeedJitter())
+        self.assertEqual(
+            PromptConfig.from_cfg(OmegaConf.create({"prompt": {"circle_seed_jitter": old}})).circle_seed_jitter,
+            CircleSeedJitter(),
+        )
+
+    def test_an_old_prompt_mix_is_refused_by_the_sum_check(self) -> None:
+        # An old run's prompt section (prob_circle_seed 0.35, no circle peers) merged over today's defaults sums to
+        # 1.25 and is refused. Nothing loads an old run's config.yaml into PromptConfig: evaluation starts from the
+        # shipped config plus the model's encoding record, and export reads only the encoding keys.
+        old = {"prob_points_only": 0.10, "prob_box_only": 0.05, "prob_box_points": 0.05, "prob_circle_seed": 0.35,
+               "prob_adjacent_poly_seed": 0.15, "prob_subset_seed": 0.15, "prob_correction": 0.10,
+               "prob_near_correct": 0.05, "circle_seed_jitter": {"prob": 0.7}}
+        with self.assertRaisesRegex(ValueError, "sum to 1.0"):
+            PromptConfig.from_cfg(OmegaConf.create({"prompt": old}))
+        old.update(prob_circle_annotator=0.0, prob_circle_pull_through=0.0)
+        self.assertEqual(PromptConfig.from_cfg(OmegaConf.create({"prompt": old})).circle_share(), 0.35)
 
     def test_a_misspelled_key_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "fit_grow"):
@@ -292,7 +313,7 @@ class _FamilyFixture(unittest.TestCase):
 
 class FamilyRegistrationTests(unittest.TestCase):
     def test_the_new_family_is_last_so_every_existing_family_keeps_its_number(self) -> None:
-        self.assertEqual(VAL_PROMPTS[-1], "circle_annotator")
+        self.assertEqual(VAL_PROMPTS[6], "circle_annotator")  # only the evaluation-only circle_oversize follows
         self.assertEqual(
             {name: VAL_FAMILY_CODES[name] for name in _FamilyFixture.OLD_FAMILIES},
             {"centroid": 0, "point": 1, "circle_mask": 2, "correction": 3, "near_correct": 4, "circle_mask_noneg": 5},
@@ -300,7 +321,7 @@ class FamilyRegistrationTests(unittest.TestCase):
         self.assertEqual(VAL_FAMILY_CODES["circle_annotator"], 6)
 
     def test_it_is_a_circle_seed_family_that_keeps_its_negatives(self) -> None:
-        self.assertEqual(VAL_MIXED_TYPES["circle_annotator"], PromptType.CIRCLE_SEED)
+        self.assertEqual(VAL_MIXED_TYPES["circle_annotator"], PromptType.CIRCLE_ANNOTATOR)
         self.assertIn("circle_annotator", CIRCLE_PROMPTS)
         self.assertNotIn("circle_annotator", NO_NEGATIVE_PROMPTS)
 
@@ -314,7 +335,9 @@ class FamilyRegistrationTests(unittest.TestCase):
 
     def test_the_one_prompt_evaluation_leaves_it_out_and_refuses_it(self) -> None:
         self.assertNotIn("circle_annotator", PER_PROMPT_DEFAULTS)
-        self.assertEqual(set(DEFAULT_VAL_PROMPTS) - set(PER_PROMPT_DEFAULTS), set(FAMILIES_ONLY_PROMPTS))
+        self.assertEqual(
+            set(DEFAULT_VAL_PROMPTS) - set(PER_PROMPT_DEFAULTS), set(FAMILIES_ONLY_PROMPTS) & set(DEFAULT_VAL_PROMPTS)
+        )
         request = EvalRequest(
             finetuned=None, base_ckpt=Path("b.pt"), model_cfg="x", data_dir=Path("."), volumes=["RC1"],
             split_path=Path("s.json"), image_size=32, threshold=0.5, out_dir=Path("o"), grid_every=0, max_grids=0,
@@ -372,7 +395,7 @@ class AnnotatorFamilyTests(_FamilyFixture):
             item = dataset[index]
             by = self.by_family(item)
             annotator = by["circle_annotator"]
-            self.assertEqual(annotator["prompt_type"], "circle_seed")
+            self.assertEqual(annotator["prompt_type"], "circle_annotator")  # 1 px minimum: always drawn here
             self.assertTrue((annotator["point_label"][:1] == 1).all())
             if not torch.equal(annotator["prompt_input"], by["circle_mask"]["prompt_input"]):
                 differs += 1
@@ -405,10 +428,11 @@ class AnnotatorFamilyTests(_FamilyFixture):
             b = self.by_family(crowd[index])["circle_annotator"]
             self.assertTrue(torch.equal(a["prompt_input"], b["prompt_input"]), index)
 
-    def test_it_ignores_the_training_probability(self) -> None:
-        # prob 0 turns the training rule off but does not turn the validation family off.
-        off = PromptConfig(circle_seed_jitter=CircleSeedJitter(prob=0.0, min_radius_px=1.0))
-        on = PromptConfig(circle_seed_jitter=CircleSeedJitter(prob=1.0, min_radius_px=1.0))
+    def test_it_ignores_the_training_mix(self) -> None:
+        # A training share of 0 for circle_annotator does not turn the validation family off.
+        jitter = CircleSeedJitter(min_radius_px=1.0)
+        off = PromptConfig(circle_seed_jitter=jitter, prob_circle_annotator=0.0, prob_circle_seed=0.30)
+        on = PromptConfig(circle_seed_jitter=jitter)
         a, b = self.dataset(["circle_annotator"], cfg=off), self.dataset(["circle_annotator"], cfg=on)
         for index in range(len(a)):
             self.assertTrue(
@@ -434,9 +458,16 @@ class AnnotatorFamilyTests(_FamilyFixture):
         # With the spec's 6 px minimum the 16 px test squares often cannot hold a circle; those samples keep the
         # inscribed seed, so the family never fails a sample.
         dataset = self.dataset(["circle_mask", "circle_annotator"], cfg=PromptConfig())
+        fell_back = 0
         for index in range(len(dataset)):
             by = self.by_family(dataset[index])
-            self.assertEqual(by["circle_annotator"]["prompt_type"], "circle_seed")
+            # A circle that cannot be drawn is built, and reported, as the plain circle_seed.
+            if by["circle_annotator"]["prompt_type"] == "circle_seed":
+                fell_back += 1
+                self.assertTrue(torch.equal(by["circle_annotator"]["prompt_input"], by["circle_mask"]["prompt_input"]))
+            else:
+                self.assertEqual(by["circle_annotator"]["prompt_type"], "circle_annotator")
+        self.assertGreater(fell_back, 0)
 
     def test_the_suite_runs_it_in_the_subset_and_the_full_pass_but_selects_on_circle_mask(self) -> None:
         suite = ValidationSuite(
@@ -454,14 +485,45 @@ class AnnotatorFamilyTests(_FamilyFixture):
             )
 
 
-PROB_ZERO_FINGERPRINT = "df9df194e97724fcf6531ae1e5cabcfa256824b3a9cf139a3052529c4115af6d"
+MIX_FINGERPRINT = "8da12e8ae7f330a646de6b5ae6c437828fa4351e2a1f528926db919ffec62e13"
 """SHA-256 of every tensor ``_mixed_item`` produced for the 9 synthetic samples (training split, identity transform,
-default ``PromptConfig``, seed 3, epochs 0 and 3), recorded from the code BEFORE the circle jitter existed (commit
-74c303f). With ``prob`` 0 the new code must reproduce it bit for bit."""
+default ``PromptConfig``, seed 3, epochs 0 and 3). It pins the whole training prompt pipeline.
+
+History: first recorded (as PROB_ZERO_FINGERPRINT) from the code before the circle jitter existed (commit 74c303f) and
+kept bit for bit while the jitter's prob was 0; re-recorded for the ``erode`` mask-to-correct kind and for the
+0.35 / 0.15 circle_seed / subset_seed mix. Re-recorded Oct 18 2026 when the circle prompts became three peer prompt
+types (circle_seed 0.10, circle_annotator 0.20, circle_pull_through 0.05, so ten prob_* entries), variant 0 stopped being
+a forced circle seed (every variant is drawn from the mix without replacement), variants_per_sample went from 3 to 4,
+negative-context dropout started applying to variant 0 too, and the per-variant jitter replacement
+(``circle_seed_jitter.prob``) was removed. Every one of those changes the prompt-type plan, so the old value cannot be
+reproduced by patching; the suite passed on the old value before these edits."""
 
 
-class TrainingRuleTests(unittest.TestCase):
-    """Step 2: ``_mixed_item`` replaces a share of the training circle seeds with annotator-like circles."""
+def only(kind: PromptType, **extra) -> PromptConfig:
+    """A mix with every share 0 but ``kind`` (1.0), one variant, and a 1 px circle minimum for the 16 px fixture."""
+    shares = {name: 0.0 for name in PROB_FIELDS.values()}
+    shares[PROB_FIELDS[kind]] = 1.0
+    values = dict(shares, variants_per_sample=1, circle_seed_jitter=CircleSeedJitter(min_radius_px=1.0))
+    values.update(extra)
+    return PromptConfig(**values)
+
+
+PROB_FIELDS = {
+    PromptType.POINTS: "prob_points_only",
+    PromptType.BOX: "prob_box_only",
+    PromptType.BOX_POINTS: "prob_box_points",
+    PromptType.CIRCLE_SEED: "prob_circle_seed",
+    PromptType.CIRCLE_ANNOTATOR: "prob_circle_annotator",
+    PromptType.CIRCLE_PULL_THROUGH: "prob_circle_pull_through",
+    PromptType.ADJACENT_POLY_SEED: "prob_adjacent_poly_seed",
+    PromptType.SUBSET_SEED: "prob_subset_seed",
+    PromptType.CORRECTION: "prob_correction",
+    PromptType.NEAR_CORRECT: "prob_near_correct",
+}
+
+
+class MixFixture(unittest.TestCase):
+    """Nine synthetic 32 px tiles (16 px square targets), training split, no random augmentation."""
 
     SEED = 3
 
@@ -475,16 +537,24 @@ class TrainingRuleTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def dataset(self, prob: float, *, split: str = "train", min_radius: float = 1.0, **extra):
+    def dataset(self, cfg: PromptConfig | None = None, *, split: str = "train", **extra):
         counter = EpochCounter()
-        cfg = PromptConfig(circle_seed_jitter=CircleSeedJitter(prob=prob, min_radius_px=min_radius))
         dataset = EMSegDataset(
-            self.examples, split=split, image_size=32, tiles=self.tiles, prompt_cfg=cfg, seed=self.SEED,
-            core_band_px=2.0, epoch=counter, **extra,
+            self.examples, split=split, image_size=32, tiles=self.tiles, prompt_cfg=cfg or PromptConfig(),
+            seed=self.SEED, core_band_px=2.0, epoch=counter, **extra,
         )
         dataset.transform = lambda image, masks: {"image": image, "masks": masks}  # no random augmentation
         dataset.counter = counter  # type: ignore[attr-defined]
         return dataset
+
+    def variants(self, dataset, epochs=(0, 1, 2)):
+        """(epoch, index, k, item, variant) of every variant."""
+        for epoch in epochs:
+            dataset.counter.set(epoch)
+            for index in range(len(dataset)):
+                item = dataset[index]
+                for k, variant in enumerate(item["variants"]):
+                    yield epoch, index, k, item, variant
 
     @staticmethod
     def fingerprint(dataset, epochs=(0, 3)) -> tuple[str, int]:
@@ -502,104 +572,79 @@ class TrainingRuleTests(unittest.TestCase):
                         count += 1
         return digest.hexdigest(), count
 
-    def test_prob_zero_is_bit_identical_to_the_code_before_the_jitter(self) -> None:
-        digest, count = self.fingerprint(self.dataset(0.0))
-        self.assertEqual(count, 432)
-        self.assertEqual(digest, PROB_ZERO_FINGERPRINT)
 
-    def test_prob_zero_draws_nothing_for_the_jitter(self) -> None:
-        keys: list = []
-        real = np.random.default_rng
+class MixFingerprintTests(MixFixture):
+    def test_the_default_training_pipeline_is_pinned(self) -> None:
+        digest, count = self.fingerprint(self.dataset())
+        dataset = self.dataset()
+        self.assertEqual(count, 2 * len(dataset) * 4 * 6)  # four variants on every sample, six tensors each
+        self.assertEqual(digest, MIX_FINGERPRINT)
 
-        def spy(seed=None):
-            keys.append(list(seed) if isinstance(seed, (list, tuple)) else seed)
-            return real(seed)
 
-        dataset = self.dataset(0.0)
-        with mock.patch.object(np.random, "default_rng", spy):
-            self.fingerprint(dataset)
-        self.assertTrue(keys, "the spy saw no generators at all")
-        self.assertFalse([k for k in keys if isinstance(k, list) and len(k) == 5 and k[-1] == 2])
-
-    def test_a_positive_prob_uses_the_documented_generator_per_circle_variant(self) -> None:
-        keys: list = []
-        real = np.random.default_rng
-
-        def spy(seed=None):
-            keys.append(list(seed) if isinstance(seed, (list, tuple)) else seed)
-            return real(seed)
-
-        dataset = self.dataset(1.0)
-        dataset.counter.set(5)
-        with mock.patch.object(np.random, "default_rng", spy):
-            item = dataset[2]
-        jitter_keys = [k for k in keys if isinstance(k, list) and len(k) == 5 and k[-1] == 2]
-        circle_ks = [k for k, v in enumerate(item["variants"]) if v["prompt_type"] == "circle_seed"]
-        self.assertEqual(sorted(key[3] for key in jitter_keys), circle_ks)
-        self.assertTrue(all(key[:3] == [self.SEED, 5, 2] for key in jitter_keys))
+class AnnotatorTrainingTests(MixFixture):
+    """``circle_annotator`` is a prompt type of its own: drawn when the mix picks it, with its own generator."""
 
     def test_the_seed_is_exactly_the_helpers_draw_for_that_sample_and_variant(self) -> None:
-        dataset = self.dataset(1.0)  # the gate always passes, so the draw order is: gate, then the helper's three
+        dataset = self.dataset(only(PromptType.CIRCLE_ANNOTATOR))
         checked = 0
-        for epoch in (0, 2):
-            dataset.counter.set(epoch)
-            for index in range(len(dataset)):
+        for epoch, index, k, item, variant in self.variants(dataset):
+            self.assertEqual(variant["requested_prompt_type"], "circle_annotator")
+            if variant["prompt_type"] != "circle_annotator":
+                continue
+            target = item["mask"].numpy().astype(bool)
+            rng = np.random.default_rng([self.SEED, epoch, index, k, 2])
+            expected = annotator_circle(target, rng, dataset.prompt_cfg.circle_seed_jitter)
+            self.assertTrue(np.array_equal(variant["prompt_input"].numpy().astype(bool), expected))
+            checked += 1
+        self.assertGreater(checked, 20)
+
+    def test_its_generator_is_used_only_by_circle_annotator_variants(self) -> None:
+        keys: list = []
+        real = np.random.default_rng
+
+        def spy(seed=None):
+            keys.append(list(seed) if isinstance(seed, (list, tuple)) else seed)
+            return real(seed)
+
+        dataset = self.dataset()
+        dataset.counter.set(5)
+        for index in range(len(dataset)):
+            keys.clear()
+            with mock.patch.object(np.random, "default_rng", spy):
                 item = dataset[index]
-                target = item["mask"].numpy().astype(bool)
-                for k, variant in enumerate(item["variants"]):
-                    if not variant["circle_jittered"]:
-                        continue
-                    rng = np.random.default_rng([self.SEED, epoch, index, k, 2])
-                    self.assertLess(rng.random(), 1.0)
-                    expected = annotator_circle(target, rng, dataset.prompt_cfg.circle_seed_jitter)
-                    self.assertIsNotNone(expected)
-                    self.assertTrue(np.array_equal(variant["prompt_input"].numpy().astype(bool), expected))
-                    checked += 1
-        self.assertGreater(checked, 10)
+            annotator_keys = [k for k in keys if isinstance(k, list) and len(k) == 5 and k[-1] == 2]
+            wanted = [k for k, v in enumerate(item["variants"]) if v["requested_prompt_type"] == "circle_annotator"]
+            self.assertEqual(sorted(key[3] for key in annotator_keys), wanted)
+            self.assertTrue(all(key[:3] == [self.SEED, 5, index] for key in annotator_keys))
 
-    def test_variant_zero_the_production_prompt_is_jittered_too(self) -> None:
-        plain, jittered = self.dataset(0.0), self.dataset(1.0)
-        changed = 0
+    def test_a_circle_that_cannot_be_drawn_falls_back_to_the_plain_one_and_is_reported_as_circle_seed(self) -> None:
+        plain = self.dataset(only(PromptType.CIRCLE_SEED))
+        strict = self.dataset(only(PromptType.CIRCLE_ANNOTATOR, circle_seed_jitter=CircleSeedJitter(min_radius_px=50)))
         for index in range(len(plain)):
-            a, b = plain[index]["variants"][0], jittered[index]["variants"][0]
-            self.assertEqual(a["prompt_type"], "circle_seed")
-            self.assertFalse(a["circle_jittered"])
-            if b["circle_jittered"]:
-                changed += 1
-                self.assertFalse(torch.equal(a["prompt_input"], b["prompt_input"]))
-        self.assertGreater(changed, 4)
+            (a,), (b,) = plain[index]["variants"], strict[index]["variants"]
+            self.assertEqual((b["requested_prompt_type"], b["prompt_type"]), ("circle_annotator", "circle_seed"))
+            for key in ("point", "point_label", "dense_mask", "prompt_fg", "prompt_input"):
+                self.assertTrue(torch.equal(a[key], b[key]), (index, key))
 
-    def test_only_circle_seed_variants_change(self) -> None:
-        plain, jittered = self.dataset(0.0), self.dataset(1.0)
-        others = 0
-        for index in range(len(plain)):
-            for a, b in zip(plain[index]["variants"], jittered[index]["variants"]):
-                self.assertEqual(a["prompt_type"], b["prompt_type"])
-                if a["prompt_type"] == "circle_seed":
-                    continue
-                others += 1
-                self.assertFalse(b["circle_jittered"])
-                for key in ("point", "point_label", "boxes", "dense_mask", "prompt_fg", "prompt_input"):
-                    x, y = a[key], b[key]
-                    self.assertTrue((x is None and y is None) or torch.equal(x, y), (index, a["prompt_type"], key))
-        self.assertGreater(others, 5, "the fixture should draw some non-circle variants")
-
-    def test_the_share_of_jittered_circle_seeds_follows_prob(self) -> None:
-        dataset = self.dataset(0.7)
-        circles = flagged = 0
-        for epoch in range(30):
-            dataset.counter.set(epoch)
-            for index in range(len(dataset)):
-                for variant in dataset[index]["variants"]:
-                    if variant["prompt_type"] == "circle_seed":
-                        circles += 1
-                        flagged += bool(variant["circle_jittered"])
-        self.assertGreater(circles, 300)
-        self.assertGreater(flagged / circles, 0.6)
-        self.assertLess(flagged / circles, 0.8)
+    def test_the_seed_still_drives_the_dense_prompt_and_the_containment_core(self) -> None:
+        dataset = self.dataset(only(PromptType.CIRCLE_ANNOTATOR))
+        overhanging = 0
+        for _epoch, _index, _k, item, variant in self.variants(dataset):
+            if variant["prompt_type"] != "circle_annotator":
+                continue
+            target = item["mask"].numpy().astype(bool)
+            seed = variant["prompt_input"].numpy().astype(bool)
+            trust = variant["prompt_fg"].numpy()
+            self.assertGreater(float(variant["dense_mask"].max()), 0.0)
+            self.assertTrue(((trust > 0) <= seed).all(), "trust must lie inside the seed")
+            self.assertEqual(float(trust[~target].max()), 0.0)
+            point = variant["point"][0].numpy()
+            self.assertTrue(seed[int(point[1]), int(point[0])], "the click is the disc's centre, inside it")
+            overhanging += int((seed & ~target).any())
+        self.assertGreater(overhanging, 0, "no annotator seed overhung the test targets, so nothing was tested")
 
     def test_the_same_epoch_sample_and_variant_always_give_the_same_circle_and_epochs_differ(self) -> None:
-        dataset = self.dataset(1.0)
+        dataset = self.dataset(only(PromptType.CIRCLE_ANNOTATOR))
         dataset.counter.set(1)
         first = [dataset[i]["variants"][0]["prompt_input"] for i in range(len(dataset))]
         again = [dataset[i]["variants"][0]["prompt_input"] for i in range(len(dataset))]
@@ -608,20 +653,8 @@ class TrainingRuleTests(unittest.TestCase):
         later = [dataset[i]["variants"][0]["prompt_input"] for i in range(len(dataset))]
         self.assertFalse(all(torch.equal(a, b) for a, b in zip(first, later)), "a new epoch should draw new circles")
 
-    def test_a_circle_that_cannot_be_drawn_keeps_the_inscribed_seed(self) -> None:
-        plain = self.dataset(0.0)
-        # With the default 6 px minimum the 16 px test squares often give None; those samples must match prob 0.
-        strict = self.dataset(1.0, min_radius=6.0)
-        same = 0
-        for index in range(len(plain)):
-            for a, b in zip(plain[index]["variants"], strict[index]["variants"]):
-                if a["prompt_type"] == "circle_seed" and not b["circle_jittered"]:
-                    same += 1
-                    self.assertTrue(torch.equal(a["prompt_input"], b["prompt_input"]))
-        self.assertGreater(same, 0)
-
     def test_the_distance_transform_is_done_once_per_sample(self) -> None:
-        dataset = self.dataset(1.0)
+        dataset = self.dataset(PromptConfig(circle_seed_jitter=CircleSeedJitter(min_radius_px=1.0)))
         calls = 0
         real = dataset_module.target_depth
 
@@ -634,52 +667,43 @@ class TrainingRuleTests(unittest.TestCase):
             for index in range(len(dataset)):
                 before = calls
                 item = dataset[index]
-                self.assertLessEqual(calls - before, 1, f"sample {index}")
-                if any(v["circle_jittered"] for v in item["variants"]):
-                    self.assertEqual(calls - before, 1)
+                drawn = {v["requested_prompt_type"] for v in item["variants"]}
+                expected = int(bool(drawn & {"circle_annotator", "circle_pull_through"}))
+                self.assertEqual(calls - before, expected, f"sample {index}")
 
-    def test_validation_and_forced_prompts_are_never_jittered(self) -> None:
-        for extra in ({"val_prompt": "circle_mask"}, {"val_prompt": "circle_mask_noneg"}):
-            off = self.dataset(0.0, split="val", **extra)
-            on = self.dataset(1.0, split="val", **extra)
-            for index in range(len(off)):
-                for a, b in zip(off[index]["variants"], on[index]["variants"]):
-                    self.assertFalse(b["circle_jittered"])
-                    self.assertTrue(torch.equal(a["prompt_input"], b["prompt_input"]))
-        # The validation families do not read prob either: circle_mask is the same, circle_annotator always draws.
-        families = ["circle_mask", "circle_annotator"]
-        off = self.dataset(0.0, split="val", val_families=families)
-        on = self.dataset(1.0, split="val", val_families=families)
-        for index in range(len(off)):
-            a = {v["val_family"]: v for v in off[index]["variants"]}
-            b = {v["val_family"]: v for v in on[index]["variants"]}
-            for family in families:
-                self.assertTrue(torch.equal(a[family]["prompt_input"], b[family]["prompt_input"]), family)
-
-    def test_an_adjacent_seed_that_falls_back_to_a_circle_gets_the_jittered_one(self) -> None:
-        dataset = self.dataset(1.0)
-        with mock.patch.object(EMSegDataset, "_plan_types", lambda self, *a, **k: [PromptType.ADJACENT_SEED]):
+    def test_an_adjacent_poly_seed_that_falls_back_uses_the_plain_circle(self) -> None:
+        dataset = self.dataset(only(PromptType.CIRCLE_SEED))
+        with mock.patch.object(EMSegDataset, "_plan_types", lambda self, *a, **k: [PromptType.ADJACENT_POLY_SEED]):
             item = dataset[0]
         (variant,) = item["variants"]
-        self.assertEqual(variant["prompt_type"], "circle_seed")  # nothing to fit, so it fell back
-        self.assertTrue(variant["circle_jittered"])
-        rng = np.random.default_rng([self.SEED, 0, 0, 0, 2])
-        rng.random()
-        expected = annotator_circle(item["mask"].numpy().astype(bool), rng, dataset.prompt_cfg.circle_seed_jitter)
-        self.assertTrue(np.array_equal(variant["prompt_input"].numpy().astype(bool), expected))
+        self.assertEqual((variant["requested_prompt_type"], variant["prompt_type"]), ("adjacent_poly_seed", "circle_seed"))
+        (plain,) = dataset[0]["variants"]
+        self.assertTrue(torch.equal(variant["prompt_input"], plain["prompt_input"]))
 
-    def test_the_seed_still_drives_the_dense_prompt_and_the_containment_core(self) -> None:
-        dataset = self.dataset(1.0)
-        for index in range(len(dataset)):
-            for variant in dataset[index]["variants"]:
-                if not variant["circle_jittered"]:
-                    continue
-                seed = variant["prompt_input"].numpy().astype(bool)
-                self.assertGreater(float(variant["dense_mask"].max()), 0.0)
-                self.assertTrue(((variant["prompt_fg"].numpy() > 0) <= seed).all(), "trust must lie inside the seed")
-                point = variant["point"][0].numpy()
-                self.assertTrue(seed[int(point[1]), int(point[0])], "the click is the disc's centre, inside it")
+    def test_the_training_variant_carries_the_fit_cap_flag(self) -> None:
+        dataset = self.dataset(only(PromptType.CIRCLE_ANNOTATOR))
+        checked = 0
+        for epoch, index, k, item, variant in self.variants(dataset, epochs=(0, 1, 2, 3)):
+            if variant["prompt_type"] != "circle_annotator":
+                self.assertFalse(variant["circle_fit_capped"])
+                continue
+            info: dict = {}
+            rng = np.random.default_rng([self.SEED, epoch, index, k, 2])
+            annotator_circle(item["mask"].numpy().astype(bool), rng, dataset.prompt_cfg.circle_seed_jitter, info=info)
+            self.assertEqual(variant["circle_fit_capped"], info["capped"])
+            self.assertFalse(info["capped"], "the 16 px fixture targets are too small for the fit cap to bind")
+            checked += 1
+        self.assertGreater(checked, 20)
 
+    def test_validation_and_forced_prompts_do_not_read_the_training_mix(self) -> None:
+        off = only(PromptType.CIRCLE_SEED)
+        on = only(PromptType.CIRCLE_ANNOTATOR)
+        for extra in ({"val_prompt": "circle_mask"}, {"val_prompt": "circle_mask_noneg"}):
+            a, b = self.dataset(off, split="val", **extra), self.dataset(on, split="val", **extra)
+            for index in range(len(a)):
+                (x,), (y,) = a[index]["variants"], b[index]["variants"]
+                self.assertEqual(y["prompt_type"], "circle_seed")
+                self.assertTrue(torch.equal(x["prompt_input"], y["prompt_input"]))
 
 
 class ContainmentWeightTests(unittest.TestCase):
@@ -758,28 +782,6 @@ class ContainmentWeightTests(unittest.TestCase):
         self.assertEqual(float(mask_containment_loss_per_sample(prediction, restricted)), 0.0)
         self.assertGreater(float(mask_containment_loss_per_sample(prediction, unrestricted)), 0.0)
 
-    def test_every_jittered_training_seed_has_zero_weight_outside_its_target(self) -> None:
-        fixture = TrainingRuleTests()
-        fixture.setUp()
-        try:
-            dataset = fixture.dataset(1.0)
-            overhanging = 0
-            for epoch in (0, 1, 2):
-                dataset.counter.set(epoch)
-                for index in range(len(dataset)):
-                    item = dataset[index]
-                    target = item["mask"].numpy().astype(bool)
-                    for variant in item["variants"]:
-                        if not variant["circle_jittered"]:
-                            continue
-                        seed = variant["prompt_input"].numpy().astype(bool)
-                        trust = variant["prompt_fg"].numpy()
-                        self.assertEqual(float(trust[~target].max()), 0.0)
-                        overhanging += int((seed & ~target).any())
-            self.assertGreater(overhanging, 0, "no jittered seed overhung the test targets, so nothing was tested")
-        finally:
-            fixture.tearDown()
-
 
 class FitCapTests(unittest.TestCase):
     """``annotator_circle`` can say whether the fit cap d(p) + fit_grow_px, not s * D, set the radius."""
@@ -808,34 +810,3 @@ class FitCapTests(unittest.TestCase):
             plain = annotator_circle(target, np.random.default_rng(seed), cfg)
             informed = annotator_circle(target, np.random.default_rng(seed), cfg, info={})
             self.assertTrue((plain is None and informed is None) or np.array_equal(plain, informed))
-
-    def test_the_training_variant_carries_the_same_flag(self) -> None:
-        fixture = TrainingRuleTests()
-        fixture.setUp()
-        try:
-            dataset = fixture.dataset(1.0)
-            flagged = checked = 0
-            for epoch in (0, 1, 2, 3):
-                dataset.counter.set(epoch)
-                for index in range(len(dataset)):
-                    item = dataset[index]
-                    target = item["mask"].numpy().astype(bool)
-                    for k, variant in enumerate(item["variants"]):
-                        if not variant["circle_jittered"]:
-                            self.assertFalse(variant["circle_fit_capped"])
-                            continue
-                        rng = np.random.default_rng([fixture.SEED, epoch, index, k, 2])
-                        rng.random()
-                        info: dict = {}
-                        annotator_circle(target, rng, dataset.prompt_cfg.circle_seed_jitter, info=info)
-                        self.assertEqual(variant["circle_fit_capped"], info["capped"])
-                        checked += 1
-                        flagged += info["capped"]
-            self.assertGreater(checked, 20)
-            self.assertEqual(flagged, 0, "the 16 px fixture targets are too small for the fit cap to bind")
-        finally:
-            fixture.tearDown()
-
-
-if __name__ == "__main__":
-    unittest.main()

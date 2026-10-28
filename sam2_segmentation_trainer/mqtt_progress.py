@@ -301,16 +301,19 @@ class TrainingProgress:
         log_every: int,
         loss: float,
         lr: float,
+        samples_per_s: float | None = None,
     ) -> None:
         """Publish the steps bar and an info line on the TensorBoard log cadence.
 
         ``step`` is the 0-based index within the epoch. No publish when
         ``log_every`` is less than 1 or ``global_step`` is off the interval.
+        ``samples_per_s`` is the training speed since the previous report (None for the first of an epoch).
         """
         every = int(log_every)
         if every <= 0 or int(global_step) % every != 0:
             return
-        label = f"steps  loss {loss:.4f}  lr {lr:.1e}"
+        speed = "" if samples_per_s is None else f"  {samples_per_s:.2f} samples/s"
+        label = f"steps  loss {loss:.4f}  lr {lr:.1e}{speed}"
         self._event(
             "iterate_progress",
             track_id="steps",
@@ -321,6 +324,7 @@ class TrainingProgress:
         )
         self.transcript(
             f"step {int(step) + 1}/{int(batches_per_epoch)} loss={loss:.4f} lr={lr:.6g}"
+            + ("" if samples_per_s is None else f" samples/s={samples_per_s:.2f}")
         )
 
     def transcript(self, message: str) -> None:

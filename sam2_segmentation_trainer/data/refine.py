@@ -3,7 +3,7 @@
 Every family here is trained against the true polygon of the target section:
 
 * subset seeds (3.2): a part of the truth, always inside it, so the model grows it;
-* masks to correct (3.3): grown, scaled, warped, simplified or merged masks that disagree with the truth;
+* masks to correct (3.3): grown, eroded, scaled, warped, simplified or merged masks that disagree with the truth;
 * near-correct masks (3.4): the truth as a good human would trace it, a few pixels off on average with a few
   local excursions, which the model must not make worse;
 * adjacent-section seeds (3.1): a neighbouring section's shape scaled to fit inside the cell.
@@ -30,7 +30,7 @@ from annotation_crops.prompt_encoding import window
 from sam2_segmentation_trainer.data.corrupt import polygon_mask
 
 SUBSET_KINDS = ("erode", "straight_cut", "shape_cut")
-CORRECTION_KINDS = ("grow", "scale", "wobble", "cascade", "merge")
+CORRECTION_KINDS = ("grow", "erode", "scale", "wobble", "cascade", "merge")
 
 
 def _depth(mask: np.ndarray) -> np.ndarray:
@@ -336,6 +336,7 @@ def correction_mask(
     *,
     neighbors: list[np.ndarray] | None = None,
     dilate_px: tuple[float, float] = (5.0, 50.0),
+    shrink_px: tuple[float, float] = (5.0, 50.0),
     scale_range: tuple[float, float] = (0.8, 1.25),
     polygon_tolerance: float = 0.04,
     max_shift_px: int = 30,
@@ -346,7 +347,8 @@ def correction_mask(
     """A mask for the model to correct, and the index in ``neighbors`` of a neighbor merged into it (else None).
 
     One of :data:`CORRECTION_KINDS` is drawn (``merge`` only when ``neighbors`` is non-empty):
-    grow (tracing outside the membrane), wheel-style scale, outline wobble (an elastic warp with a mean
+    grow (tracing outside the membrane), erode (tracing inside it: the mirror of grow, an erosion by ``U(shrink_px)``
+    pixels capped at half the mask's own depth so it never vanishes), wheel-style scale, outline wobble (an elastic warp with a mean
     displacement of ``U(wobble_px)`` and local excursions up to ``excursion_px[1]``), a CascadePSP-style
     simplified outline followed by a random grow or shrink, or a union with part of an annotated neighbor. A merge
     picks among the neighbors within ``merge_reach_px`` of ``mask`` (the ones a tracer could plausibly leak into),
@@ -359,6 +361,9 @@ def correction_mask(
     merged: int | None = None
     if kind == "grow":
         out = grow_mask(mask, float(rng.uniform(*dilate_px)))
+    elif kind == "erode":
+        depth = _depth(mask)
+        out = depth > min(float(rng.uniform(*shrink_px)), 0.5 * float(depth.max()))
     elif kind == "scale":
         ys, xs = np.nonzero(mask)
         factor = float(rng.uniform(*scale_range))
@@ -389,7 +394,7 @@ def correction_mask(
     return out, merged
 
 
-def fit_adjacent_seed(
+def fit_adjacent_poly_seed(
     shape_mask: np.ndarray,
     target: np.ndarray,
     rng: np.random.Generator,
