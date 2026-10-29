@@ -88,6 +88,39 @@ def test_unmasked_circles_count_and_a_polygons_own_circle_does_not(crops: Path) 
     assert pixels[10, 4] == 0  # location 2's big inscribed circle was not stamped over its small mask
 
 
+
+def test_the_circle_file_is_parsed_once_per_version(crops: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parsing RC1's 37 MB file for every bitmask was ~92% of a card layer's build; a changed file is read again."""
+    import negatives_view
+
+    parses: list[Path] = []
+    real = negatives_view.load_circle_annotations
+
+    def counting(crops_arg: Path):
+        parses.append(crops_arg)
+        return real(crops_arg)
+
+    monkeypatch.setattr(negatives_view, "load_circle_annotations", counting)
+    circles = crops / "circle_annotations.json"
+
+    def write(center_y: float, stamp_ns: int) -> None:
+        payload = {"version": 1, "grid_cells": {KEY: [{"location_id": 99, "center_x": 4.0, "center_y": center_y,
+                                                           "radius": 2.0}]}}
+        circles.write_text(json.dumps(payload), encoding="utf-8")
+        os.utime(circles, ns=(stamp_ns, stamp_ns))
+
+    write(28.0, 1_000_000_000_000_000_000)
+    for location_id in (1, 2, 3, 1):
+        cache_path(crops, KEY, location_id).unlink(missing_ok=True)
+        negative_bitmask(crops, KEY, location_id)
+    assert len(parses) == 1
+
+    write(12.0, 1_000_000_010_000_000_000)
+    cache_path(crops, KEY, 2).unlink(missing_ok=True)
+    pixels = _decode(negative_bitmask(crops, KEY, 2)[0])
+    assert len(parses) == 2
+    assert pixels[12, 4] == 255 and pixels[28, 4] == 0  # the circle from the new file, not the parsed old one
+
 def test_tile_without_neighbors_is_empty(tmp_path: Path) -> None:
     crops = tmp_path / "AnnotationCrops"
     _tile(crops, [1])

@@ -33,8 +33,8 @@
     : (window.GoldMode && window.GoldMode.onGoldPath(location.pathname) ? "goldView" : VIEW_KEY);
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
   // Finished cards kept to repaint without the network, counted in pixels so small cards keep more of them: 64 M
-  // pixels is 256 MB of canvas, about 240 Large cards, 980 Small or 60 Huge. A count of 80 was less than the three
-  // screens of Medium or Small cards the grid keeps drawn, so a scroll back always reloaded them.
+  // pixels is 256 MB of canvas, 64 Huge (1024 px), 256 Large, 455 Medium or 1,024 Small cards. A count of 80 was less
+  // than the three screens of Medium or Small cards the grid keeps drawn, so a scroll back always reloaded them.
   const CACHE_MAX_PIXELS = 64 * 1024 * 1024;
 
   const state = {

@@ -35,6 +35,39 @@ CACHE_DIR = "cache"
 """Folder under ``AnnotationCrops`` for cached bitmasks. It is not served as a raw file."""
 
 
+_CIRCLE_VOLUMES_KEPT = 4
+"""Parsed circle files kept in memory, one per volume: 57 MB for RC1's 37 MB file, 91 MB for RPC1's 59 MB one."""
+
+_circle_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+_circle_lock = threading.Lock()
+
+
+def _circles_by_key(crops: Path) -> dict:
+    """``load_circle_annotations(crops)``, parsed once per version of the file (its mtime and size).
+
+    Every negative bitmask needs its tile's circles. Parsing the whole volume's file for each one took 0.5-1 s, about
+    92% of building a card layer. One lock covers the parse, so card layers built at once wait for a single parse.
+    """
+    path = circle_file_path(crops)
+    try:
+        info = path.stat()
+        stamp = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        return {}
+    name = str(path)
+    with _circle_lock:
+        hit = _circle_cache.get(name)
+        if hit is not None and hit[0] == stamp:
+            _circle_cache[name] = _circle_cache.pop(name)
+            return hit[1]
+        index = load_circle_annotations(crops)
+        _circle_cache.pop(name, None)
+        _circle_cache[name] = (stamp, index)
+        while len(_circle_cache) > _CIRCLE_VOLUMES_KEPT:
+            _circle_cache.pop(next(iter(_circle_cache)))
+        return index
+
+
 def cache_path(crops: Path, image_key: str, location_id: int) -> Path:
     """Where the bitmask for ``(image_key, location_id)`` is cached."""
     return crops / CACHE_DIR / f"neg_{image_key}_{location_id}.png"
@@ -130,7 +163,7 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     if hit is not None:
         return hit
 
-    circles = load_circle_annotations(crops).get(image_key, ())
+    circles = _circles_by_key(crops).get(image_key, ())
     regions = collect_negative_regions(image_key, location_id, ids, circles, masks, shape)
     canvas = stamp_negative_regions(regions, shape)
     bitmask = (canvas < 0).astype("uint8") * 255
