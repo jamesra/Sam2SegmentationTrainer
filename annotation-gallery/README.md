@@ -95,7 +95,7 @@ be audited and re-created.
   optional spread over structure types or section ranges. A location that spans several crop windows (about half of RC1)
   contributes one window, chosen by the seed among those holding a substantial part of its mask, so large cells are not
   left out.
-* **Open list**: a `.txt` of location ids (one per line or comma-separated, `#` comments) that extends or replaces a volume's
+* **Open list**: a `.txt` of location ids (one per line or comma-separated, `5-8` an inclusive range, `#` comments) that extends or replaces a volume's
   cards. Ids that cannot be used are reported with the reason.
 * **Touch up**: pen retrace (`R`) or the brush and eraser (`B`, hold Shift to erase, Ctrl+Z to undo a stroke, Save mask).
   Edits are exact to the pixel (a pixel is inside when its centre is).

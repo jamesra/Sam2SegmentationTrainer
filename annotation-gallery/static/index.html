@@ -59,23 +59,23 @@
       </div>
     </div>
     <div class="filter">
-      <label for="type" title="Matches a type id or a type name. This field is a substring, not a list or a regular expression.">Type</label>
+      <label for="type" title="Type ids, such as 1 or 1, 3, 5-8 (a hyphen between two ids is an inclusive range). Anything else matches as a substring of the type name.">Type</label>
       <div class="filter-row">
-        <input id="type" type="search" placeholder="type id or name" title="Matches a type id or a type name. This field is a substring, not a list or a regular expression.">
+        <input id="type" type="search" placeholder="type ids or name" title="Type ids, such as 1 or 1, 3, 5-8 (a hyphen between two ids is an inclusive range). Anything else matches as a substring of the type name.">
         <button type="button" class="reverse" data-sort="type_id" title="Sort by type. Click again to reverse.">Reverse</button>
       </div>
     </div>
     <div class="filter">
-      <label for="label" title="Exact structure ids, such as 487 or 487, 120. Or a regular expression matched against structure labels, such as ^M.">Structure</label>
+      <label for="label" title="Exact structure ids, such as 487 or 487, 120, 1000-1050 (a hyphen between two ids is an inclusive range). Or a regular expression matched against structure labels, such as ^M.">Structure</label>
       <div class="filter-row">
-        <input id="label" type="search" placeholder="ids or label regex" title="Exact structure ids, such as 487 or 487, 120. Or a regular expression matched against structure labels, such as ^M.">
+        <input id="label" type="search" placeholder="ids or label regex" title="Exact structure ids, such as 487 or 487, 120, 1000-1050 (a hyphen between two ids is an inclusive range). Or a regular expression matched against structure labels, such as ^M.">
         <button type="button" class="reverse" data-sort="structure_label" title="Sort by structure label. Click again to reverse.">Reverse</button>
       </div>
     </div>
     <div class="filter">
-      <label for="locate" title="Show only this location id, or several separated by commas. A location is shown whether it is approved, rejected, or unknown; the other filters still apply.">Location</label>
+      <label for="locate" title="Show only this location id, or several separated by commas, such as 1529372, 1529388, 193665-193697 (a hyphen between two ids is an inclusive range). A location is shown whether it is approved, rejected, or unknown; the other filters still apply.">Location</label>
       <div class="filter-row">
-        <input id="locate" type="search" placeholder="location id(s)" title="Show only this location id, or several separated by commas. A location is shown whether it is approved, rejected, or unknown; the other filters still apply.">
+        <input id="locate" type="search" placeholder="location id(s)" title="Show only this location id, or several separated by commas, such as 1529372, 1529388, 193665-193697 (a hyphen between two ids is an inclusive range). A location is shown whether it is approved, rejected, or unknown; the other filters still apply.">
       </div>
       <div id="locate-status" class="locate-status" role="status" aria-live="polite" hidden></div>
     </div>
@@ -312,7 +312,7 @@
         <option value="extend">add these locations to the current cards</option>
         <option value="replace">replace the cards with these locations</option>
       </select>
-      <p class="import-totals">One location id per line, or separated by commas. Text after # is ignored. Replacing removes the current cards, approved ones included.</p>
+      <p class="import-totals">One location id per line, or separated by commas; a hyphen between two ids is an inclusive range, such as 193665-193697. Text after # is ignored. Replacing removes the current cards, approved ones included.</p>
       <div class="import-actions">
         <button type="button" id="gold-list-start" class="review-only">Apply</button>
         <button type="button" id="gold-list-cancel">Cancel</button>

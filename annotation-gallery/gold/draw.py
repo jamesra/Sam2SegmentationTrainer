@@ -129,29 +129,45 @@ def choose_window(seed: int, location_id: int, windows: Sequence[Dict[str, Any]]
 
 
 _ID = re.compile(r"[0-9]+")
+_RANGE = re.compile(r"([0-9]+)-([0-9]+)")
+# "5 - 8" is the range 5-8; "0 -4" stays two tokens, an id and a junk "-4".
+_RANGE_SPACES = re.compile(r"(?<=[0-9])\s+-\s+(?=[0-9])")
 
 
 def parse_id_list(text: str, limit: int = 100000) -> Tuple[List[int], List[str]]:
     """Location ids from a .txt: separated by newlines, commas, spaces or semicolons; ``#`` starts a comment.
 
+    Follows the Viking / nornir id-list convention (``nornir_shared.argparse_helpers.IntegerList``): a hyphen between
+    two ids is an inclusive range, so ``1, 3, 5-8`` is 1, 3, 5, 6, 7 and 8. A backwards range (``8-5``) is not ids.
+
     Returns ``(ids, bad)``: ids in order of first appearance without repeats, and the tokens that were not ids, so an upload
-    never silently drops a line.
+    never silently drops a line. More than ``limit`` ids (a range counts every id in it) raises ``ValueError``.
     """
     ids: List[int] = []
     seen = set()
     bad: List[str] = []
+
+    def add(value: int) -> None:
+        if value not in seen:
+            if len(ids) >= limit:
+                raise ValueError(f"more than {limit} ids")
+            seen.add(value)
+            ids.append(value)
+
     for line in text.splitlines():
-        line = line.split("#", 1)[0]
+        line = _RANGE_SPACES.sub("-", line.split("#", 1)[0])
         for token in re.split(r"[,\s;]+", line.strip()):
             if not token:
                 continue
+            span = _RANGE.fullmatch(token)
             if _ID.fullmatch(token) and int(token) > 0:
-                value = int(token)
-                if value not in seen:
-                    seen.add(value)
-                    ids.append(value)
+                add(int(token))
+            elif span and 0 < int(span.group(1)) <= int(span.group(2)):
+                lo, hi = int(span.group(1)), int(span.group(2))
+                if hi - lo + 1 > limit:
+                    raise ValueError(f"more than {limit} ids")
+                for value in range(lo, hi + 1):
+                    add(value)
             else:
                 bad.append(token)
-    if len(ids) > limit:
-        raise ValueError(f"more than {limit} ids")
     return ids, bad

@@ -1219,19 +1219,47 @@
     return Number.isFinite(value) ? { lo: value, hi: value } : { invalid: true };
   }
 
-  // "1529372" or "1529372, 1529388": the location ids to show. Text with no usable id matches nothing.
-  function parseLocationIds(text) {
+  // Id boxes follow the Viking / nornir id-list convention (nornir_shared.argparse_helpers.IntegerList, Viking's
+  // NumberRangeToList): commas separate ids and a hyphen between two ids is an inclusive range, so "1, 3, 5-8, 11" is
+  // 1, 3, 5, 6, 7, 8 and 11. Spaces, semicolons and new lines also separate, so a pasted column works. Null for empty
+  // text; pieces that are neither an id nor a range (including a backwards range such as 8-5) match nothing.
+  // `listed` holds the ids named one by one; ranges stay as [lo, hi] so a wide one costs nothing to test.
+  function parseIdList(text) {
     const trimmed = (text || "").trim();
     if (!trimmed) {
       return null;
     }
-    const ids = new Set();
-    for (const piece of trimmed.split(/[\s,;]+/)) {
+    const listed = new Set();
+    const ranges = [];
+    // "5 - 8" is the range 5-8; "0 -4" stays two pieces, an id and a junk "-4".
+    for (const piece of trimmed.replace(/(\d)\s+-\s+(?=\d)/g, "$1-").split(/[\s,;]+/)) {
+      const range = /^(\d+)-(\d+)$/.exec(piece);
       if (/^\d+$/.test(piece)) {
-        ids.add(Number(piece));
+        listed.add(Number(piece));
+      } else if (range && Number(range[1]) <= Number(range[2])) {
+        ranges.push([Number(range[1]), Number(range[2])]);
       }
     }
-    return ids;
+    return {
+      listed,
+      ranges,
+      empty: !listed.size && !ranges.length,
+      has(id) {
+        const value = Number(id);
+        return listed.has(value) || ranges.some(([lo, hi]) => value >= lo && value <= hi);
+      },
+    };
+  }
+
+  // True when the whole text is an id list (ids and ranges only), so a box that also takes a name or a regular
+  // expression reads it as ids.
+  function isIdListText(text) {
+    return /^\d+(?:(?:\s+-\s+|-)\d+)?(?:[\s,;]+\d+(?:(?:\s+-\s+|-)\d+)?)*[\s,;]*$/.test((text || "").trim());
+  }
+
+  // The Location box: "1529372", "1529372, 1529388" or "193665-193697". Text with no usable id matches nothing.
+  function parseLocationIds(text) {
+    return parseIdList(text);
   }
 
   function overlayHue() {
@@ -1611,6 +1639,9 @@
     const zText = els.z.value.trim();
     const radius = parseRadius(els.radius.value);
     const locations = parseLocationIds(els.locate.value);
+    // Type and Structure take ids in the id-list convention, or otherwise a type name / a structure label regex.
+    const typeIds = isIdListText(type) ? parseIdList(type) : null;
+    const structureIds = isIdListText(label) ? parseIdList(label) : null;
     const classes = visibleClasses();
     if (radius && radius.invalid) {
       state.filterNote = "radius: use a number or a range such as 100-500";
@@ -1627,22 +1658,20 @@
       if (zText && String(row.z) !== zText) {
         return false;
       }
-      if (type) {
+      if (typeIds) {
+        if (row.type_id == null || !typeIds.has(row.type_id)) {
+          return false;
+        }
+      } else if (type) {
         const hay = `${row.type_id || ""} ${row.type_name || ""}`.toLowerCase();
         if (!hay.includes(type)) {
           return false;
         }
       }
       if (label) {
-        const idText = row.structure_id == null ? "" : String(row.structure_id);
         const name = `${row.structure_label || ""}`;
-        const pieces = label.split(",").map((item) => item.trim()).filter(Boolean);
-        if (pieces.length > 1 && pieces.every((item) => /^\d+$/.test(item))) {
-          if (!pieces.includes(idText)) {
-            return false;
-          }
-        } else if (/^\d+$/.test(label)) {
-          if (idText !== label) {
+        if (structureIds) {
+          if (row.structure_id == null || !structureIds.has(row.structure_id)) {
             return false;
           }
         } else {
@@ -2542,7 +2571,7 @@
     if (!ids) {
       return "";
     }
-    if (!ids.size) {
+    if (ids.empty) {
       return `"${text}" has no location id`;
     }
     const known = state.rows.some((row) => ids.has(Number(row.location_id)));
@@ -3937,7 +3966,9 @@
   function scheduleLocateCheck() {
     window.clearTimeout(locateCheck.timer);
     const ids = parseLocationIds(els.locate.value);
-    const missing = ids ? [...ids].filter((id) => !state.rows.some((row) => Number(row.location_id) === id)) : [];
+    // Only ids named one by one are looked up on the server; a range filters what the volume already has (a wide
+    // range would otherwise ask the server about every number in it).
+    const missing = ids ? [...ids.listed].filter((id) => !state.rows.some((row) => Number(row.location_id) === id)) : [];
     if (!missing.length || state.permission !== "review") {
       if (!locateCheck.active.size) {
         showLocateStatus("");
