@@ -32,7 +32,10 @@
     ? "converterView"
     : (window.GoldMode && window.GoldMode.onGoldPath(location.pathname) ? "goldView" : VIEW_KEY);
   const CARD_SIZES = { huge: 1024, large: 512, medium: 384, small: 256 };
-  const CACHE_MAX = 80;
+  // Finished cards kept to repaint without the network, counted in pixels so small cards keep more of them: 64 M
+  // pixels is 256 MB of canvas, about 240 Large cards, 980 Small or 60 Huge. A count of 80 was less than the three
+  // screens of Medium or Small cards the grid keeps drawn, so a scroll back always reloaded them.
+  const CACHE_MAX_PIXELS = 64 * 1024 * 1024;
 
   const state = {
     me: null,
@@ -761,13 +764,20 @@
     return hit;
   }
 
+  let overlayCachePixels = 0;
+
   function cacheSet(key, canvas) {
-    if (overlayCache.has(key)) {
+    const old = overlayCache.get(key);
+    if (old) {
       overlayCache.delete(key);
+      overlayCachePixels -= old.width * old.height;
     }
     overlayCache.set(key, canvas);
-    while (overlayCache.size > CACHE_MAX) {
-      overlayCache.delete(overlayCache.keys().next().value);
+    overlayCachePixels += canvas.width * canvas.height;
+    while (overlayCachePixels > CACHE_MAX_PIXELS && overlayCache.size > 1) {
+      const [oldestKey, oldest] = overlayCache.entries().next().value;
+      overlayCache.delete(oldestKey);
+      overlayCachePixels -= oldest.width * oldest.height;
     }
   }
 
@@ -4169,7 +4179,8 @@
   });
 
   els.scroller.addEventListener("scroll", () => {
-    render(false);
+    // Keep the cards that stay in the drawn window: rebuilding them all made cards that never left the screen load again.
+    render(false, true);
     scheduleReprioritize();
   });
   window.addEventListener("resize", () => {

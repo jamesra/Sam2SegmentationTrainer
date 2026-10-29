@@ -85,6 +85,9 @@ VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # "original" holds the converter's current-outline masks, drawn beside the proposal.
 FILE_PREFIXES = frozenset({"images", "masks", "ignored", "original"})
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# A crop's tissue image and its card JPEGs hold no mask, so they do not change when an annotation does: the browser
+# keeps them a day without asking. Masks, card layers and everything else are asked for each time (no-cache + ETag).
+TISSUE_CACHE = "private, max-age=86400"
 SESSION_COOKIE = "gallery_session"
 # Most location ids one card-scores or rescore-status request may ask about (the page asks for the few it watches).
 MAX_CARD_SCORE_IDS = 1000
@@ -1970,12 +1973,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
             if ensured is None or not ensured.is_file():
                 self._send_json({"error": "not found"}, status=404)
                 return
-            self._send_file(ensured, content_type_for(ensured))
+            self._send_file(ensured, content_type_for(ensured), TISSUE_CACHE)
             return
         if not target.is_file():
             self._send_json({"error": "not found"}, status=404)
             return
-        self._send_file(target, content_type_for(target))
+        tissue = relative.replace("\\", "/").startswith("images/") and target.suffix.lower() in (".png", ".jpg", ".jpeg")
+        self._send_file(target, content_type_for(target), TISSUE_CACHE if tissue else "no-cache")
 
     def _review_granted(self, volume: str) -> bool:
         """True when the caller may review ``volume``; otherwise sends 404 (no grant) or 403 (read-only)."""
@@ -2055,14 +2059,28 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path: Path, content_type: str) -> None:
+    def _send_file(self, path: Path, content_type: str, cache: str = "no-cache") -> None:
+        """Send a file with an ETag of its content, or a 304 when the browser already holds that content.
+
+        ``no-cache`` (the default) lets the browser keep the file but ask each time, which costs a 304 and no body.
+        The ETag is of the bytes, not the mtime, so a thumbnail rebuilt with the same picture still matches.
+        """
         if not path.is_file():
             self._send_json({"error": "not found"}, status=404)
             return
         data = path.read_bytes()
+        etag = '"' + hashlib.sha1(data).hexdigest()[:20] + '"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(data)
 

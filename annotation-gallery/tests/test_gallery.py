@@ -1227,6 +1227,42 @@ def test_cardmask_endpoint_serves_png_with_etag(httpd: tuple[str, int], registry
     assert missing.status == 404
 
 
+
+def test_file_route_caches_tissue_for_a_day_and_revalidates_masks(httpd: tuple[str, int], registry: Path) -> None:
+    """Tissue images and card JPEGs are kept a day; masks and sidecars are asked for each time; both answer 304."""
+    import numpy as np
+    from PIL import Image as _Image
+
+    crops = registry / "RC2" / "AnnotationCrops"
+    key = "RC2_17_D1_X0-64_Y0-64"
+    (crops / "images").mkdir(parents=True, exist_ok=True)
+    (crops / "masks").mkdir(parents=True, exist_ok=True)
+    (crops / "images" / f"{key}.json").write_text(
+        json.dumps({"image": {"width": 64, "height": 64}, "annotations": [{"id": 42}]}), encoding="utf-8"
+    )
+    _Image.fromarray(np.full((64, 64), 128, dtype=np.uint8)).save(crops / "images" / f"{key}.png")
+    _Image.fromarray(np.zeros((64, 64), dtype=np.uint8)).save(crops / "masks" / f"{key}_42.png")
+
+    def get(rel: str, headers: dict[str, str] | None = None):
+        connection = HTTPConnection(httpd[0], httpd[1], timeout=5)
+        connection.request("GET", f"/api/volumes/RC2/file?path={rel}", headers=headers or {})
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        return response.status, response.getheader("Cache-Control"), response.getheader("ETag"), body
+
+    for rel, cache in (
+        (f"images/{key}.png", "private, max-age=86400"),
+        (f"overlays/thumb/256/{key}.jpg", "private, max-age=86400"),
+        (f"masks/{key}_42.png", "no-cache"),
+        (f"images/{key}.json", "no-cache"),
+    ):
+        status, control, etag, body = get(rel)
+        assert (status, control) == (200, cache), rel
+        assert etag and body, rel
+        status, control, again, body = get(rel, {"If-None-Match": etag})
+        assert (status, control, again, body) == (304, cache, etag, b""), rel
+
 def test_update_all_endpoints(httpd: tuple[str, int], registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NORNIR_BUILDMANAGER_DIR", str(registry / "no-such-mount"))
     status, payload = _request(httpd, "GET", "/api/volumes/RC2/update-all", bearer="review")
@@ -1542,3 +1578,14 @@ def test_odata_read_does_not_retry_an_http_error(monkeypatch):
     with pytest.raises(HTTPError):
         server.fetch_odata_location("https://example.test/RPC2/OData", 7)
     assert len(calls) == 1
+
+
+def test_spa_scroll_keeps_drawn_cards_and_the_card_cache_is_by_pixels() -> None:
+    """A scroll back repaints from memory: drawn cards are kept and the cache holds about three screens or more."""
+    js = (GALLERY_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    scroll = js.split('els.scroller.addEventListener("scroll"', 1)[1].split("});", 1)[0]
+    assert "render(false, true);" in scroll
+    assert "const CACHE_MAX_PIXELS = 64 * 1024 * 1024;" in js
+    cache_set = js.split("function cacheSet", 1)[1].split("function blit", 1)[0]
+    assert "overlayCachePixels > CACHE_MAX_PIXELS" in cache_set
+    assert "CACHE_MAX " not in js
