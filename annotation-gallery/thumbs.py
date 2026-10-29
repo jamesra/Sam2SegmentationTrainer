@@ -4,8 +4,10 @@ Huge cards and the zoom view use the original crop PNG. Large, Medium, and
 Small read ``overlays/thumb/{512|384|256}/{imageKey}.jpg``. A JPEG is rewritten
 when it is missing or older than that window's newest mask.
 
-A background watch polls the registry symlink and the ``images``, ``masks``,
-and ``ignored`` folder modified times. One backfill runs at a time. A change
+A background watch polls the registry symlink, the ``images``, ``masks``,
+and ``ignored`` folder modified times and ``circle_annotations.json``. Each
+pass also builds the card layers (``cardmask.backfill_card_layers``) after the
+thumbnails, so a card's first view finds them ready. One backfill runs at a time. A change
 that arrives during a run queues a single follow-up pass, which reads the tree
 again when it starts. Thumbnail writes are not part of that signature, so
 filling the cache does not schedule another pass. Replacing a file in place
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import threading
 import time
 import traceback
@@ -36,6 +39,8 @@ _CROP_SUFFIXES = (".png", ".jpg", ".jpeg")
 _ENCODE_WORKERS = 4
 _WATCH_INTERVAL_S = 5.0
 _WATCH_FOLDERS = ("images", "masks", "ignored")
+# Rewritten by Update All; a card layer depends on its tile's circles, so a change starts a pass.
+_WATCH_FILES = ("circle_annotations.json",)
 
 _indexes: dict[str, dict[str, int]] = {}
 _index_lock = threading.Lock()
@@ -270,15 +275,29 @@ def _backfill_registry(registry: Path) -> None:
     if not registry.is_dir():
         return
     written = 0
+    volumes: list[tuple[str, Path]] = []
     for child in registry.iterdir():
         crops = crops_dir_for(child)
         if not crops.is_dir():
             continue
+        volumes.append((child.name, crops))
         try:
             written += backfill_crops(crops)
         except OSError as exc:
             print(f"annotation-gallery thumbnails {child.name}: {exc}", flush=True)
     print(f"annotation-gallery thumbnails: wrote {written}", flush=True)
+    from cardmask import BACKFILL_WORKERS, backfill_card_layers  # cardmask imports this module
+
+    if BACKFILL_WORKERS <= 0:
+        return
+    for name, crops in volumes:
+        started = time.monotonic()
+        try:
+            built = backfill_card_layers(crops)
+        except (OSError, sqlite3.Error) as exc:
+            print(f"annotation-gallery card layers {name}: {exc}", flush=True)
+            continue
+        print(f"annotation-gallery card layers {name}: built {built} in {time.monotonic() - started:.0f} s", flush=True)
 
 
 def _dir_mtime_ns(path: Path) -> int | None:
@@ -304,7 +323,7 @@ def registry_signature(registry: Path) -> tuple[str, tuple[tuple[str, tuple[int 
 
     The symlink target catches a retargeted ``current`` pointer even when the
     new tree's folder times were preserved. Each volume contributes the modified
-    times of ``images``, ``masks``, and ``ignored``. ``overlays/thumb`` is
+    times of ``images``, ``masks`` and ``ignored``, and of ``circle_annotations.json``. ``overlays`` is
     omitted so writing a JPEG does not look like a new export.
     """
     rows: list[tuple[str, tuple[int | None, ...]]] = []
@@ -316,7 +335,7 @@ def registry_signature(registry: Path) -> tuple[str, tuple[tuple[str, tuple[int 
         crops = crops_dir_for(child)
         if not crops.is_dir():
             continue
-        rows.append((child.name, tuple(_dir_mtime_ns(crops / name) for name in _WATCH_FOLDERS)))
+        rows.append((child.name, tuple(_dir_mtime_ns(crops / name) for name in _WATCH_FOLDERS + _WATCH_FILES)))
     return (_link_target(registry), tuple(rows))
 
 

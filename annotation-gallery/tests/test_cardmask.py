@@ -97,3 +97,87 @@ def test_rejected_target_still_has_a_layer_and_bad_input_is_refused(tmp_path: Pa
         pass
     else:
         raise AssertionError("expected FileNotFoundError")
+
+
+OTHER = "RC1_5_D1_X64-128_Y0-64"
+
+
+def _circles(crops: Path, cells: dict[str, list[dict]], stamp_ns: int) -> None:
+    path = crops / "circle_annotations.json"
+    path.write_text(json.dumps({"version": 1, "grid_cells": cells}), encoding="utf-8")
+    os.utime(path, ns=(stamp_ns, stamp_ns))
+
+
+def _circle(location_id: int, x: float) -> dict:
+    return {"location_id": location_id, "center_x": x, "center_y": 56.0, "radius": 4.0}
+
+
+def test_a_rewritten_circle_file_only_rebuilds_the_tiles_whose_circles_changed(tmp_path: Path) -> None:
+    """Update All rewrites the whole circle file; a layer is rebuilt only when its own tile's circles differ."""
+    crops = _tile(tmp_path)
+    late = 2_000_000_000_000_000_000
+    _circles(crops, {KEY: [_circle(9, 8.0)], OTHER: [_circle(8, 8.0)]}, late)
+    first = ensure_card_mask(crops, 256, KEY, 1)
+    cached = card_mask_path(crops, 256, KEY, 1)
+    marker = cached.stat().st_mtime_ns
+
+    _circles(crops, {KEY: [_circle(9, 8.0)], OTHER: [_circle(8, 40.0)]}, late + 10_000_000_000)
+    assert ensure_card_mask(crops, 256, KEY, 1) == first
+    assert cached.stat().st_mtime_ns == marker, "another tile's circle moved: this layer is still valid"
+
+    _circles(crops, {KEY: [_circle(9, 40.0)], OTHER: [_circle(8, 40.0)]}, late + 20_000_000_000)
+    moved = _decode(ensure_card_mask(crops, 256, KEY, 1))
+    assert cached.stat().st_mtime_ns != marker
+    assert moved[224, 160, 1] > 0 and moved[224, 32, 1] == 0, "the negative circle is drawn where it is now"
+
+
+def test_a_layer_from_before_circle_digests_is_rebuilt(tmp_path: Path) -> None:
+    crops = _tile(tmp_path)
+    ensure_card_mask(crops, 256, KEY, 1)
+    cached = card_mask_path(crops, 256, KEY, 1)
+    with Image.open(cached) as image:
+        image.load()
+        plain = image.copy()
+    plain.save(cached)  # no circles field, as every layer written before the digest was
+    newer = cached.stat().st_mtime_ns + 10_000_000_000
+    os.utime(cached, ns=(newer, newer))
+    ensure_card_mask(crops, 256, KEY, 1)
+    with Image.open(cached) as image:
+        assert "circles" in image.info
+
+
+def _catalog(crops: Path, cards: list[tuple[int, str]]) -> None:
+    from catalog import connect
+
+    connection = connect(crops)
+    for location_id, image_key in cards:
+        connection.execute(
+            "INSERT INTO locations (location_id, z, structure_id, structure_label, type_id, type_name, radius, "
+            "image_key, image_relpath, mask_relpath, ignored) VALUES (?, 5, 7, 'c', 1, 'Cell', 5.0, ?, ?, ?, 0)",
+            [location_id, image_key, f"images/{image_key}.png", f"masks/{image_key}_{location_id}.png"],
+        )
+    connection.commit()
+    connection.close()
+
+
+def test_backfill_builds_every_card_at_each_size_once(tmp_path: Path) -> None:
+    from cardmask import backfill_card_layers
+
+    crops = _tile(tmp_path)
+    _catalog(crops, [(1, KEY), (2, KEY), (3, KEY)])  # 3 has no mask: skipped, not an error
+    assert backfill_card_layers(crops, workers=2) == 6
+    for size in (256, 384, 512):
+        assert card_mask_path(crops, size, KEY, 1).is_file() and card_mask_path(crops, size, KEY, 2).is_file()
+    assert backfill_card_layers(crops, workers=2) == 0, "a second pass only checks"
+    assert backfill_card_layers(crops, workers=0) == 0
+
+
+def test_the_watch_sees_a_rewritten_circle_file(tmp_path: Path) -> None:
+    from thumbs import registry_signature
+
+    registry = tmp_path / "set"
+    crops = _tile(registry / "RC1")
+    _circles(crops, {}, 1_000_000_000_000_000_000)
+    before = registry_signature(registry)
+    _circles(crops, {}, 1_000_000_010_000_000_000)
+    assert registry_signature(registry) != before

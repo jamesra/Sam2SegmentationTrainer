@@ -7,6 +7,7 @@ The gallery draws this over the tile so a reviewer sees the same other-annotatio
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -30,6 +31,9 @@ IMAGE_KEY_PATTERN = re.compile(r"[A-Za-z0-9_.\-]+")
 
 COUNT_FIELD = "negatives"
 """PNG text field in a cached bitmask that holds the number of negative annotations."""
+
+CIRCLE_FIELD = "circles"
+"""PNG text field in a cached bitmask (and a card layer) with :func:`circle_digest` of the circles it was built from."""
 
 CACHE_DIR = "cache"
 """Folder under ``AnnotationCrops`` for cached bitmasks. It is not served as a raw file."""
@@ -66,6 +70,19 @@ def _circles_by_key(crops: Path) -> dict:
         while len(_circle_cache) > _CIRCLE_VOLUMES_KEPT:
             _circle_cache.pop(next(iter(_circle_cache)))
         return index
+
+
+def _digest(circles: tuple) -> str:
+    return hashlib.sha1(repr(circles).encode("utf-8")).hexdigest()[:16]
+
+
+def circle_digest(crops: Path, image_key: str) -> str:
+    """Fingerprint of one tile's circles (the empty tuple included).
+
+    A cache built from this tile's circles stays valid while the fingerprint holds, however often the volume's
+    circle file is rewritten: Update All rewrites the whole file, which used to make every cached layer stale.
+    """
+    return _digest(_circles_by_key(crops).get(image_key, ()))
 
 
 def cache_path(crops: Path, image_key: str, location_id: int) -> Path:
@@ -119,8 +136,9 @@ def _sidecar(crops: Path, image_key: str) -> tuple[list[int], tuple[int, int]]:
     return ids, (int(image["height"]), int(image["width"]))
 
 
-def _read_cache(path: Path, newest_source_ns: int) -> tuple[bytes, int] | None:
-    """Cached PNG bytes and count when the file is at least as new as every source and decodes, else None.
+def _read_cache(path: Path, newest_source_ns: int, digest: str) -> tuple[bytes, int] | None:
+    """Cached PNG bytes and count when the file is at least as new as every source, was built from the tile's current
+    circles (``digest``; a file without the field is stale) and decodes, else None.
 
     ``Image.open`` reads only the header, so a file cut short mid-pixels would pass it; ``load`` decodes the
     pixels so a torn file counts as a miss and is rebuilt.
@@ -131,6 +149,8 @@ def _read_cache(path: Path, newest_source_ns: int) -> tuple[bytes, int] | None:
         data = path.read_bytes()
         with Image.open(io.BytesIO(data)) as image:
             image.load()
+            if image.info.get(CIRCLE_FIELD) != digest:
+                return None
             return data, int(image.info.get(COUNT_FIELD, "0"))
     except (OSError, ValueError):
         return None
@@ -140,8 +160,8 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     """8-bit PNG (0 = no negative, 255 = other annotation) for the tile, and how many other annotations it has.
 
     Computed with :func:`annotation_crops.negatives.collect_negative_regions` from the tile's other mask PNGs and
-    the circle annotations, then cached under ``cache/``. The cache is reused until the sidecar, the circle file
-    or any neighbor mask is newer than it. A cache that cannot be written is ignored, so a read-only share
+    the circle annotations, then cached under ``cache/``. The cache is reused until the sidecar or any neighbor mask
+    is newer than it, or the tile's own circles change (:func:`circle_digest`). A cache that cannot be written is ignored, so a read-only share
     still works.
 
     Raises ValueError for an unsafe key or a sidecar without a size, and FileNotFoundError when the tile's
@@ -153,17 +173,17 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     masks = crops / "masks"
     sources = [
         crops / "images" / f"{image_key}.json",
-        circle_file_path(crops),
         original_mask_path(crops, image_key, location_id),
         *(masks / f"{image_key}_{other}.png" for other in ids if other != location_id),
     ]
     newest = max(_mtime_ns(source) for source in sources)
+    circles = _circles_by_key(crops).get(image_key, ())
+    digest = _digest(circles)
     cached_file = cache_path(crops, image_key, location_id)
-    hit = _read_cache(cached_file, newest)
+    hit = _read_cache(cached_file, newest, digest)
     if hit is not None:
         return hit
 
-    circles = _circles_by_key(crops).get(image_key, ())
     regions = collect_negative_regions(image_key, location_id, ids, circles, masks, shape)
     canvas = stamp_negative_regions(regions, shape)
     bitmask = (canvas < 0).astype("uint8") * 255
@@ -171,6 +191,7 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     count = len(regions) + added
     info = PngImagePlugin.PngInfo()
     info.add_text(COUNT_FIELD, str(count))
+    info.add_text(CIRCLE_FIELD, digest)
     buffer = io.BytesIO()
     Image.fromarray(bitmask, mode="L").save(buffer, format="PNG", pnginfo=info, optimize=True)
     data = buffer.getvalue()

@@ -9,8 +9,9 @@ thumbnail:
 * B: where the two overlap
 
 Each channel is box-downsampled and keeps 0-255, so the browser can use it as soft alpha. A file is valid only
-while it is newer than every source that feeds it; the gallery also deletes a tile's files outright when it
-changes a mask (:func:`drop_card_masks`).
+while it is newer than every mask and sidecar that feeds it and was built from the tile's current circles (its
+``circles`` text field, :func:`negatives_view.circle_digest`); the gallery also deletes a tile's files outright when
+it changes a mask (:func:`drop_card_masks`). :func:`backfill_card_layers` builds them ahead of the first view.
 """
 
 from __future__ import annotations
@@ -18,19 +19,28 @@ from __future__ import annotations
 import io
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import crops_path  # noqa: F401
 import numpy as np
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
-from annotation_crops.negatives import circle_file_stamp
-from negatives_view import IMAGE_KEY_PATTERN, _sidecar, negative_bitmask, original_mask_path
+from negatives_view import (
+    CIRCLE_FIELD,
+    IMAGE_KEY_PATTERN,
+    _sidecar,
+    circle_digest,
+    negative_bitmask,
+    original_mask_path,
+)
 from thumbs import THUMB_SIZES
 
 CARD_MASK_DIR = ("overlays", "cardmask")
 _MASK_THRESHOLD = 127
 _build_slots = threading.BoundedSemaphore(int(os.environ.get("GALLERY_CARDMASK_BUILDS", "4") or 4))
+# Background builders; each takes one of the build slots, so cards being viewed keep the rest. 0 turns it off.
+BACKFILL_WORKERS = int(os.environ.get("GALLERY_CARDMASK_BACKFILL_WORKERS", "2") or 0)
 
 
 def card_mask_path(crops: Path, size: int, image_key: str, location_id: int) -> Path:
@@ -82,11 +92,12 @@ def _annotation_ids(crops: Path, image_key: str) -> tuple[int, list[int]]:
 def _newest_source_ns(crops: Path, image_key: str, location_id: int, own: Path | None) -> int:
     """Newest mtime among everything a card layer is built from.
 
-    That is the sidecar, the circle file, the location's own mask and every other annotation's mask in the tile.
-    The tile's annotation ids come from a cached read of the sidecar, so a warm check is a handful of stats.
+    That is the sidecar, the location's own mask and every other annotation's mask in the tile. The circles are
+    checked by their digest instead, since the circle file is rewritten whole. The tile's annotation ids come from a
+    cached read of the sidecar, so a warm check is a handful of stats.
     """
     sidecar_ns, ids = _annotation_ids(crops, image_key)
-    newest = max(sidecar_ns, circle_file_stamp(crops) or 0)
+    newest = sidecar_ns
     if own is not None:
         newest = max(newest, _mtime_ns(own))
     newest = max(newest, _mtime_ns(original_mask_path(crops, image_key, location_id)))
@@ -109,8 +120,18 @@ def _read_plane(data: bytes | Path) -> np.ndarray:
         return np.asarray(image.convert("L"), dtype=np.uint8)
 
 
+def _built_from(data: bytes) -> str | None:
+    """The circle digest a cached layer records, or None (an older file, or one that does not open)."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            return image.info.get(CIRCLE_FIELD)
+    except (OSError, ValueError):
+        return None
+
+
 def build_card_mask(crops: Path, size: int, image_key: str, location_id: int) -> bytes:
     """PNG bytes for one card layer. Raises FileNotFoundError when the location has no mask in this tile."""
+    digest = circle_digest(crops, image_key)
     own_path = _own_mask_path(crops, image_key, location_id)
     if own_path is None:
         raise FileNotFoundError(f"no mask for {image_key} {location_id}")
@@ -126,17 +147,24 @@ def build_card_mask(crops: Path, size: int, image_key: str, location_id: int) ->
         ) > _MASK_THRESHOLD
     planes = (own, negative, own & negative)
     rgb = np.stack([_downsample(plane.astype(np.uint8) * 255, size) for plane in planes], axis=-1)
+    info = PngImagePlugin.PngInfo()
+    info.add_text(CIRCLE_FIELD, digest)
     buffer = io.BytesIO()
-    Image.fromarray(rgb, mode="RGB").save(buffer, format="PNG", optimize=True)
+    Image.fromarray(rgb, mode="RGB").save(buffer, format="PNG", pnginfo=info, optimize=True)
     return buffer.getvalue()
 
 
 def ensure_card_mask(crops: Path, size: int, image_key: str, location_id: int) -> bytes:
-    """Cached layer when it is newer than every source, else rebuilt and cached.
+    """Cached layer when it is still valid (see the module notes), else rebuilt and cached.
 
     Raises ValueError for an unsafe key or size and FileNotFoundError when the location has no mask.
     A cache that cannot be written is ignored, so a read-only share still works.
     """
+    return _ensure(crops, size, image_key, location_id)[0]
+
+
+def _ensure(crops: Path, size: int, image_key: str, location_id: int) -> tuple[bytes, bool]:
+    """:func:`ensure_card_mask`, and whether it had to build the layer."""
     if size not in THUMB_SIZES or IMAGE_KEY_PATTERN.fullmatch(image_key) is None:
         raise ValueError("invalid card mask request")
     cached = card_mask_path(crops, size, image_key, location_id)
@@ -145,7 +173,9 @@ def ensure_card_mask(crops: Path, size: int, image_key: str, location_id: int) -
         raise FileNotFoundError(f"no mask for {image_key} {location_id}")
     try:
         if cached.stat().st_mtime_ns >= _newest_source_ns(crops, image_key, int(location_id), own):
-            return cached.read_bytes()
+            data = cached.read_bytes()
+            if _built_from(data) == circle_digest(crops, image_key):
+                return data, False
     except OSError:
         pass
     with _build_slots:
@@ -159,7 +189,50 @@ def ensure_card_mask(crops: Path, size: int, image_key: str, location_id: int) -
         pass
     finally:
         temporary.unlink(missing_ok=True)
-    return data
+    return data, True
+
+
+def _catalog_cards(crops: Path) -> list[tuple[int, str]]:
+    """Every card of the volume, ``(location_id, image_key)``, in section order."""
+    from catalog import connect
+
+    connection = connect(crops)
+    try:
+        rows = connection.execute(
+            "SELECT location_id, image_key, MIN(z) AS z FROM locations WHERE image_key IS NOT NULL"
+            " GROUP BY location_id, image_key ORDER BY z, location_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    return [(int(row[0]), str(row[1])) for row in rows]
+
+
+def backfill_card_layers(crops: Path, workers: int | None = None) -> int:
+    """Build every card's layer at each card size (Large first) before it is viewed. Returns how many were built.
+
+    A layer that is still valid is only checked, so a pass after an Update All rebuilds just the tiles whose masks or
+    circles changed. Cards without a mask are skipped. ``workers`` defaults to :data:`BACKFILL_WORKERS`.
+    """
+    workers = BACKFILL_WORKERS if workers is None else workers
+    if workers <= 0:
+        return 0
+    cards = _catalog_cards(crops)
+    sizes = sorted(THUMB_SIZES, reverse=True)
+
+    def one(card: tuple[int, str]) -> int:
+        location_id, image_key = card
+        built = 0
+        for size in sizes:
+            try:
+                built += _ensure(crops, size, image_key, location_id)[1]
+            except (FileNotFoundError, ValueError):
+                return built
+            except OSError as exc:
+                print(f"annotation-gallery card layer {image_key} {location_id}: {exc}", flush=True)
+        return built
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gallery-card-layers") as pool:
+        return sum(pool.map(one, cards))
 
 
 def drop_card_masks(crops: Path, image_keys: list[str]) -> int:
