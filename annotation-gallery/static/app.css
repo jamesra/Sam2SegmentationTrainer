@@ -1157,6 +1157,17 @@ button.card-score:hover {
   letter-spacing: 0.04em;
 }
 
+/* A validation card (never trained on) carries a small "val" tag after its location id. */
+.split-tag {
+  padding: 0 3px;
+  border: 1px solid var(--accent, #3478cb);
+  border-radius: 3px;
+  color: var(--accent, #3478cb);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* The trend icon beside a card's score, and the chart it opens. */
 .trend-btn {
   margin: 0 0 0 3px;

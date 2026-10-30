@@ -66,6 +66,7 @@ from refresh import (
     nornir_buildmanager_root,
     refresh_location,
 )
+from annotation_crops.validation_split import FILE_NAME as SPLIT_FILE_NAME, read_split_file
 from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
@@ -342,7 +343,8 @@ _CATALOG_LOCK = threading.Lock()
 def catalog_stamp(crops: Path) -> tuple:
     """Changes whenever something the catalog shows changes (rows, review state, rejected masks)."""
     parts = []
-    for name in ("annotation_crops.sqlite", "annotation_crops.sqlite-wal", "ignore.json", "approved.json", "ignored"):
+    for name in ("annotation_crops.sqlite", "annotation_crops.sqlite-wal", "ignore.json", "approved.json", "ignored",
+                 SPLIT_FILE_NAME):
         try:
             info = (Path(crops) / name).stat()
             parts.append((name, info.st_mtime_ns, info.st_size))
@@ -359,8 +361,11 @@ def catalog_body(crops: Path, volume: str, permission: str, crop_size: int) -> t
         cached = _CATALOG_CACHE.get(key)
         if cached and cached[0] == stamp:
             return cached[1], cached[2]
+    # ``split``: the training run's validation / training locations (validation_split.json), or None when no run
+    # has published one; the page's Split filter uses it.
     body = json.dumps(
-        {"volume": volume, "permission": permission, "cropSize": crop_size, "rows": list_catalog_rows(crops)}
+        {"volume": volume, "permission": permission, "cropSize": crop_size, "rows": list_catalog_rows(crops),
+         "split": read_split_file(crops)}
     ).encode("utf-8")
     packed = gzip.compress(body, compresslevel=5)
     with _CATALOG_LOCK:

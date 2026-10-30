@@ -190,6 +190,8 @@ const context = {{
   closeViewer: () => {{}},
   renderSortStack: () => {{}},
   watchCatalogRescores: () => {{}},
+  indexSplit: () => null,
+  applySplitControl: () => {{}},
   CARD_SORT_WORST_DESC: new Map(),
   render: () => {{ renders += 1; }},
   document: {{ body: {{ classList: {{ toggle: () => {{}} }} }} }},

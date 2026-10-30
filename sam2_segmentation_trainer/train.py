@@ -1364,6 +1364,26 @@ def _record_training_data(
         )
     except Exception as exc:
         print(f"WARNING: could not write the training data record: {exc}")
+    _publish_split(run_dir, data_dir, volumes, train_ex, val_ex, cfg)
+
+
+def _publish_split(run_dir: Path, data_dir: Path, volumes: list[str], train_ex, val_ex, cfg: DictConfig) -> None:
+    """Write ``validation_split.json`` beside each volume's crops (the locations this run validates and trains on),
+    for the gallery's Split filter; a failure only warns."""
+    from annotation_crops.validation_split import write_split_file
+
+    mode = str(OmegaConf.select(cfg, "data.split_mode", default="location"))
+    for volume in volumes:
+        try:
+            write_split_file(
+                annotation_crops_root(volume, data_dir),
+                run=run_dir.name,
+                mode=mode,
+                validation={int(ex.location_id) for ex in val_ex if ex.volume == volume},
+                training={int(ex.location_id) for ex in train_ex if ex.volume == volume},
+            )
+        except Exception as exc:
+            print(f"WARNING: could not publish the validation split of {volume}: {exc}")
 
 
 def _write_run_inputs(path: Path, inputs: RunInputs) -> None:

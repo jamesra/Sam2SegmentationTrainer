@@ -59,6 +59,17 @@
       </div>
     </div>
     <div class="filter">
+      <label for="split" title="Which side of the training run's split a card is on. Validation cards are never trained on; they are what the run scores itself against. Neither: guard sections beside the validation sections, or locations added after the run started.">Split</label>
+      <div class="filter-row">
+        <select id="split" title="Which side of the training run's split a card is on. Validation cards are never trained on; they are what the run scores itself against. Neither: guard sections beside the validation sections, or locations added after the run started.">
+          <option value="">All cards</option>
+          <option value="validation">Validation</option>
+          <option value="training">Training</option>
+          <option value="neither">Neither</option>
+        </select>
+      </div>
+    </div>
+    <div class="filter">
       <label for="type" title="Type ids, such as 1 or 1, 3, 5-8 (a hyphen between two ids is an inclusive range). Anything else matches as a substring of the type name.">Type</label>
       <div class="filter-row">
         <input id="type" type="search" placeholder="type ids or name" title="Type ids, such as 1 or 1, 3, 5-8 (a hyphen between two ids is an inclusive range). Anything else matches as a substring of the type name.">

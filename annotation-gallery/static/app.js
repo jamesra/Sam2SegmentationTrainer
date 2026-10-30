@@ -77,6 +77,7 @@
     z: document.getElementById("z"),
     radius: document.getElementById("radius"),
     locate: document.getElementById("locate"),
+    split: document.getElementById("split"),
     sortStack: document.getElementById("sort-stack"),
     hue: document.getElementById("hue"),
     visibility: document.getElementById("visibility"),
@@ -1395,6 +1396,9 @@
       const names = Object.keys(VIEW_LABELS).filter((name) => classes.has(name)).map((name) => VIEW_LABELS[name]);
       criteria.push(names.length ? `View ${names.join(" + ")}` : "View nothing");
     }
+    if (values.split && SPLIT_LABELS[values.split]) {
+      criteria.push(`Split ${SPLIT_LABELS[values.split]}`);
+    }
     for (const [label, text] of [
       ["Type", values.type],
       ["Structure", values.label],
@@ -1428,6 +1432,7 @@
       z: els.z.value,
       radius: els.radius.value,
       location: els.locate.value,
+      split: state.split ? els.split.value : "",
       sorts: state.sorts,
     }, (key) => labels.get(key) || key);
     const text = [...scope, ...(criteria.length ? criteria : ["No filters"])].join(" · ");
@@ -1620,6 +1625,51 @@
     return "unknown";
   }
 
+  // split-begin
+  // The training run's split (the catalog's `split`, from the volume's validation_split.json): which locations it
+  // validates on and which it trains on. Null when no run has published one, and the Split filter is then off.
+  const SPLIT_LABELS = { validation: "Validation", training: "Training", neither: "Neither" };
+
+  function indexSplit(payload) {
+    if (!payload || !Array.isArray(payload.validation)) {
+      return null;
+    }
+    return {
+      run: String(payload.run || ""),
+      writtenAt: String(payload.writtenAt || ""),
+      validation: new Set(payload.validation.map(Number)),
+      training: new Set((payload.training || []).map(Number)),
+    };
+  }
+
+  // "validation", "training", or "neither" (a guard section beside a validation slab, or a location added after the
+  // run started: the run uses it on neither side). Null without a published split.
+  function splitOf(split, row) {
+    if (!split) {
+      return null;
+    }
+    const id = Number(row.location_id);
+    if (split.validation.has(id)) {
+      return "validation";
+    }
+    return split.training.has(id) ? "training" : "neither";
+  }
+  // split-end
+
+  function applySplitControl() {
+    const split = state.split;
+    els.split.disabled = !split;
+    const base = "Which side of the training run's split a card is on. Validation cards are never trained on; they are "
+      + "what the run scores itself against. Neither: guard sections beside the validation sections, or locations added "
+      + "after the run started.";
+    els.split.title = split
+      ? `${base} Split of ${split.run}${split.writtenAt ? `, published ${split.writtenAt}` : ""}.`
+      : "No training run has published a split for this volume.";
+    if (!split) {
+      els.split.value = "";
+    }
+  }
+
   function visibleClasses() {
     const selected = new Set();
     document.querySelectorAll("#view-classes input:checked").forEach((input) => {
@@ -1642,6 +1692,7 @@
     // Type and Structure take ids in the id-list convention, or otherwise a type name / a structure label regex.
     const typeIds = isIdListText(type) ? parseIdList(type) : null;
     const structureIds = isIdListText(label) ? parseIdList(label) : null;
+    const splitWanted = state.split ? els.split.value : "";
     const classes = visibleClasses();
     if (radius && radius.invalid) {
       state.filterNote = "radius: use a number or a range such as 100-500";
@@ -1653,6 +1704,9 @@
           return false;
         }
       } else if (!classes.has(reviewClass(row))) {
+        return false;
+      }
+      if (splitWanted && splitOf(state.split, row) !== splitWanted) {
         return false;
       }
       if (zText && String(row.z) !== zText) {
@@ -1814,7 +1868,10 @@
       ? `<a href="${structureHref}" target="_blank" rel="noreferrer" title="Open in sbfsem-tools">${structureText}</a>`
       : structureText;
     const label = row.structure_label ? ` · ${row.structure_label}` : "";
-    return `<a class="viking-link" href="${vikingHref(row)}" title="Open in Viking">#${row.location_id}</a> · Z ${row.z} · ${structure}${label} ${loss}${sam2}`;
+    const val = splitOf(state.split, row) === "validation"
+      ? ` <span class="split-tag" title="Validation card of ${attrText(state.split.run)}: never trained on">val</span>`
+      : "";
+    return `<a class="viking-link" href="${vikingHref(row)}" title="Open in Viking">#${row.location_id}</a>${val} · Z ${row.z} · ${structure}${label} ${loss}${sam2}`;
   }
 
   // ---- card scores --------------------------------------------------------------------------------------------------
@@ -2344,6 +2401,7 @@
       els.z.value,
       els.radius.value,
       els.locate.value,
+      els.split.value,
       views.join(""),
       state.sorts.map((item) => `${item.key}:${item.desc ? 1 : 0}`).join(","),
       layoutActive() ? state.layoutEpoch : "",
@@ -2767,6 +2825,8 @@
       return;
     }
     state.rows = payload.rows || [];
+    state.split = state.converter || state.gold ? null : indexSplit(payload.split);
+    applySplitControl();
     if (state.converter) {
       try {
         const cards = await getJson(withSet(`/api/volumes/${encodeURIComponent(volume)}/converter/cards`));
@@ -4041,6 +4101,7 @@
   document.querySelectorAll("#view-classes input").forEach((input) => {
     input.addEventListener("change", render);
   });
+  els.split.addEventListener("change", render);
   ["input", "change"].forEach((name) => {
     els.tags.addEventListener(name, () => {
       state.filterNote = "";
