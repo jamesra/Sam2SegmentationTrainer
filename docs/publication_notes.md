@@ -44,6 +44,17 @@ All defined in `docs/depth_relative_trust.md`:
 
 ## Algorithmic decisions
 
+- **2026-11-02 Refreshing a Gold card discards edits and withdraws approval.** Why: a Gold card is reviewed, its mask
+  edited into shape, then approved; only approved cards belong to the validation set. Refresh redraws the mask from the
+  annotation database (OData) into `masks/` and `source_masks/`, so an edited mask must not survive it silently:
+  the card is unapproved, its edit flags reset and stale thumbnails dropped, and the user re-reviews. Rejected:
+  keeping the edits across a refresh (the redrawn source mask would disagree with the edited one, and approval would
+  then vouch for a mask nobody reviewed). Where: `annotation-gallery/gold/web.py` (`refresh_card`), commit `2bb8f80`.
+- **2026-11-02 OData reads retry on transient connection failures only.** Why: intermittent gallery refresh errors came
+  from Docker Desktop's resolver failing the first lookup after idle (127.0.0.11 -> Pi-hole), a second try always
+  worked. Three attempts, 1 s apart, on `URLError`; `HTTPError` is not retried, so a real server answer (404, 500) is
+  never masked. Rejected for now: pinning `dns:` on the compose services (fixes the cause, not yet done). Where:
+  `annotation-gallery/server.py` (`_read_odata_json`), commit `7f51214`.
 - **2026-10-25 Thin branches by local thickness, not by unioning with the target.** Rejected: rebuilding a missing
   branch prompt from the union of the carried shape and the target mask, because it puts the answer in the prompt
   (teaches copying) and production has no target mask.
