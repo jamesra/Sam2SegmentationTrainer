@@ -1,14 +1,18 @@
 """Background build jobs: one per (structure set, volume), reporting in the shape of Update All's status so the page's
 progress strip, Cancel and polling serve both.
 
-A job survives a page reload (it is found again by set and volume) but not a server restart; a restart is resumed by
-starting the build again, which skips every card already built for the same shape and model (see builder.should_build).
+A job runs on a server thread, so it goes on when the page is closed or reloaded (it is found again by set and volume).
+It also survives a server restart: a running job's settings are kept in ``job.json`` in its build folder, and
+:func:`resume_unfinished` starts every build still marked running when the gallery starts. The resumed build skips every
+card already built for the same shape and model (see builder.should_build). A cancelled, finished or failed build is not
+resumed.
 At most ``GALLERY_CONVERTER_STREAMS`` (default 1) segmentation streams run at once across all jobs, so a build cannot
 starve the interactive users of the segmentation server.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -28,6 +32,8 @@ _JOBS: Dict[Tuple[str, str], "BuildJob"] = {}
 _JOBS_LOCK = threading.Lock()
 _STREAMS: Optional[threading.Semaphore] = None
 _STREAMS_LOCK = threading.Lock()
+# A build's last known state, beside its catalog; "running" there after a restart means the build was cut short.
+STATE_FILE = "job.json"
 
 
 class ConverterNotConfigured(Exception):
@@ -175,6 +181,7 @@ class BuildJob:
                 self.phase = "building"
 
     def _run(self) -> None:
+        save_state(self.crops, "running", self.params)
         try:
             client = self._make_client()
             if self.params.viking_xml:
@@ -207,6 +214,8 @@ class BuildJob:
         finally:
             with self._lock:
                 self.finished = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                phase = self.phase
+            save_state(self.crops, phase, self.params)
 
 
 def current_job(set_name: str, volume: str) -> Optional[BuildJob]:
@@ -232,6 +241,51 @@ def start_job(job: BuildJob) -> BuildJob:
         _JOBS[key] = job
     job.start()
     return job
+
+
+def save_state(crops: Path, state: str, params: builder_module.BuildParams) -> None:
+    """Record a build's state and settings, so a restart can tell a build cut short from a finished one."""
+    document = {
+        "state": state,
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "params": dataclasses.asdict(params),
+    }
+    try:
+        crops.mkdir(parents=True, exist_ok=True)
+        temporary = crops / (STATE_FILE + ".tmp")
+        temporary.write_text(json.dumps(document, indent=1), encoding="utf-8")
+        temporary.replace(crops / STATE_FILE)
+    except OSError:
+        LOGGER.exception("could not save the build state in %s", crops)
+
+
+def load_params(document: Dict[str, Any]) -> builder_module.BuildParams:
+    """The settings a ``job.json`` was saved with. Raises ``TypeError`` or ``ValueError`` for a document that is not."""
+    raw = dict(document.get("params") or {})
+    known = {item.name for item in dataclasses.fields(builder_module.BuildParams)}
+    params = builder_module.BuildParams(**{key: value for key, value in raw.items() if key in known})
+    return dataclasses.replace(params, type_codes=tuple(int(code) for code in params.type_codes))
+
+
+def resume_unfinished(root: Optional[Path]) -> List[BuildJob]:
+    """Start again every build whose ``job.json`` still says running: the server stopped while it ran."""
+    if root is None or not root.is_dir():
+        return []
+    resumed: List[BuildJob] = []
+    for state_path in sorted(root.glob(f"structure-*/*/{STATE_FILE}")):
+        crops = state_path.parent
+        try:
+            document = json.loads(state_path.read_text(encoding="utf-8"))
+            if document.get("state") != "running":
+                continue
+            params = load_params(document)
+        except (OSError, TypeError, ValueError) as error:
+            LOGGER.warning("not resuming %s: %s", state_path, error)
+            continue
+        set_name, volume = crops.parent.name, crops.name
+        LOGGER.warning("resuming converter build %s/%s, cut short by a restart", set_name, volume)
+        resumed.append(start_job(new_job(set_name, volume, crops, params)))
+    return resumed
 
 
 def write_source(

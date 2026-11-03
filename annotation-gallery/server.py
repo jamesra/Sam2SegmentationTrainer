@@ -2196,6 +2196,8 @@ def main() -> None:
         https_port=https_public_port,
     )
     start_thumbnail_watch(registry_dir())
+    # Builds cut short by a restart go on by themselves; their cards fill in whether or not a page is open.
+    converter_jobs.resume_unfinished(converter_web.converter_root(env_map()))
     print(f"annotation-gallery HTTP on {host}:{http_port}", flush=True)
     if https_server is not None:
         print(f"annotation-gallery HTTPS on {host}:{https_port}", flush=True)

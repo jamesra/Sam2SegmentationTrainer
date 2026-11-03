@@ -292,6 +292,25 @@ def test_continuing_skips_built_cards(clean_httpd) -> None:
     assert done["refreshed"] == 0 and done["skipped"] == 2
 
 
+def test_a_build_cut_short_by_a_restart_resumes_when_the_gallery_starts(clean_httpd, converter_root: Path) -> None:
+    request(clean_httpd, "POST", "/api/converter/structures", {"structureId": 500, "volume": "RC1"})
+    wait_until_done(clean_httpd)
+    crops = converter_root / SET / "RC1"
+    assert json.loads((crops / jobs.STATE_FILE).read_text(encoding="utf-8"))["state"] == "done"
+    assert jobs.resume_unfinished(converter_root) == [], "a finished build is not started again"
+
+    # The process stopped mid-build: the state file still says running, and no job is in memory.
+    finished = json.loads((crops / jobs.STATE_FILE).read_text(encoding="utf-8"))
+    (crops / jobs.STATE_FILE).write_text(json.dumps({**finished, "state": "running"}), encoding="utf-8")
+    jobs._JOBS.clear()
+
+    (resumed,) = jobs.resume_unfinished(converter_root)
+    resumed.join(20)
+    assert resumed.phase == "done" and resumed.summary.skipped == 2, "built cards are skipped, not segmented again"
+    assert resumed.params.structure_id == 500 and isinstance(resumed.params.type_codes, tuple)
+    assert json.loads((crops / jobs.STATE_FILE).read_text(encoding="utf-8"))["state"] == "done"
+
+
 def test_idle_status_of_a_structure_without_a_job(clean_httpd, converter_root: Path) -> None:
     (converter_root / "structure-9" / "RC1").mkdir(parents=True)
     status, payload = get_json(clean_httpd, "/api/volumes/RC1/update-all?set=structure-9")
