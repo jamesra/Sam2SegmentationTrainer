@@ -4327,6 +4327,13 @@
     if (!volumes.length) {
       state.rows = [];
       els.status.textContent = "No volumes with Read access in this training set.";
+      // The sign-in keeps the volumes it saw; one made while the gallery had none stays empty until a new sign-in.
+      if (state.config.identityMode === "oidc") {
+        const again = document.createElement("a");
+        again.href = "/logout";
+        again.textContent = "Sign out and sign in again";
+        els.status.append(" If you expected some, your sign-in may predate them: ", again, ".");
+      }
       render();
       return;
     }
