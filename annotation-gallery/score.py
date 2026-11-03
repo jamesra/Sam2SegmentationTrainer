@@ -38,7 +38,8 @@ import catalog
 from circle_update import max_inscribed_circle
 from converter import builder as builder_module
 from converter import contour as contour_module
-from converter import odata, seed
+from converter import engines, odata, seed
+from converter.engines import tiled as tiled_engine
 from converter.seg_client import SegmentationFailed, TileIdentity
 from converter.tilesource import SectionTiles, TileCache, Volume
 
@@ -103,14 +104,19 @@ def _no_neighbours(cells: Sequence[Tuple[int, int]]) -> List[Any]:
 def _segment_once(
     record: odata.LocationRecord, volume_name: str, volume: Volume, tileset: Any, cache: TileCache, client: Any,
     downsample: int, cx: float, cy: float, radius: float, *, semaphore: Optional[threading.Semaphore], attempts: int,
+    tiled: bool = False,
 ) -> Tuple[Any, Any]:
-    """One request at one level: ``(result, contour or None)``."""
+    """One request at one level: ``(result, contour or None)``. ``tiled`` uses the tiled engine's seed (the circle
+    alone); otherwise the single-window seed (:func:`seed.circle_prompt`, with rim clicks)."""
     section = SectionTiles(volume, tileset, downsample, cache)
     identity = TileIdentity(
         volume=volume_name, section=record.z, channel=tileset.channel,
         transform=tileset.name or "mosaic", downsample=downsample,
     )
-    prompt = seed.circle_prompt(cx / downsample, cy / downsample, radius / downsample)
+    if tiled:
+        prompt = tiled_engine.circle_prompt(cx / downsample, cy / downsample, radius / downsample)
+    else:
+        prompt = seed.circle_prompt(cx / downsample, cy / downsample, radius / downsample)
     if semaphore is not None:
         semaphore.acquire()
     try:
@@ -135,15 +141,94 @@ def score_record(
     semaphore: Optional[threading.Semaphore] = None,
     attempts: int = 1,
     native_downsample: Optional[int] = None,
+    engine: Optional[str] = None,
 ) -> LocationScore:
     """Segment ``record`` from its seed circle and compare the result with the annotation, both whole on one card.
 
-    ``native_downsample`` (the level the location's crops were exported at) is the finest level used, and is recorded
-    so a score taken at a coarser level can be told apart.
-
-    Raises ``SegmentationFailed`` (server refused or unreachable) or ``seed.NotSeedable`` (nothing to seed with).
-    An empty mask is a score of 0, not an error: the model did not find the object.
+    The served model's engine decides how (see :mod:`converter.engines`; ``engine`` forces one): the tiled engine
+    segments at the model's tile level and lets the server grow across tiles; the single-window engine fits the object
+    into one window. Raises ``SegmentationFailed`` (server refused or unreachable) or ``seed.NotSeedable`` (nothing to
+    seed with). An empty mask is a score of 0, not an error: the model did not find the object.
     """
+    choice = engines.choose(client, engine)
+    if choice.kind == engines.TILED:
+        return _score_tiled(
+            record, volume_name, volume, client, cache, level=choice.tile_downsample, model=model,
+            semaphore=semaphore, attempts=attempts, native_downsample=native_downsample,
+        )
+    return _score_window(
+        record, volume_name, volume, client, cache, model=model, semaphore=semaphore, attempts=attempts,
+        native_downsample=native_downsample,
+    )
+
+
+def _score_tiled(
+    record: odata.LocationRecord,
+    volume_name: str,
+    volume: Volume,
+    client: Any,
+    cache: TileCache,
+    *,
+    level: int,
+    model: Optional[str],
+    semaphore: Optional[threading.Semaphore],
+    attempts: int,
+    native_downsample: Optional[int],
+) -> LocationScore:
+    """The tiled engine's score: one request at the model's tile level; the comparison card is laid out afterwards at
+    the finest level that holds the annotation and the mask, which changes nothing the model saw."""
+    cx, cy, radius, kind = seed_circle(record)
+    tileset = volume.select(record.z)
+    levels = sorted(tileset.levels)
+    if level not in levels:
+        raise SegmentationFailed(f"no_level: section {record.z}'s tileset has no level {level}, the model's tile level")
+    result, shape = _segment_once(
+        record, volume_name, volume, tileset, cache, client, level, cx, cy, radius,
+        semaphore=semaphore, attempts=attempts, tiled=True,
+    )
+    record_bounds = odata.bounds(record)
+    bounds = record_bounds if shape is None else builder_module.union_bounds(
+        record_bounds, builder_module.shape_bounds(shape, level)
+    )
+    try:
+        card = builder_module.choose_downsample(bounds, levels)
+    except SegmentationFailed:
+        bounds = record_bounds
+        card = builder_module.choose_downsample(bounds, levels)
+    origin = builder_module.card_origin(bounds, card)
+    original = builder_module.original_mask(record, card, origin)
+    if shape is None:
+        candidate = np.zeros_like(original)
+    else:
+        moved = builder_module.rescale(shape, level, card)
+        candidate = builder_module.draw_mask([moved.exterior] + list(moved.holes), origin)
+    pred = getattr(result, "score", None)
+    return LocationScore(
+        location_id=record.id,
+        gt_iou=builder_module.iou(original, candidate),
+        pred_iou=None if pred is None else float(pred),
+        model=model,
+        scored_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        prompt=kind,
+        downsample=level,
+        native_downsample=native_downsample,
+    )
+
+
+def _score_window(
+    record: odata.LocationRecord,
+    volume_name: str,
+    volume: Volume,
+    client: Any,
+    cache: TileCache,
+    *,
+    model: Optional[str],
+    semaphore: Optional[threading.Semaphore],
+    attempts: int,
+    native_downsample: Optional[int],
+) -> LocationScore:
+    """The single-window engine's score: the object whole on one card, at the finest level (no finer than
+    ``native_downsample``, the level the crops were exported at) that holds it, recorded so a coarser score shows."""
     cx, cy, radius, kind = seed_circle(record)
     tileset = volume.select(record.z)
     levels = sorted(tileset.levels)

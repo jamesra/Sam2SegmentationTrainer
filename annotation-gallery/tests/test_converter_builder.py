@@ -15,7 +15,7 @@ from PIL import Image
 
 import catalog
 from converter import builder as builder_module
-from converter import contour, geo, odata, seed
+from converter import contour, engines, geo, odata, seed
 from converter.seg_client import SegmentationFailed, SegmentResult
 from converter.tilesource import SectionTiles, TileCache, flip_for_protocol, parse_viking_xml
 
@@ -181,8 +181,9 @@ class FakeSegmenter:
             raise SegmentationFailed(self.fail[location_id])
         assert tiles(identity.downsample and 0, 0) is None or True  # the provider must be callable
         size = self.size  # samples, 4 px each
-        xs0 = min(x for x, _ in prompt.foreground_points) - size * 4 // 2
-        ys0 = min(y for _, y in prompt.foreground_points) - size * 4 // 2
+        anchor = _prompt_anchor(prompt)
+        xs0 = anchor[0] - size * 4 // 2
+        ys0 = anchor[1] - size * 4 // 2
         rows = np.arange(size)
         cols = np.arange(size)
         X = xs0 + (cols[None, :] + 0.5) * 4
@@ -196,11 +197,23 @@ class FakeSegmenter:
         )
 
 
+def _prompt_anchor(prompt):
+    """Where the fake centres its window: the lowest click, else the first shape's centre (a tiled circle has no
+    clicks)."""
+    if prompt.foreground_points:
+        return (int(min(x for x, _ in prompt.foreground_points)), int(min(y for _, y in prompt.foreground_points)))
+    shape = prompt.foreground_shapes[0]
+    if shape.WhichOneof("kind") == "circle":
+        return (int(shape.circle.center.x), int(shape.circle.center.y))
+    points = shape.polygon.exterior.points
+    return (int(min(p.x for p in points)), int(min(p.y for p in points)))
+
+
 def _disc(cx, cy, r):
     return lambda X, Y, grow: (X - cx) ** 2 + (Y - cy) ** 2 <= (r + grow) ** 2
 
 
-def _make(tmp_path, volume, cache, segmenter, entities, **params):
+def _make(tmp_path, volume, cache, segmenter, entities, engine=None, **params):
     pages = {"value": entities}
 
     def get_json(url: str):
@@ -209,7 +222,9 @@ def _make(tmp_path, volume, cache, segmenter, entities, **params):
         return pages
 
     build_params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500, **params)
-    return builder_module.Builder(build_params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json)
+    return builder_module.Builder(
+        build_params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, engine=engine
+    )
 
 
 def test_a_circle_is_built_into_a_gallery_card(tmp_path: Path, volume, cache) -> None:
@@ -253,18 +268,56 @@ def test_candidate_polygon_is_where_the_object_is_in_mosaic_pixels(tmp_path: Pat
     assert abs((max(xs) - min(xs)) / 2 - 83) < 4
 
 
-def test_a_polygon_at_a_coarser_level_when_it_is_big(tmp_path: Path, volume, cache) -> None:
+def test_the_window_engine_segments_a_big_polygon_at_a_coarser_level(tmp_path: Path, volume, cache) -> None:
     # 1500 x 1500 mosaic px does not fit a 1024 card at D=1 with margin, so D=2 is chosen.
     wkt = "POLYGON ((800 800, 2300 800, 2300 2300, 800 2300, 800 800))"
     # The segmenter works in protocol pixels: the square's centre (1550, 1550) mosaic is (775, 775) at D=2, half side 375.
     square = lambda X, Y, grow: (abs(X - 775) <= 375 + grow) & (abs(Y - 775) <= 375 + grow)
-    builder = _make(tmp_path, volume, cache, FakeSegmenter(lambda _id: square, size=384), [_entity(13, 4, wkt)])
+    segmenter = FakeSegmenter(lambda _id: square, size=384)
+    builder = _make(tmp_path, volume, cache, segmenter, [_entity(13, 4, wkt)], engine=engines.WINDOW)
     summary = builder.run()
     assert summary.built == 1
+    assert [identity.downsample for identity, _prompt, _id in segmenter.calls] == [2]
     row = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite").execute(
-        "SELECT downsample, iou FROM converter_cards"
+        "SELECT downsample, iou, engine FROM converter_cards"
     ).fetchone()
-    assert row[0] == 2 and row[1] > 0.9
+    assert row[0] == 2 and row[1] > 0.9 and row[2] == engines.WINDOW
+
+
+def test_the_tiled_engine_segments_a_big_polygon_at_ds1_and_only_draws_its_card_coarser(tmp_path: Path, volume, cache) -> None:
+    wkt = "POLYGON ((800 800, 2300 800, 2300 2300, 800 2300, 800 800))"
+    # At D=1 the protocol's pixels are mosaic pixels: centre (1550, 1550), half side 750.
+    square = lambda X, Y, grow: (abs(X - 1550) <= 750 + grow) & (abs(Y - 1550) <= 750 + grow)
+    segmenter = FakeSegmenter(lambda _id: square, size=640)
+    builder = _make(tmp_path, volume, cache, segmenter, [_entity(13, 4, wkt)])
+    summary = builder.run()
+    assert builder.engine_kind == engines.TILED and summary.built == 1
+    assert [identity.downsample for identity, _prompt, _id in segmenter.calls] == [1], "no coarser request"
+    (_identity, prompt, _id) = segmenter.calls[0]
+    assert len(prompt.foreground_points) == 1, "one click at the polygon's deepest point"
+    row = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite").execute(
+        "SELECT downsample, iou, engine, candidate_wkt FROM converter_cards"
+    ).fetchone()
+    assert row[0] == 2, "the card is drawn at D=2 to hold the shape"
+    assert row[1] > 0.9 and row[2] == engines.TILED
+    assert "2300" in row[3] or "2301" in row[3] or "2302" in row[3], "the proposal is stored in mosaic pixels"
+
+
+def test_a_tiled_circle_is_its_shape_alone(tmp_path: Path, volume, cache) -> None:
+    segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    _make(tmp_path, volume, cache, segmenter, [_entity(11, 1, "POINT (1400 1600)", radius=80)]).run()
+    (identity, prompt, _id) = segmenter.calls[0]
+    assert identity.downsample == 1 and not prompt.foreground_points
+    (shape,) = prompt.foreground_shapes
+    assert shape.circle.radius == 80
+
+
+def test_cards_made_before_the_engine_split_are_built_again(tmp_path: Path, volume, cache) -> None:
+    entities = [_entity(11, 1, "POINT (1400 1600)", radius=80)]
+    _make(tmp_path, volume, cache, FakeSegmenter(lambda _id: _disc(1400, 1600, 80)), entities, engine=engines.WINDOW).run()
+    again = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    summary = _make(tmp_path, volume, cache, again, entities).run()
+    assert summary.built == 1 and len(again.calls) == 1, "a card from the other engine is rebuilt"
 
 
 def test_failures_are_recorded_with_a_reason_and_do_not_stop_the_structure(tmp_path: Path, volume, cache) -> None:

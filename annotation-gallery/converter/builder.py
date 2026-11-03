@@ -28,19 +28,25 @@ from PIL import Image
 
 import catalog
 from converter import contour as contour_module
-from converter import odata, seed
-from converter.seg_client import (
-    Prompt,
-    SegmentationClient,
-    SegmentationFailed,
-    TileIdentity,
+from converter import engines, odata, seed
+from converter.cardgeom import (  # noqa: F401 - re-exported: scoring and tests use them from here
+    CARD_SIZE,
+    MARGIN,
+    Bounds,
+    card_origin,
+    choose_downsample,
+    rescale,
+    rings_for_prompt,
+    scaled as _scaled,
+    shape_bounds,
+    union_bounds,
 )
+from converter.engines.tiled import TiledEngine
+from converter.engines.window import WindowEngine
+from converter.seg_client import SegmentationClient, SegmentationFailed
 from converter.tilesource import SectionTiles, TileCache, Volume
 
 LOGGER = logging.getLogger("converter.builder")
-
-CARD_SIZE = 1024
-MARGIN = 48
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS converter_cards (
     location_id INTEGER NOT NULL,
@@ -58,6 +64,7 @@ CREATE TABLE IF NOT EXISTS converter_cards (
     candidate_wkt TEXT,
     type_code INTEGER,
     built_at TEXT,
+    engine TEXT,
     PRIMARY KEY (location_id, image_key)
 )
 """
@@ -114,59 +121,6 @@ def source_hash(record: odata.LocationRecord) -> str:
 
 def image_key(volume: str, record: odata.LocationRecord, downsample: int) -> str:
     return f"{volume}_{record.z}_D{downsample}_L{record.id}"
-
-
-Bounds = Tuple[float, float, float, float]
-
-
-def choose_downsample(bounds: Bounds, levels: Sequence[int], at_least: int = 1) -> int:
-    """The finest level (``at_least`` or coarser) at which mosaic ``bounds`` plus a margin fit one card.
-
-    Raises ``SegmentationFailed`` when none does.
-    """
-    min_x, min_y, max_x, max_y = bounds
-    extent = max(max_x - min_x, max_y - min_y)
-    for level in sorted(levels):
-        if level >= at_least and extent / level + 2 * MARGIN <= CARD_SIZE:
-            return level
-    raise SegmentationFailed(f"too_large: the shape is {extent:.0f} mosaic pixels across and no tileset level fits it in {CARD_SIZE}")
-
-
-def card_origin(bounds: Bounds, downsample: int) -> Tuple[int, int]:
-    """Origin, in level pixels, of the card window centred on mosaic ``bounds``."""
-    min_x, min_y, max_x, max_y = bounds
-    cx, cy = (min_x + max_x) / 2 / downsample, (min_y + max_y) / 2 / downsample
-    return int(math.floor(cx - CARD_SIZE / 2)), int(math.floor(cy - CARD_SIZE / 2))
-
-
-def union_bounds(a: Bounds, b: Bounds) -> Bounds:
-    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
-
-
-def shape_bounds(shape: contour_module.Contour, downsample: int) -> Bounds:
-    """Mosaic-pixel bounds of a proposed outline (its exterior; holes lie inside it)."""
-    xs = [x for x, _ in shape.exterior]
-    ys = [y for _, y in shape.exterior]
-    return min(xs) * downsample, min(ys) * downsample, max(xs) * downsample, max(ys) * downsample
-
-
-def _scaled(rings: Sequence[Sequence[Tuple[float, float]]], downsample: int) -> List[List[Tuple[float, float]]]:
-    return [[(x / downsample, y / downsample) for x, y in ring] for ring in rings]
-
-
-def rings_for_prompt(record: odata.LocationRecord, downsample: int) -> Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]:
-    """The exterior and holes of the polygon to seed with: the largest part of a multi-part shape."""
-    best = max(record.polygons, key=lambda rings: abs(contour_module.signed_area(np.array(rings[0], dtype=float))))
-    scaled = _scaled(best, downsample)
-    return scaled[0], scaled[1:]
-
-
-def build_prompt(record: odata.LocationRecord, downsample: int) -> Prompt:
-    if record.is_circle:
-        cx, cy = record.center
-        return seed.circle_prompt(cx / downsample, cy / downsample, record.radius / downsample)
-    exterior, holes = rings_for_prompt(record, downsample)
-    return seed.polygon_prompt(exterior, holes)
 
 
 def draw_mask(
@@ -231,7 +185,9 @@ class Builder:
         *,
         get_json: odata.GetJson = odata.http_get_json,
         semaphore: Optional[threading.Semaphore] = None,
+        engine: Optional[str] = None,
     ) -> None:
+        """``engine`` forces ``engines.TILED`` or ``engines.WINDOW``; None asks the served model (see :mod:`engines`)."""
         self.params = params
         self.crops = Path(crops)
         self.volume = volume
@@ -240,6 +196,18 @@ class Builder:
         self.get_json = get_json
         self.semaphore = semaphore
         self._sections: Dict[Tuple[int, int], SectionTiles] = {}
+        choice = engines.choose(client, engine)
+        self.engine_kind = choice.kind
+        if choice.kind == engines.WINDOW:
+            self.engine: Any = WindowEngine(
+                params.volume, client, self._section, self._levels, threshold=params.threshold, semaphore=semaphore
+            )
+        else:
+            self.engine = TiledEngine(
+                params.volume, client, self._section, self._levels,
+                tile_downsample=choice.tile_downsample, threshold=params.threshold, semaphore=semaphore,
+            )
+        LOGGER.info("structure %s: %s engine", params.structure_id, choice.kind)
 
     # -- catalog -------------------------------------------------------------------------------------------------
 
@@ -247,6 +215,10 @@ class Builder:
         connection = catalog.connect(self.crops)
         connection.execute(SCHEMA)
         connection.execute(LINKS_SCHEMA)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(converter_cards)")}
+        if "engine" not in columns:
+            # Cards from before the engines were split say no engine, so each is built again by the current one.
+            connection.execute("ALTER TABLE converter_cards ADD COLUMN engine TEXT")
         return connection
 
     def _store_links(self) -> None:
@@ -276,9 +248,9 @@ class Builder:
             connection.execute("DELETE FROM converter_cards WHERE location_id = ?", [record.id])
             connection.execute(
                 "INSERT INTO converter_cards (location_id, image_key, state, reason, iou, source_hash, model_id, z, downsample, "
-                "origin_x, origin_y, original_wkt, candidate_wkt, type_code, built_at) "
+                "origin_x, origin_y, original_wkt, candidate_wkt, type_code, built_at, engine) "
                 "VALUES (:location_id, :image_key, :state, :reason, :iou, :source_hash, :model_id, :z, :downsample, "
-                ":origin_x, :origin_y, :original_wkt, :candidate_wkt, :type_code, :built_at)",
+                ":origin_x, :origin_y, :original_wkt, :candidate_wkt, :type_code, :built_at, :engine)",
                 row,
             )
             if row["state"] == BUILT:
@@ -310,23 +282,13 @@ class Builder:
 
     def build_one(self, record: odata.LocationRecord) -> Dict[str, Any]:
         """Build one card and commit it. Returns its row; raises ``SegmentationFailed`` for a recorded failure."""
-        levels = self._levels(record.z)
-        record_bounds = odata.bounds(record)
-        downsample = choose_downsample(record_bounds, levels)
-        while True:
-            section = self._section(record.z, downsample)
-            shape = self._segment(record, section, downsample)
-            # The card must hold the proposal as well as the annotation: the proposal can reach past the annotation,
-            # and a window centred on the annotation alone would crop it.
-            bounds = union_bounds(record_bounds, shape_bounds(shape, downsample))
-            try:
-                fitted = choose_downsample(bounds, levels, at_least=downsample)
-            except SegmentationFailed:
-                # No level holds the whole proposal; keep the annotation's card rather than fail the location.
-                bounds, fitted = record_bounds, downsample
-            if fitted == downsample:
-                break
-            downsample = fitted
+        segmented = self.engine.segment(record)
+        if segmented.card_level is not None:
+            downsample, bounds = segmented.card_level, segmented.card_bounds
+        else:
+            downsample, bounds = self._card_layout(record, segmented)
+        section = self._section(record.z, downsample)
+        shape = rescale(segmented.shape, segmented.level, downsample)
         origin = card_origin(bounds, downsample)
         key = image_key(self.params.volume, record, downsample)
 
@@ -356,38 +318,22 @@ class Builder:
             "location_id": record.id, "image_key": key, "state": BUILT, "reason": None, "iou": ratio,
             "source_hash": source_hash(record), "model_id": self.params.model_id, "z": record.z, "downsample": downsample,
             "origin_x": origin[0], "origin_y": origin[1], "original_wkt": record.wkt,
-            "candidate_wkt": candidate_polygon_wkt(shape, downsample), "type_code": record.type_code,
-            "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "candidate_wkt": candidate_polygon_wkt(segmented.shape, segmented.level), "type_code": record.type_code,
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "engine": self.engine_kind,
         }
         self._commit_card(record, row, int(candidate.sum()))
         return row
 
-    def _segment(self, record: odata.LocationRecord, section: SectionTiles, downsample: int) -> contour_module.Contour:
-        """The server's proposed outline for a location at one level, in that level's pixels."""
-        identity = TileIdentity(
-            volume=self.params.volume, section=record.z, channel=section.tileset.channel,
-            transform=section.tileset.name or "mosaic", downsample=downsample,
-        )
-        prompt = build_prompt(record, downsample)
-        if self.semaphore is not None:
-            self.semaphore.acquire()
+    def _card_layout(self, record: odata.LocationRecord, segmented: engines.Segmentation) -> Tuple[int, Bounds]:
+        """The level and bounds of a card that shows the annotation and the proposal: display only, after segmenting."""
+        levels = self._levels(record.z)
+        record_bounds = odata.bounds(record)
+        bounds = union_bounds(record_bounds, shape_bounds(segmented.shape, segmented.level))
         try:
-            result = self.client.segment_with_retry(
-                identity, prompt, section.protocol_tile, self._no_neighbours,
-                threshold=self.params.threshold, request_id=record.id & 0xFFFFFFFF,
-            )
-        finally:
-            if self.semaphore is not None:
-                self.semaphore.release()
-        shape = contour_module.contour_from_result(result)
-        if shape is None:
-            raise SegmentationFailed("no_object: the mask is empty at the threshold")
-        return shape
-
-    @staticmethod
-    def _no_neighbours(cells: Sequence[Tuple[int, int]]) -> List[Any]:
-        """Neighbouring annotations are not looked up yet: every cell is answered as having no background shapes."""
-        return []
+            return choose_downsample(bounds, levels), bounds
+        except SegmentationFailed:
+            # A proposal too big for any card is still kept; the card centres on the annotation.
+            return choose_downsample(record_bounds, levels), record_bounds
 
     def _record_failure(self, record: odata.LocationRecord, reason: str) -> None:
         row = {
@@ -395,6 +341,7 @@ class Builder:
             "source_hash": source_hash(record), "model_id": self.params.model_id, "z": record.z, "downsample": None,
             "origin_x": None, "origin_y": None, "original_wkt": record.wkt, "candidate_wkt": None,
             "type_code": record.type_code, "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "engine": self.engine_kind,
         }
         self._commit_card(record, row, 0)
 
@@ -409,6 +356,8 @@ class Builder:
         if existing is None or self.params.rebuild:
             return True
         if existing["source_hash"] != source_hash(record) or existing["model_id"] != self.params.model_id:
+            return True
+        if existing["engine"] != self.engine_kind:
             return True
         if existing["state"] == FAILED:
             return self.params.retry_failed

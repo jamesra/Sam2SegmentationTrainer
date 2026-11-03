@@ -1,9 +1,11 @@
-"""Seeds for the segmentation server: what we already know about a location, as a shape plus a few clicks.
+"""The single-window engine's seeds (:mod:`converter.engines.window`): what we already know about a location, as a shape
+plus a few clicks. The tiled engine has its own (:mod:`converter.engines.tiled`); this module's polygon rasteriser and
+interior points are shared with it, its seeds are not.
 
 Everything is in mosaic pixels at the request's downsample, X right, Y up, like the protocol.
 
-* A circle (LocationType 1) is a circle shape with its TRUE radius plus four clicks on its rim at 0.95 r, the encoding
-  Viking's own segmentation command uses for circles. The server softens the circle with the model's
+* A circle (LocationType 1) is a circle shape with its TRUE radius plus four clicks on its rim at 0.95 r. (Viking's tile
+  grid and the tiled engine send the circle alone.) The server softens the circle with the model's
   circle_diameter_scale; the client never scales it.
 * A polygon, curve polygon or closed curve (4, 6, 7) is the polygon shape (exterior and holes) plus clicks inside it: the
   point farthest from the edge and one more in each of up to three well-separated deep parts. The server softens every

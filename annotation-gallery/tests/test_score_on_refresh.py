@@ -11,7 +11,7 @@ import pytest
 
 import catalog
 import score as score_module
-from converter import odata
+from converter import engines, odata
 from converter.seg_client import SegmentationFailed
 from converter.tilesource import TileCache, parse_viking_xml
 from tests.test_converter_builder import VIKING_XML, VOLUME, FakeSegmenter, _disc, _entity, tile_http
@@ -104,17 +104,30 @@ def test_a_small_object_is_scored_at_its_crops_level_and_says_nothing_more(volum
     assert score.downsample == 1 and not score.coarser_than_native and score.checkpoint_label == "v5.4"
 
 
-def test_an_object_too_large_for_one_card_is_scored_coarser_and_labelled_so(volume, cache) -> None:
+def test_the_window_engine_scores_an_object_too_large_for_one_card_coarser_and_labels_it(volume, cache) -> None:
     # 1500 px across: no 1024-pixel card holds it at D1, so it is scored whole at D2. The fake segmenter works in the
     # level's pixels: the square's centre (1550, 1550) mosaic is (775, 775) at D2, half side 375 (as in the converter test).
     record = odata.record_from_entity(_entity(14, 4, "POLYGON ((800 800, 2300 800, 2300 2300, 800 2300, 800 800))"))
     square = lambda X, Y, grow: (abs(X - 775) <= 375 + grow) & (abs(Y - 775) <= 375 + grow)  # noqa: E731
     client = ScoringClient(lambda _id: square, grow=0.0, size=384)
 
-    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1)
+    score = score_module.score_record(
+        record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1, engine=engines.WINDOW
+    )
 
     assert score.downsample == 2 and score.coarser_than_native
     assert score.checkpoint_label == "v5.4 at D2" and score.payload()["sam2Checkpoint"] == "v5.4 at D2"
+    assert score.gt_iou > 0.9
+
+
+def test_the_tiled_engine_scores_a_large_object_at_ds1(volume, cache) -> None:
+    record = odata.record_from_entity(_entity(14, 4, "POLYGON ((800 800, 2300 800, 2300 2300, 800 2300, 800 800))"))
+    square = lambda X, Y, grow: (abs(X - 1550) <= 750 + grow) & (abs(Y - 1550) <= 750 + grow)  # noqa: E731
+    client = ScoringClient(lambda _id: square, grow=0.0, size=640)
+
+    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1)
+
+    assert score.downsample == 1 and not score.coarser_than_native and score.checkpoint_label == "v5.4"
     assert score.gt_iou > 0.9
 
 
