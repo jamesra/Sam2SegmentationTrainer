@@ -483,6 +483,23 @@ def list_registry_names(registry: Path) -> list[str]:
     return names
 
 
+def require_registry(registry: Path) -> list[str]:
+    """Registry children, or exit 1 when there are none.
+
+    Docker Desktop mounts an empty tmpfs when a ``\\\\wsl.localhost`` bind cannot be resolved as the container starts
+    (2026-11-02: both galleries came up that way and listed no volumes). Exiting lets ``restart: unless-stopped``
+    start the container again with the bind, instead of serving an empty gallery.
+    """
+    names = list_registry_names(registry)
+    if not names:
+        print(
+            f"annotation-gallery: no volumes in GALLERY_VOLUME_DIR={registry}; the data bind is missing or empty, exiting",
+            flush=True,
+        )
+        raise SystemExit(1)
+    return names
+
+
 def registry_aliases(registry: Path) -> dict[str, str]:
     """Registry folder -> annotation database name (what Identity grants are named after)."""
     aliases: dict[str, str] = {}
@@ -2163,7 +2180,8 @@ def _https_server(host: str, port: int) -> ThreadingHTTPServer | None:
 
 
 def main() -> None:
-    host = os.environ.get("GALLERY_HOST") or "0.0.0.0"
+    require_registry(registry_dir())
+    host =os.environ.get("GALLERY_HOST") or "0.0.0.0"
     http_port = int(os.environ.get("GALLERY_HTTP_PORT") or os.environ.get("GALLERY_PORT") or "80")
     https_port = int(os.environ.get("GALLERY_HTTPS_PORT") or "443")
     # Browser-facing ports may differ from container listen ports (8080/8443 publish).

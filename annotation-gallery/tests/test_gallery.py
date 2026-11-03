@@ -33,6 +33,7 @@ from server import (  # noqa: E402
     https_redirect_location,
     list_registry_names,
     make_server,
+    require_registry,
     safe_crop_file,
     structure_ids_for_tag_pattern,
     tag_tokens,
@@ -834,6 +835,17 @@ def test_path_traversal_rejected(httpd: tuple[str, int], registry: Path) -> None
     allowed = safe_crop_file(crops, "overlays/parts/42.json")
     assert allowed.name == "42.json"
     assert list_registry_names(registry) == ["RC2"]
+
+
+def test_require_registry_exits_when_the_data_bind_is_missing(tmp_path: Path) -> None:
+    """An unresolved bind leaves an empty mount; the gallery exits so the restart policy mounts it again."""
+    with pytest.raises(SystemExit) as missing:
+        require_registry(tmp_path / "current")
+    assert missing.value.code == 1
+    with pytest.raises(SystemExit):
+        require_registry(tmp_path)
+    (tmp_path / "RC2").mkdir()
+    assert require_registry(tmp_path) == ["RC2"]
 
 
 def test_spa_hides_review_controls_without_review() -> None:
