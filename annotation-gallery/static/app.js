@@ -3785,6 +3785,12 @@
   if (brushButton) {
     brushButton.addEventListener("click", toggleBrush);
   }
+  document.getElementById("no-volumes-signin").addEventListener("click", () => {
+    window.location.href = "/logout";
+  });
+  document.getElementById("no-volumes-dismiss").addEventListener("click", () => {
+    document.getElementById("no-volumes-notice").hidden = true;
+  });
   const retraceOk = document.getElementById("retrace-notice-ok");
   if (retraceOk) {
     retraceOk.addEventListener("click", () => {
@@ -4333,6 +4339,11 @@
         again.href = "/logout";
         again.textContent = "Sign out and sign in again";
         els.status.append(" If you expected some, your sign-in may predate them: ", again, ".");
+        // Asked once per page load; the status link stays for later.
+        if (!state.noVolumesAsked) {
+          state.noVolumesAsked = true;
+          document.getElementById("no-volumes-notice").hidden = false;
+        }
       }
       render();
       return;
