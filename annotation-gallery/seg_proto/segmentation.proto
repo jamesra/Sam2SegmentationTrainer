@@ -103,8 +103,9 @@ message SegmentTilesRequest {
   viking.geometry.v1.TileGrid grid = 16;
   // The cells under the prompt. They need not be uploaded: the server asks for the ones it does not hold.
   repeated viking.geometry.v1.GridCell tiles = 17;
-  // Logit above which a pixel is object. Higher values shrink the mask; lower values grow it. Optional so the server
-  // can tell an omitted field (it then uses its own default) from an explicit 0.
+  // Logit above which a pixel is object while the server grows the mask: lower values grow it further. Omitted means 0,
+  // SAM2's own boundary. The result's logits can be drawn at this value or any higher one (see
+  // SegmentationResponse.growth_threshold), so a client that raises its threshold redraws without asking again.
   optional float mask_threshold = 6;
   // When true, each window is predicted twice: the second pass is given the first pass's logits as SAM2's mask_input
   // along with the same prompt.
@@ -259,6 +260,10 @@ message SegmentationResponse {
   // An outline a person reviewed for the request's single location (PutReviewedOutlines), when one is stored and the
   // location has not been edited since. A client shows it as the proposal; `segments` still holds the model's logits.
   optional ReviewedOutline reviewed = 10;
+  // The mask_threshold the server grew this result at. It is at or below the request's: a cached result grown at a
+  // lower threshold answers any higher one. The logits are good for drawing at this value or above; drawing below it
+  // needs a new request with the lower threshold. Unset from servers older than this field.
+  optional float growth_threshold = 11;
 }
 
 message CacheInfo {
@@ -343,8 +348,9 @@ message ListJobsResponse {
   repeated Job jobs = 1;
 }
 
-// The segmentation of one island: SAM2's logits at their native resolution. The client contours the logits at the
-// request's mask_threshold, then places the contour with logits_origin and logits_scale.
+// The segmentation of one island: SAM2's logits at their native resolution. The client contours the logits at its
+// mask_threshold (at or above SegmentationResponse.growth_threshold), keeps the pieces its clicks land on, then places
+// the contour with logits_origin and logits_scale.
 message SegmentResult {
   // Was index, mask, x, y, polygons, logits_width, logits_height, logits_x and logits_y.
   reserved 1, 3, 4, 5, 6, 8, 9, 11, 12;
