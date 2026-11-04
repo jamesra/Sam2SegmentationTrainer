@@ -42,6 +42,7 @@ from converter.cardgeom import (  # noqa: F401 - re-exported: scoring and tests 
     union_bounds,
 )
 from converter.engines.tiled import TiledEngine
+from converter.prompts import LocationPrompts
 from converter.engines.window import WindowEngine
 from converter.seg_client import SegmentationClient, SegmentationFailed
 from converter.tilesource import SectionTiles, TileCache, Volume
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS converter_cards (
     type_code INTEGER,
     built_at TEXT,
     engine TEXT,
+    last_modified_ticks INTEGER,
     PRIMARY KEY (location_id, image_key)
 )
 """
@@ -186,8 +188,12 @@ class Builder:
         get_json: odata.GetJson = odata.http_get_json,
         semaphore: Optional[threading.Semaphore] = None,
         engine: Optional[str] = None,
+        prompt_library: Any = None,
+        job_id: int = 0,
     ) -> None:
-        """``engine`` forces ``engines.TILED`` or ``engines.WINDOW``; None asks the served model (see :mod:`engines`)."""
+        """``engine`` forces ``engines.TILED`` or ``engines.WINDOW``; None asks the served model (see :mod:`engines`).
+        ``prompt_library`` replaces the native shared prompt library (tests). ``job_id`` is the build's segmentation
+        server job (:mod:`converter.serverreview`): the tiled engine's results are kept in the server's cache under it."""
         self.params = params
         self.crops = Path(crops)
         self.volume = volume
@@ -203,8 +209,11 @@ class Builder:
                 params.volume, client, self._section, self._levels, threshold=params.threshold, semaphore=semaphore
             )
         else:
+            prompts = LocationPrompts(
+                params.volume, params.odata_base, get_json=get_json, prompt_library=prompt_library, job_id=job_id
+            )
             self.engine = TiledEngine(
-                params.volume, client, self._section, self._levels,
+                params.volume, client, self._section, self._levels, prompts=prompts,
                 tile_downsample=choice.tile_downsample, threshold=params.threshold, semaphore=semaphore,
             )
         LOGGER.info("structure %s: %s engine", params.structure_id, choice.kind)
@@ -219,6 +228,9 @@ class Builder:
         if "engine" not in columns:
             # Cards from before the engines were split say no engine, so each is built again by the current one.
             connection.execute("ALTER TABLE converter_cards ADD COLUMN engine TEXT")
+        if "last_modified_ticks" not in columns:
+            # The location's LastModified the card was built from, for the outline a reviewer approves (serverreview).
+            connection.execute("ALTER TABLE converter_cards ADD COLUMN last_modified_ticks INTEGER")
         return connection
 
     def _store_links(self) -> None:
@@ -248,9 +260,9 @@ class Builder:
             connection.execute("DELETE FROM converter_cards WHERE location_id = ?", [record.id])
             connection.execute(
                 "INSERT INTO converter_cards (location_id, image_key, state, reason, iou, source_hash, model_id, z, downsample, "
-                "origin_x, origin_y, original_wkt, candidate_wkt, type_code, built_at, engine) "
+                "origin_x, origin_y, original_wkt, candidate_wkt, type_code, built_at, engine, last_modified_ticks) "
                 "VALUES (:location_id, :image_key, :state, :reason, :iou, :source_hash, :model_id, :z, :downsample, "
-                ":origin_x, :origin_y, :original_wkt, :candidate_wkt, :type_code, :built_at, :engine)",
+                ":origin_x, :origin_y, :original_wkt, :candidate_wkt, :type_code, :built_at, :engine, :last_modified_ticks)",
                 row,
             )
             if row["state"] == BUILT:
@@ -320,6 +332,7 @@ class Builder:
             "origin_x": origin[0], "origin_y": origin[1], "original_wkt": record.wkt,
             "candidate_wkt": candidate_polygon_wkt(segmented.shape, segmented.level), "type_code": record.type_code,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "engine": self.engine_kind,
+            "last_modified_ticks": odata.last_modified_ticks(record.last_modified),
         }
         self._commit_card(record, row, int(candidate.sum()))
         return row
@@ -341,7 +354,7 @@ class Builder:
             "source_hash": source_hash(record), "model_id": self.params.model_id, "z": record.z, "downsample": None,
             "origin_x": None, "origin_y": None, "original_wkt": record.wkt, "candidate_wkt": None,
             "type_code": record.type_code, "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "engine": self.engine_kind,
+            "engine": self.engine_kind, "last_modified_ticks": odata.last_modified_ticks(record.last_modified),
         }
         self._commit_card(record, row, 0)
 

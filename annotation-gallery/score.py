@@ -39,7 +39,8 @@ from circle_update import max_inscribed_circle
 from converter import builder as builder_module
 from converter import contour as contour_module
 from converter import engines, odata, seed
-from converter.engines import tiled as tiled_engine
+from converter.prompts import LocationPrompts, prompt_annotation
+from converter.prompts_native import PromptRejected, PromptTooLarge
 from converter.seg_client import SegmentationFailed, TileIdentity
 from converter.tilesource import SectionTiles, TileCache, Volume
 
@@ -104,19 +105,15 @@ def _no_neighbours(cells: Sequence[Tuple[int, int]]) -> List[Any]:
 def _segment_once(
     record: odata.LocationRecord, volume_name: str, volume: Volume, tileset: Any, cache: TileCache, client: Any,
     downsample: int, cx: float, cy: float, radius: float, *, semaphore: Optional[threading.Semaphore], attempts: int,
-    tiled: bool = False,
 ) -> Tuple[Any, Any]:
-    """One request at one level: ``(result, contour or None)``. ``tiled`` uses the tiled engine's seed (the circle
-    alone); otherwise the single-window seed (:func:`seed.circle_prompt`, with rim clicks)."""
+    """One single-window request at one level: ``(result, contour or None)``, seeded by :func:`seed.circle_prompt`
+    (the circle with rim clicks)."""
     section = SectionTiles(volume, tileset, downsample, cache)
     identity = TileIdentity(
         volume=volume_name, section=record.z, channel=tileset.channel,
         transform=tileset.name or "mosaic", downsample=downsample,
     )
-    if tiled:
-        prompt = tiled_engine.circle_prompt(cx / downsample, cy / downsample, radius / downsample)
-    else:
-        prompt = seed.circle_prompt(cx / downsample, cy / downsample, radius / downsample)
+    prompt = seed.circle_prompt(cx / downsample, cy / downsample, radius / downsample)
     if semaphore is not None:
         semaphore.acquire()
     try:
@@ -124,6 +121,45 @@ def _segment_once(
             identity, prompt, section.protocol_tile, _no_neighbours,
             threshold=THRESHOLD, request_id=record.id & 0xFFFFFFFF, attempts=attempts,
         )
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+    return result, contour_module.contour_from_result(result)
+
+
+def _seed_circle_target(record: odata.LocationRecord, cx: float, cy: float, radius: float) -> Any:
+    """The seed circle as a prompt target in the location's place (its id keeps the location out of the background)."""
+    target = prompt_annotation(record)
+    target.type_code = 1
+    target.mosaic_wkt = ""
+    target.x, target.y, target.radius = float(cx), float(cy), float(radius)
+    return target
+
+
+def _segment_tiled_once(
+    record: odata.LocationRecord, volume: Volume, tileset: Any, cache: TileCache, client: Any, prompts: LocationPrompts,
+    cx: float, cy: float, radius: float, kind: str, *, semaphore: Optional[threading.Semaphore], attempts: int,
+) -> Tuple[Any, Any]:
+    """One tiled request built by the shared prompt library: ``(result, contour or None)``. A circle annotation is its
+    own location prompt (the converter's request, answered from the same cache row); a polygon's seed circle is not the
+    location's prompt, so it goes in the location's place but is never cached."""
+    section = SectionTiles(volume, tileset, 1, cache)
+    own = kind == "circle"
+    try:
+        prompt_input = prompts.input_for(
+            [record], tileset.name or tileset.channel, model_id=client.model_id(), threshold=THRESHOLD,
+            request_id=record.id, target_annotations=None if own else [_seed_circle_target(record, cx, cy, radius)],
+        )
+    except PromptRejected as error:
+        raise seed.NotSeedable(str(error)) from error
+    if semaphore is not None:
+        semaphore.acquire()
+    try:
+        result = prompts.segment(client, prompt_input, section.protocol_tile, threshold=THRESHOLD, attempts=attempts, cache=own)
+    except PromptRejected as error:
+        raise seed.NotSeedable(str(error)) from error
+    except PromptTooLarge as error:
+        raise SegmentationFailed(f"too_large: {error}") from error
     finally:
         if semaphore is not None:
             semaphore.release()
@@ -142,18 +178,20 @@ def score_record(
     attempts: int = 1,
     native_downsample: Optional[int] = None,
     engine: Optional[str] = None,
+    prompts: Optional[LocationPrompts] = None,
 ) -> LocationScore:
     """Segment ``record`` from its seed circle and compare the result with the annotation, both whole on one card.
 
     The served model's engine decides how (see :mod:`converter.engines`; ``engine`` forces one): the tiled engine
     segments at the model's tile level and lets the server grow across tiles; the single-window engine fits the object
     into one window. Raises ``SegmentationFailed`` (server refused or unreachable) or ``seed.NotSeedable`` (nothing to
-    seed with). An empty mask is a score of 0, not an error: the model did not find the object.
+    seed with). An empty mask is a score of 0, not an error: the model did not find the object. The tiled engine
+    needs ``prompts`` (the volume's OData, for the neighbours).
     """
     choice = engines.choose(client, engine)
     if choice.kind == engines.TILED:
         return _score_tiled(
-            record, volume_name, volume, client, cache, level=choice.tile_downsample, model=model,
+            record, volume, client, cache, prompts, level=choice.tile_downsample, model=model,
             semaphore=semaphore, attempts=attempts, native_downsample=native_downsample,
         )
     return _score_window(
@@ -164,10 +202,10 @@ def score_record(
 
 def _score_tiled(
     record: odata.LocationRecord,
-    volume_name: str,
     volume: Volume,
     client: Any,
     cache: TileCache,
+    prompts: Optional[LocationPrompts],
     *,
     level: int,
     model: Optional[str],
@@ -177,14 +215,17 @@ def _score_tiled(
 ) -> LocationScore:
     """The tiled engine's score: one request at the model's tile level; the comparison card is laid out afterwards at
     the finest level that holds the annotation and the mask, which changes nothing the model saw."""
+    if prompts is None:
+        raise SegmentationFailed("not_configured: the tiled score needs the volume's OData for the prompt's neighbours")
+    if level != 1:
+        raise SegmentationFailed(f"no_level: the model's tile level is DS {level}; the shared prompt library builds DS 1 only")
     cx, cy, radius, kind = seed_circle(record)
     tileset = volume.select(record.z)
     levels = sorted(tileset.levels)
     if level not in levels:
         raise SegmentationFailed(f"no_level: section {record.z}'s tileset has no level {level}, the model's tile level")
-    result, shape = _segment_once(
-        record, volume_name, volume, tileset, cache, client, level, cx, cy, radius,
-        semaphore=semaphore, attempts=attempts, tiled=True,
+    result, shape = _segment_tiled_once(
+        record, volume, tileset, cache, client, prompts, cx, cy, radius, kind, semaphore=semaphore, attempts=attempts,
     )
     record_bounds = odata.bounds(record)
     bounds = record_bounds if shape is None else builder_module.union_bounds(
@@ -340,8 +381,10 @@ def score_after_refresh(
     volume_key: str,
     make_cache: Callable[[], TileCache],
     semaphore: Optional[threading.Semaphore] = None,
+    make_prompts: Optional[Callable[[], LocationPrompts]] = None,
 ) -> Dict[str, Any]:
-    """Score and store one refreshed location. Never raises: a failure comes back as ``{"error": ...}``."""
+    """Score and store one refreshed location. Never raises: a failure comes back as ``{"error": ...}``.
+    ``make_prompts`` gives the tiled engine's prompt builder for the volume."""
     try:
         record = odata.record_from_entity(entity)
     except Exception as exc:  # noqa: BLE001 - an entity the converter cannot read
@@ -357,6 +400,7 @@ def score_after_refresh(
         score = score_record(
             record, volume_name, volume, client, make_cache(), model=model_version(client), semaphore=semaphore,
             native_downsample=native_downsample(crops, record.id),
+            prompts=make_prompts() if make_prompts is not None else None,
         )
         rows = write_score(crops, score)
         return {**score.payload(), "rows": rows}

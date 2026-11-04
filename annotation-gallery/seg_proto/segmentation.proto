@@ -35,6 +35,17 @@ service SegmentationService {
 
   // Version, load and the served model, for health and selection.
   rpc GetServerStatus (ServerStatusRequest) returns (ServerStatusResponse) {}
+
+  // Store or remove outlines a person reviewed (approved or retraced) for single locations. A stored outline is sent
+  // as SegmentationResponse.reviewed with every later segmentation of that location until the location is edited.
+  // Only a pending proposal is ever made from it: nothing is written to the annotation database.
+  rpc PutReviewedOutlines (PutReviewedOutlinesRequest) returns (PutReviewedOutlinesResponse) {}
+
+  // A job is a reason to keep cached segmentations: rows linked to a job (SegmentTilesRequest.job_id) are never evicted
+  // by the cache's size or age limits. Deleting a job only lifts that protection.
+  rpc CreateJob (CreateJobRequest) returns (Job) {}
+  rpc DeleteJob (DeleteJobRequest) returns (DeleteJobResponse) {}
+  rpc ListJobs (ListJobsRequest) returns (ListJobsResponse) {}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -116,6 +127,30 @@ message SegmentTilesRequest {
   // touches, each once. 0 when there is no bitmap. The server waits for all of them before growth starts. More tiles
   // than announced is INVALID_ARGUMENT; a count over the server's limit is RESOURCE_EXHAUSTED.
   uint32 mask_tile_count = 18;
+  // The annotation(s) the prompt segments: one location, or the locations of a merged group. When set, the server
+  // keeps the result and answers a later request with the same key from its cache without asking for tiles. The key
+  // is these locations (any order) with their last_modified_ticks, the neighbors, the prompt, the model, the server
+  // version and the grid's space, transform, channel and downsample; an edit to any of the locations or neighbours
+  // therefore segments anew. Empty: nothing is cached.
+  repeated LocationRef locations = 19;
+  // The annotations whose shapes are, or may be, sent as background (background_feature and TilesAnswer
+  // background_shapes). The cache key is taken from `start` alone, so list every neighbour the client might send.
+  repeated LocationRef neighbors = 20;
+  // Segment anew and replace the cached result instead of answering from the cache.
+  bool refresh = 21;
+  // Links the result to a job (CreateJob), which keeps it from eviction. 0 or unset: no job.
+  optional int64 job_id = 22;
+  // What the object roughly is: an existing outline to correct (a location's own polygon). Its shapes form islands like
+  // foreground shapes, but are encoded as a mask to correct (the model's CORRECTION role, weaker than a seed) and are
+  // never pinned as object. Points are clicks, as in foreground_feature.
+  Feature correction_feature = 23;
+}
+
+// An annotation the request is about, as of its last change.
+message LocationRef {
+  int64 id = 1;
+  // The location's LastModified, UTC, in .NET ticks (100 ns since 0001-01-01).
+  int64 last_modified_ticks = 2;
 }
 
 // One side of the prompt.
@@ -219,6 +254,93 @@ message SegmentationResponse {
   repeated SegmentResult segments = 4;
   // SegmentTilesRequest.request_id echoed back. 0 when the request carried none.
   uint64 request_id = 8;
+  // Set when this answer came from the server's cache instead of the model.
+  optional CacheInfo cache = 9;
+  // An outline a person reviewed for the request's single location (PutReviewedOutlines), when one is stored and the
+  // location has not been edited since. A client shows it as the proposal; `segments` still holds the model's logits.
+  optional ReviewedOutline reviewed = 10;
+}
+
+message CacheInfo {
+  // When the cached result was segmented, UTC, in .NET ticks.
+  int64 created_ticks = 1;
+  // ModelInfo.model_version of the model that made it.
+  string model_version = 2;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reviewed outlines
+
+message ReviewedOutline {
+  int64 location_id = 1;
+  // The location's LastModified (UTC ticks) the outline was reviewed against.
+  int64 last_modified_ticks = 2;
+  // The outline in MOSAIC pixels at downsample 1 (X right, Y up), on the location's section.
+  viking.geometry.v1.Shape outline = 3;
+  // "approved" or "retraced".
+  string state = 4;
+  // When it was reviewed, UTC, in .NET ticks.
+  int64 reviewed_ticks = 5;
+  string reviewer = 6;
+}
+
+message PutReviewedOutlinesRequest {
+  // TileGrid.volume: the VikingXML volume name.
+  string volume = 1;
+  // Stored, replacing any outline for the same location.
+  repeated ReviewedOutline outlines = 2;
+  // Locations whose stored outline is removed.
+  repeated int64 remove_location_ids = 3;
+}
+
+message PutReviewedOutlinesResponse {
+  uint32 stored = 1;
+  uint32 removed = 2;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Jobs
+
+message Job {
+  int64 job_id = 1;
+  // TileGrid.volume: jobs belong to one volume.
+  string volume = 2;
+  string title = 3;
+  // Who asked for the job.
+  string username = 4;
+  string description = 5;
+  // What made it, such as "convert" or "scores".
+  string kind = 6;
+  // UTC, in .NET ticks.
+  int64 created_ticks = 7;
+  // Cache keys linked to the job (ListJobs only).
+  uint32 linked = 8;
+}
+
+message CreateJobRequest {
+  string volume = 1;
+  string title = 2;
+  string username = 3;
+  string description = 4;
+  string kind = 5;
+}
+
+message DeleteJobRequest {
+  string volume = 1;
+  int64 job_id = 2;
+}
+
+message DeleteJobResponse {
+  // False when no such job existed.
+  bool deleted = 1;
+}
+
+message ListJobsRequest {
+  string volume = 1;
+}
+
+message ListJobsResponse {
+  repeated Job jobs = 1;
 }
 
 // The segmentation of one island: SAM2's logits at their native resolution. The client contours the logits at the

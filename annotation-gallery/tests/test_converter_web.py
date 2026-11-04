@@ -19,6 +19,7 @@ for folder in (GALLERY_ROOT, Path(__file__).resolve().parent):
         sys.path.insert(0, str(folder))
 
 import test_converter_builder as fixtures  # noqa: E402
+from fake_prompts import FakePromptLibrary  # noqa: E402
 from converter import builder as builder_module  # noqa: E402
 from converter import web  # noqa: E402
 from server import make_server  # noqa: E402
@@ -53,7 +54,7 @@ def built(converter_root: Path) -> Path:
     params = builder_module.BuildParams(volume="RC1", odata_base="http://odata.test/RC1", structure_id=500)
     builder = builder_module.Builder(
         params, crops, volume, segmenter, fixtures.TileCache(None, fixtures.tile_http),
-        get_json=lambda url: {"@odata.count": 3, "value": entities},
+        get_json=lambda url: {"@odata.count": 3, "value": entities}, prompt_library=FakePromptLibrary(),
     )
     summary = builder.run()
     assert (summary.built, summary.failed) == (2, 1)
@@ -156,6 +157,34 @@ def test_approve_puts_a_card_in_the_batch_and_unapprove_takes_it_out(httpd) -> N
     assert request(httpd, "GET", f"/api/volumes/RC1/converter/batch?set={SET}")[1] == b""
 
 
+def _wait_for(condition, seconds: float = 5.0) -> None:
+    deadline = time.time() + seconds
+    while not condition():
+        assert time.time() < deadline, "the background call did not arrive"
+        time.sleep(0.02)
+
+
+def test_review_marks_and_deleting_reach_the_segmentation_servers_cache(httpd, built: Path) -> None:
+    from converter import jobs
+    from converter import serverreview
+
+    client = fixtures.FakeSegmenter(lambda _id: None)
+    jobs.OVERRIDES["make_client"] = lambda: client
+    (built / serverreview.JOB_FILE).write_text(json.dumps({"job_id": 41}), encoding="utf-8")
+    key = f"{fixtures.VOLUME}_7_D1_L11"
+    try:
+        assert request(httpd, "POST", f"/api/volumes/RC1/approve?set={SET}", {"location_id": 11, "image_key": key})[0] == 200
+        _wait_for(lambda: len(client.reviewed) == 1)
+        assert [(o.location_id, o.state) for o in client.reviewed[0][1]] == [(11, "approved")]
+        assert request(httpd, "POST", f"/api/volumes/RC1/unapprove?set={SET}", {"location_id": 11, "image_key": key})[0] == 200
+        _wait_for(lambda: len(client.reviewed) == 2)
+        assert client.reviewed[1] == ("RC1", [], [11])
+        assert request(httpd, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 200
+        _wait_for(lambda: ("delete", "RC1", 41) in client.jobs)
+    finally:
+        jobs.OVERRIDES.clear()
+
+
 def test_reject_leaves_the_card_out_of_the_batch_and_restore_brings_it_back_unapproved(httpd) -> None:
     key = f"{fixtures.VOLUME}_7_D1_L12"
     assert request(httpd, "POST", f"/api/volumes/RC1/ignore?set={SET}", {"location_id": 12, "image_key": key})[0] == 200
@@ -240,6 +269,7 @@ def job_env(tmp_path: Path, converter_root: Path, monkeypatch: pytest.MonkeyPatc
         make_volume=lambda name: volume,
         make_cache=lambda: fixtures.TileCache(None, fixtures.tile_http),
         get_json=get_json,
+        prompt_library=FakePromptLibrary(),
     )
     yield
     jobs.OVERRIDES.clear()

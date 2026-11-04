@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import numpy as np
@@ -16,8 +17,9 @@ from PIL import Image
 import catalog
 from converter import builder as builder_module
 from converter import contour, engines, geo, odata, seed
-from converter.seg_client import SegmentationFailed, SegmentResult
+from converter.seg_client import SegmentationClient, SegmentationFailed, SegmentResult
 from converter.tilesource import SectionTiles, TileCache, flip_for_protocol, parse_viking_xml
+from tests.fake_prompts import FakePromptLibrary
 
 VOLUME = "RC1"
 TILE = 512
@@ -173,6 +175,37 @@ class FakeSegmenter:
         self.grow = grow
         self.fail = fail or {}
         self.calls: List[Any] = []
+        self.starts: List[Any] = []
+        # The cache calls (converter.serverreview): jobs made and deleted, reviewed outlines stored and removed.
+        self.jobs: List[Any] = []
+        self.reviewed: List[Any] = []
+
+    def model_id(self):
+        return "v5"
+
+    def create_job(self, volume, *, title, kind, **_):
+        self.jobs.append(("create", volume, kind))
+        return 41
+
+    def delete_job(self, volume, job_id):
+        self.jobs.append(("delete", volume, job_id))
+        return True
+
+    def put_reviewed_outlines(self, volume, outlines, remove_location_ids=()):
+        self.reviewed.append((volume, list(outlines), list(remove_location_ids)))
+
+    # The tiled engine's calls: a start from the prompt library, retried as the real client retries.
+    retrying = staticmethod(SegmentationClient.retrying)
+
+    def segment_request(self, start, tiles, answer_background, *, threshold):
+        self.starts.append(start)
+        identity = SimpleNamespace(downsample=start.grid.downsample, channel=start.grid.channel, transform=start.grid.transform)
+        prompt = SimpleNamespace(
+            foreground_mask=None,
+            foreground_points=[(p.x, p.y) for p in start.foreground_feature.points],
+            foreground_shapes=list(start.foreground_feature.shapes) + list(start.correction_feature.shapes),
+        )
+        return self.segment_with_retry(identity, prompt, tiles, None, threshold=threshold, request_id=start.request_id)
 
     def segment_with_retry(self, identity, prompt, tiles, background, *, threshold, request_id, **_):
         self.calls.append((identity, prompt, request_id))
@@ -198,22 +231,23 @@ class FakeSegmenter:
 
 
 def _prompt_anchor(prompt):
-    """Where the fake centres its window: the lowest click, else the first shape's centre (a tiled circle has no
-    clicks)."""
+    """Where the fake centres its window: the lowest click, else the first shape's centre (a tiled polygon, an outline
+    to correct, has no click)."""
     if prompt.foreground_points:
         return (int(min(x for x, _ in prompt.foreground_points)), int(min(y for _, y in prompt.foreground_points)))
     shape = prompt.foreground_shapes[0]
     if shape.WhichOneof("kind") == "circle":
         return (int(shape.circle.center.x), int(shape.circle.center.y))
     points = shape.polygon.exterior.points
-    return (int(min(p.x for p in points)), int(min(p.y for p in points)))
+    xs, ys = [p.x for p in points], [p.y for p in points]
+    return (int((min(xs) + max(xs)) / 2), int((min(ys) + max(ys)) / 2))
 
 
 def _disc(cx, cy, r):
     return lambda X, Y, grow: (X - cx) ** 2 + (Y - cy) ** 2 <= (r + grow) ** 2
 
 
-def _make(tmp_path, volume, cache, segmenter, entities, engine=None, **params):
+def _make(tmp_path, volume, cache, segmenter, entities, engine=None, prompt_library=None, **params):
     pages = {"value": entities}
 
     def get_json(url: str):
@@ -223,7 +257,8 @@ def _make(tmp_path, volume, cache, segmenter, entities, engine=None, **params):
 
     build_params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500, **params)
     return builder_module.Builder(
-        build_params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, engine=engine
+        build_params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, engine=engine,
+        prompt_library=prompt_library or FakePromptLibrary(),
     )
 
 
@@ -293,8 +328,10 @@ def test_the_tiled_engine_segments_a_big_polygon_at_ds1_and_only_draws_its_card_
     summary = builder.run()
     assert builder.engine_kind == engines.TILED and summary.built == 1
     assert [identity.downsample for identity, _prompt, _id in segmenter.calls] == [1], "no coarser request"
-    (_identity, prompt, _id) = segmenter.calls[0]
-    assert len(prompt.foreground_points) == 1, "one click at the polygon's deepest point"
+    (start,) = segmenter.starts
+    assert not start.foreground_feature.points, "no click: the server clicks the outline's deepest pixel"
+    assert len(start.correction_feature.shapes) == 1, "the polygon is an outline to correct"
+    assert [ref.id for ref in start.locations] == [13], "the location, so the server caches the result"
     row = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite").execute(
         "SELECT downsample, iou, engine, candidate_wkt FROM converter_cards"
     ).fetchone()
@@ -303,12 +340,13 @@ def test_the_tiled_engine_segments_a_big_polygon_at_ds1_and_only_draws_its_card_
     assert "2300" in row[3] or "2301" in row[3] or "2302" in row[3], "the proposal is stored in mosaic pixels"
 
 
-def test_a_tiled_circle_is_its_shape_alone(tmp_path: Path, volume, cache) -> None:
+def test_a_tiled_circle_is_its_true_disc_and_a_click_at_its_centre_on_the_tilesets_mosaic_grid(tmp_path: Path, volume, cache) -> None:
     segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
     _make(tmp_path, volume, cache, segmenter, [_entity(11, 1, "POINT (1400 1600)", radius=80)]).run()
-    (identity, prompt, _id) = segmenter.calls[0]
-    assert identity.downsample == 1 and not prompt.foreground_points
-    (shape,) = prompt.foreground_shapes
+    (start,) = segmenter.starts
+    assert start.grid.downsample == 1 and start.grid.channel == start.grid.transform != ""
+    assert [(p.x, p.y) for p in start.foreground_feature.points] == [(1400, 1600)]
+    (shape,) = start.foreground_feature.shapes
     assert shape.circle.radius == 80
 
 
@@ -507,9 +545,10 @@ def test_location_links_are_stored_once_each_and_replaced_on_every_run(tmp_path:
 
     params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500)
     segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
-    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json).run()
+    library = FakePromptLibrary()
+    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, prompt_library=library).run()
     assert converter_web.link_rows(tmp_path / "crops") == [[11, 12], [11, 13]]
 
     links[:] = [{"A": 11, "B": 15}]
-    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json).run()
+    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, prompt_library=library).run()
     assert converter_web.link_rows(tmp_path / "crops") == [[11, 15]]

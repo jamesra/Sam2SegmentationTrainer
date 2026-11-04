@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from converter import builder as builder_module
 from converter import odata
+from converter import serverreview
 from converter.seg_client import SegmentationClient
 from converter.tilesource import TileCache, Volume, load_volume
 
@@ -102,6 +103,7 @@ class BuildJob:
         make_volume: Callable[[str], Volume] = default_volume,
         make_cache: Callable[[], TileCache] = tile_cache,
         get_json: odata.GetJson = odata.http_get_json,
+        prompt_library: Any = None,
     ) -> None:
         self.set_name = set_name
         self.volume = volume
@@ -111,6 +113,8 @@ class BuildJob:
         self._make_volume = make_volume
         self._make_cache = make_cache
         self._get_json = get_json
+        # None: the process's native prompt library, loaded when the tiled engine first builds a request.
+        self._prompt_library = prompt_library
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self.phase = "starting"
@@ -190,8 +194,10 @@ class BuildJob:
             else:
                 volume = self._make_volume(self.volume)
             cache = self._make_cache()
+            job_id = serverreview.build_job(self.crops, client, self.params.volume, self.set_name)
             builder = builder_module.Builder(
-                self.params, self.crops, volume, client, cache, get_json=self._get_json, semaphore=streams()
+                self.params, self.crops, volume, client, cache, get_json=self._get_json, semaphore=streams(),
+                prompt_library=self._prompt_library, job_id=job_id,
             )
             with self._lock:
                 self.phase = "building"

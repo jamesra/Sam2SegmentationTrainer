@@ -271,6 +271,8 @@ class SegmentResult:
     islands: int = 1  # how many islands the server returned; only ``island`` is kept
     tiles_uploaded: int = 0
     background_shapes_sent: int = 0
+    # True when the server answered from its result cache (SegmentationResponse.cache).
+    from_cache: bool = False
     notes: List[str] = field(default_factory=list)
 
 
@@ -347,6 +349,23 @@ class SegmentationClient:
     def status(self) -> "pb.ServerStatusResponse":
         return self._stub.GetServerStatus(pb.ServerStatusRequest(), timeout=15)
 
+    def create_job(self, volume: str, *, title: str, kind: str, username: str = "", description: str = "") -> int:
+        """A cache job: the server keeps every result linked to it (``SegmentTilesRequest.job_id``) until it is deleted."""
+        request = pb.CreateJobRequest(volume=volume, title=title, kind=kind, username=username, description=description)
+        return int(self._stub.CreateJob(request, timeout=15).job_id)
+
+    def delete_job(self, volume: str, job_id: int) -> bool:
+        """False when the server had no such job."""
+        return bool(self._stub.DeleteJob(pb.DeleteJobRequest(volume=volume, job_id=job_id), timeout=15).deleted)
+
+    def put_reviewed_outlines(
+        self, volume: str, outlines: Sequence["pb.ReviewedOutline"], remove_location_ids: Sequence[int] = ()
+    ) -> "pb.PutReviewedOutlinesResponse":
+        """Store outlines a person reviewed, and remove others; the server sends a stored one with every later
+        segmentation of its location until the location is edited."""
+        request = pb.PutReviewedOutlinesRequest(volume=volume, outlines=outlines, remove_location_ids=list(remove_location_ids))
+        return self._stub.PutReviewedOutlines(request, timeout=30)
+
     def model_id(self) -> Optional[str]:
         """The model id requests carry: the one given, else the one the server reports (it refuses requests without it
         when its manifest says so). A server that cannot say leaves it unset."""
@@ -408,6 +427,33 @@ class SegmentationClient:
         if model_id and model_id != "unknown":
             start.model_id = model_id
 
+        return self._converse(
+            start, foreground, tiles,
+            lambda needed: new_background([_cell_of(cell) for cell in needed.background_cells]), threshold,
+        )
+
+    def segment_request(
+        self,
+        start: "pb.SegmentTilesRequest",
+        tiles: TileProvider,
+        answer_background: Callable[["pb.TilesNeeded"], Sequence["geo.Shape"]],
+        *,
+        threshold: float = 0.5,
+    ) -> SegmentResult:
+        """Run a ``start`` built elsewhere (the shared prompt library, :mod:`converter.prompts`). ``answer_background``
+        gives the background shapes for one ``TilesNeeded``; the start is sent as given (its model_id included)."""
+        return self._converse(start, [], tiles, answer_background, threshold)
+
+    def _converse(
+        self,
+        start: "pb.SegmentTilesRequest",
+        mask_tiles: Sequence["pb.MaskTile"],
+        tiles: TileProvider,
+        answer_background: Callable[["pb.TilesNeeded"], Sequence["geo.Shape"]],
+        threshold: float,
+    ) -> SegmentResult:
+        """One SegmentTilesStream: send ``start`` (and the mask tiles), upload what the server asks for and answer its
+        background cells, until the result."""
         outbound: "queue.Queue[Optional[pb.SegmentTilesStreamRequest]]" = queue.Queue()
 
         def requests() -> Iterator["pb.SegmentTilesStreamRequest"]:
@@ -418,25 +464,27 @@ class SegmentationClient:
                 yield item
 
         outbound.put(pb.SegmentTilesStreamRequest(start=start))
-        if foreground:
-            outbound.put(pb.SegmentTilesStreamRequest(mask_tiles=pb.MaskTiles(tiles=foreground)))
+        if mask_tiles:
+            outbound.put(pb.SegmentTilesStreamRequest(mask_tiles=pb.MaskTiles(tiles=mask_tiles)))
 
         uploaded = 0
+        sent = len(start.background_feature.shapes)
         deadline = time.monotonic() + self._total_timeout
         call = self._stub.SegmentTilesStream(requests(), timeout=self._total_timeout)
         try:
             for message in call:
                 kind = message.WhichOneof("update")
                 if kind == "result":
-                    return self._finish(message.result, threshold, uploaded, len(sent_shapes))
+                    return self._finish(message.result, threshold, uploaded, sent)
                 if kind != "needed":
                     continue
                 if time.monotonic() > deadline:
                     raise SegmentationFailed("segmentation exceeded its time limit", grpc.StatusCode.DEADLINE_EXCEEDED)
                 needed = message.needed
-                ready, unavailable = self._upload(identity, needed.tiles, tiles)
+                ready, unavailable = self._upload(start.grid, needed.tiles, tiles)
                 uploaded += ready
-                shapes = new_background([_cell_of(cell) for cell in needed.background_cells])
+                shapes = list(answer_background(needed)) if needed.background_cells else []
+                sent += len(shapes)
                 outbound.put(
                     pb.SegmentTilesStreamRequest(answer=pb.TilesAnswer(unavailable=unavailable, background_shapes=shapes))
                 )
@@ -447,12 +495,11 @@ class SegmentationClient:
         raise SegmentationFailed("the stream ended without a result")
 
     def _upload(
-        self, identity: TileIdentity, cells: Iterable["geo.GridCell"], tiles: TileProvider
+        self, grid: "geo.TileGrid", cells: Iterable["geo.GridCell"], tiles: TileProvider
     ) -> Tuple[int, List["geo.GridCell"]]:
         """Upload the cells' tiles: ``(how many were uploaded, the cells that could not be supplied)``."""
         ready = 0
         unavailable: List["geo.GridCell"] = []
-        grid = identity.grid()
         for cell in cells:
             data = tiles(cell.row, cell.col)
             if not data:
@@ -487,6 +534,7 @@ class SegmentationClient:
             islands=len(response.segments),
             tiles_uploaded=uploaded,
             background_shapes_sent=sent,
+            from_cache=response.HasField("cache"),
             notes=notes,
         )
 
@@ -503,9 +551,14 @@ class SegmentationClient:
     def segment_with_retry(self, *args, attempts: int = 4, backoff_seconds: float = 5.0, **kwargs) -> SegmentResult:
         """``segment`` retried with growing waits when the server is unavailable or timed out waiting for our tiles;
         nothing else is retried."""
+        return self.retrying(lambda: self.segment(*args, **kwargs), attempts=attempts, backoff_seconds=backoff_seconds)
+
+    @staticmethod
+    def retrying(call: Callable[[], SegmentResult], *, attempts: int = 4, backoff_seconds: float = 5.0) -> SegmentResult:
+        """``call`` (one whole stream) retried as ``segment_with_retry`` retries."""
         for attempt in range(attempts):
             try:
-                return self.segment(*args, **kwargs)
+                return call()
             except SegmentationFailed as failure:
                 if not failure.retryable or attempt == attempts - 1:
                     raise

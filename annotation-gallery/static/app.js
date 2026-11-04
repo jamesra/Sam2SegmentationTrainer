@@ -1143,9 +1143,12 @@
     if (!template || template.includes("connectomes.utah.edu/connectome")) {
       template = "viking://open?volumeName={volume}&location={id}";
     }
-    return template
+    const href = template
       .replaceAll("{volume}", encodeURIComponent(identityNameOf(state.volume)))
       .replaceAll("{id}", encodeURIComponent(String(row.location_id)));
+    // A converter card asks Viking to segment the location on arrival; the server's cache usually answers at once.
+    // Viking versions that do not know the parameter ignore it.
+    return state.converter ? `${href}&propose=1` : href;
   }
 
   // The name Identity (and so Viking) knows the volume by: NM for the NasalMonkey folder.
@@ -1162,11 +1165,12 @@
       return false;
     }
     const location = decodeURIComponent(match[1]);
+    const propose = /[?&]propose=1(?:&|$)/.test(link.getAttribute("href") || "");
     try {
       const response = await fetch(withSet(`/api/volumes/${encodeURIComponent(state.volume)}/viking-link`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ location }),
+        body: JSON.stringify({ location, propose }),
       });
       if (response.status === 401) {
         window.location.href = "/login";

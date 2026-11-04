@@ -71,7 +71,9 @@ from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
 from converter import jobs as converter_jobs
+from converter.prompts import LocationPrompts
 from converter import odata as odata_module
+from converter import serverreview
 from converter import web as converter_web
 from converter.builder import BuildParams
 from converter.tilesource import load_volume as load_viking_volume
@@ -420,13 +422,16 @@ def viking_link(
     identity_name: str,
     location: str,
     http_json: Callable[..., Any] = default_http_json,
+    propose: bool = False,
 ) -> str:
-    """viking:// link that opens (or jumps) Viking on a location, signed in as the token's user.
+    """viking:// link that opens (or jumps) Viking on a location, signed in as the token's user. ``propose`` asks Viking
+    to segment the location on arrival (a converter card); a Viking that does not know the parameter ignores it.
 
     Asks Identity for a one-use launch code. When Identity refuses the volume (403) the plain link is returned:
     Viking then signs in by itself. A 401 is raised as IdentityHttpError so the caller can send the user to sign in.
     """
-    plain = "viking://open?volumeName=" + quote(identity_name, safe="") + "&location=" + quote(location, safe="")
+    place = "&location=" + quote(location, safe="") + ("&propose=1" if propose else "")
+    plain = "viking://open?volumeName=" + quote(identity_name, safe="") + place
     try:
         payload = http_json(
             api_base.rstrip("/") + "/api/viking/launch-code",
@@ -441,7 +446,7 @@ def viking_link(
     url = str((payload or {}).get("viking_url") or "")
     if not url.lower().startswith("viking://"):
         return plain
-    return url + "&location=" + quote(location, safe="")
+    return url + place
 
 
 def identity_logout_url(environ: dict[str, str] | None = None) -> str:
@@ -996,6 +1001,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if action in ("ignore", "restore"):
             # A rejected mask stops being a negative for its neighbors, so the whole tile's layers are stale.
             drop_card_masks(crops, location_image_keys(crops, [location_id]))
+        if action != "restore" and converter_web.is_converter_crops(crops):
+            # An approved card's outline goes to the segmentation server, so Viking proposes it; unapproving or
+            # rejecting takes it back. Restore leaves the card unapproved, which it already was on the server.
+            self._publish_review(crops, volume, location_id, image_key, keep=action == "approve")
         self._send_json({
             "ok": True,
             "location_id": location_id,
@@ -1125,9 +1134,21 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if crops is None:
             return
         try:
-            self._send_json(converter_web.apply_edit(crops, location_id, image_key, body.get("rings")))
+            edited = converter_web.apply_edit(crops, location_id, image_key, body.get("rings"))
         except converter_web.EditRejected as rejected:
             self._send_json({"error": str(rejected)}, status=400)
+            return
+        self._publish_review(crops, volume, location_id, image_key, keep=True)
+        self._send_json(edited)
+
+    def _publish_review(self, crops: Path, volume: str, location_id: int, image_key: str | None, *, keep: bool) -> None:
+        """Store (``keep``) or remove a converter card's reviewed outline on the segmentation server, in the background."""
+        principal = self._principal()
+        serverreview.publish(
+            crops, volume, location_id, image_key, keep=keep,
+            reviewer=principal.display_name or principal.subject or "unknown",
+            make_client=converter_jobs.OVERRIDES.get("make_client", converter_jobs.default_client),
+        )
 
     # ---- gold sets ------------------------------------------------------------------------------------------------
 
@@ -1376,12 +1397,15 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if job is not None and job.running:
             self._send_json({"error": "this build is running; cancel it first"}, status=409)
             return
+        job_id = serverreview.stored_job(set_dir / volume)
         try:
             converter_web.delete_build(root, set_name, volume)
         except (FileNotFoundError, ValueError):
             self._send_json({"error": "not found"}, status=404)
             return
         converter_jobs.forget_job(set_name, volume)
+        # The build's cached results are no longer needed, so the server may evict them.
+        serverreview.delete_job(converter_jobs.OVERRIDES.get("make_client", converter_jobs.default_client), volume, job_id)
         self._send_json({"deleted": {"set": set_name, "volume": volume}})
 
     def _handle_converter_create(self) -> None:
@@ -1459,7 +1483,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         api = os.environ.get("GALLERY_IDENTITY_API") or "https://identity.codepharm.net:6001"
         try:
-            url = viking_link(api, token, identity_name, location)
+            url = viking_link(api, token, identity_name, location, propose=body.get("propose") is True)
         except IdentityHttpError as exc:
             status = 401 if exc.status == 401 else 502
             self._send_json({"error": "launch code failed", "login": "/login"}, status=status)
@@ -1818,6 +1842,11 @@ class GalleryHandler(BaseHTTPRequestHandler):
             volume_key=viking_xml or volume,
             make_cache=converter_jobs.OVERRIDES.get("make_cache", converter_jobs.tile_cache),
             semaphore=converter_jobs.streams(),
+            make_prompts=lambda: LocationPrompts(
+                volume, odata_endpoint(volume, source),
+                get_json=converter_jobs.OVERRIDES.get("get_json", odata_module.http_get_json),
+                prompt_library=converter_jobs.OVERRIDES.get("prompt_library"),
+            ),
         )
 
     def _handle_import_location(self, volume: str) -> None:

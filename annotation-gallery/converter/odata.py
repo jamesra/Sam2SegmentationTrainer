@@ -6,6 +6,8 @@ Read-only. The converter never writes to OData (it cannot); approved results go 
 from __future__ import annotations
 
 import json
+import re
+from datetime import date
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlparse
@@ -14,13 +16,17 @@ from urllib.request import Request, urlopen
 from converter import geo
 
 SELECT = "ID,ParentID,TypeCode,Z,X,Y,OffEdge,MosaicShape,LastModified,Radius"
-EXPAND = "Parent($select=ID,TypeID,Label;$expand=Type($select=ID,Name,ParentID))"
+EXPAND = "Parent($select=ID,TypeID,Label,ParentID;$expand=Type($select=ID,Name,ParentID))"
 PAGE_SIZE = 500
 
 GetJson = Callable[[str], Dict[str, Any]]
 
 # Types the converter builds cards for by default: the closed shapes that become polygons, and circles.
 DEFAULT_TYPE_CODES = (1, 4, 6, 7)
+
+# The neighbours a prompt may use (Viking.SegmentationPrompts' rule): circles, polygons and curve polygons of structures
+# whose type is Cell (1) or a child type of Cell, which is what the model saw as negatives in training.
+NEIGHBOUR_FILTER = "(TypeCode eq 1 or TypeCode eq 4 or TypeCode eq 6) and (Parent/TypeID eq 1 or Parent/Type/ParentID eq 1)"
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,11 @@ class LocationRecord:
     tags: Tuple[str, ...] = ()
     center: Optional[Tuple[float, float]] = None
     polygons: Tuple[geo.PolygonRings, ...] = field(default=())
+    # The structure's TypeID, its type's ParentID and the structure's own ParentID (None when not known), for the
+    # neighbour rule of the shared prompt library.
+    structure_type_id: Optional[int] = None
+    structure_type_parent_id: Optional[int] = None
+    structure_parent_id: Optional[int] = None
 
     @property
     def is_circle(self) -> bool:
@@ -52,6 +63,33 @@ def _tags(value: Any) -> Tuple[str, ...]:
     if isinstance(value, list):
         return tuple(sorted(str(t) for t in value if t))
     return ()
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    return None if value in (None, "") else int(value)
+
+
+_TIMESTAMP = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)?$")
+_TICKS_PER_SECOND = 10_000_000
+_TICKS_PER_DAY = 86_400 * _TICKS_PER_SECOND
+
+
+def last_modified_ticks(text: str) -> int:
+    """An OData ``LastModified`` (ISO 8601 with an offset) as UTC .NET ticks (100 ns since 0001-01-01), the protocol's
+    ``LocationRef.last_modified_ticks``. Integer arithmetic on the text, so all seven digits of a .NET timestamp
+    survive (``datetime`` keeps six). A text without an offset is taken as UTC; an unreadable one is 0."""
+    match = _TIMESTAMP.match((text or "").strip())
+    if match is None:
+        return 0
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    fraction = ((match.group(7) or "") + "0000000")[:7]
+    ticks = (date(year, month, day).toordinal() - 1) * _TICKS_PER_DAY
+    ticks += ((hour * 60 + minute) * 60 + second) * _TICKS_PER_SECOND + int(fraction)
+    offset = match.group(8)
+    if offset and offset != "Z":
+        sign = 1 if offset[0] == "+" else -1
+        ticks -= sign * (int(offset[1:3]) * 60 + int(offset[4:6])) * 60 * _TICKS_PER_SECOND
+    return ticks
 
 
 def _center_of(entity: Dict[str, Any]) -> Optional[Tuple[float, float]]:
@@ -88,6 +126,9 @@ def record_from_entity(entity: Dict[str, Any]) -> Optional[LocationRecord]:
         structure_label=parent.get("Label"),
         type_name=parent_type.get("Name"),
         tags=_tags(entity.get("Tags")),
+        structure_type_id=_optional_int(parent.get("TypeID")),
+        structure_type_parent_id=_optional_int(parent_type.get("ParentID")),
+        structure_parent_id=_optional_int(parent.get("ParentID")),
     )
     if base["structure_id"] is not None:
         base["structure_id"] = int(base["structure_id"])
@@ -209,3 +250,51 @@ def count_locations(base: str, structure_id: int, *, get_json: GetJson = http_ge
     if value is None:
         raise ValueError("the endpoint did not return @odata.count")
     return int(value)
+
+
+def section_neighbours_url(base: str, z: int) -> str:
+    """Every location on section ``z`` that the prompt library's neighbour rule could accept, in ID order."""
+    return locations_url(base, f"Z eq {int(z)} and {NEIGHBOUR_FILTER}")
+
+
+def iter_section_neighbours(base: str, z: int, *, get_json: GetJson = http_get_json) -> Iterator[LocationRecord]:
+    """The candidate neighbours of every prompt on section ``z``, page by page."""
+    for page in iter_pages(section_neighbours_url(base, z), get_json):
+        for entity in page.get("value") or []:
+            if isinstance(entity, dict) and "ID" in entity:
+                record = record_from_entity(entity)
+                if record is not None:
+                    yield record
+
+
+@dataclass(frozen=True)
+class StructureRecord:
+    """A structure's place in the hierarchy, for the neighbour rule's descendant walk."""
+
+    id: int
+    parent_id: Optional[int]
+    type_id: Optional[int]
+    type_parent_id: Optional[int]
+
+
+STRUCTURES_PER_QUERY = 50
+
+
+def iter_structures(base: str, ids: Sequence[int], *, get_json: GetJson = http_get_json) -> Iterator[StructureRecord]:
+    """The structures with these ids (fewer when some do not exist), a few dozen per query."""
+    unique = sorted(set(int(i) for i in ids))
+    for start in range(0, len(unique), STRUCTURES_PER_QUERY):
+        clause = " or ".join(f"ID eq {i}" for i in unique[start:start + STRUCTURES_PER_QUERY])
+        url = (
+            f"{base.rstrip('/')}/Structures?$filter={quote(clause, safe='()/')}"
+            f"&$select=ID,ParentID,TypeID&$expand={quote('Type($select=ParentID)', safe='();$,')}"
+        )
+        for page in iter_pages(url, get_json):
+            for entity in page.get("value") or []:
+                if isinstance(entity, dict) and entity.get("ID") is not None:
+                    yield StructureRecord(
+                        id=int(entity["ID"]),
+                        parent_id=_optional_int(entity.get("ParentID")),
+                        type_id=_optional_int(entity.get("TypeID")),
+                        type_parent_id=_optional_int((entity.get("Type") or {}).get("ParentID")),
+                    )

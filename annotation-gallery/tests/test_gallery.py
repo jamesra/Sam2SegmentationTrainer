@@ -1426,6 +1426,7 @@ def test_viking_link_falls_back_to_the_plain_link_when_identity_refuses_the_volu
         raise IdentityHttpError(403, "forbidden")
 
     assert viking_link("https://i", "tok", "NM", "7", refuse) == "viking://open?volumeName=NM&location=7"
+    assert viking_link("https://i", "tok", "NM", "7", refuse, propose=True) == "viking://open?volumeName=NM&location=7&propose=1"
 
     def expired(url, **kwargs):
         raise IdentityHttpError(401, "unauthorized")

@@ -15,6 +15,13 @@ from converter import engines, odata
 from converter.seg_client import SegmentationFailed
 from converter.tilesource import TileCache, parse_viking_xml
 from tests.test_converter_builder import VIKING_XML, VOLUME, FakeSegmenter, _disc, _entity, tile_http
+from tests.fake_prompts import FakePromptLibrary
+from converter.prompts import LocationPrompts
+
+
+def _prompts() -> LocationPrompts:
+    """Prompts for the tiled score with no neighbours on the section and the stand-in library."""
+    return LocationPrompts(VOLUME, "http://odata.test/RC1", get_json=lambda url: {"value": []}, prompt_library=FakePromptLibrary(), annotation_context=0)
 
 
 @pytest.fixture
@@ -76,7 +83,7 @@ def test_a_model_that_finds_the_annotated_circle_scores_near_one(volume, cache) 
     record = odata.record_from_entity(_entity(11, 1, "POINT (1400 1600)", radius=80))
     client = ScoringClient(lambda _id: _disc(1400, 1600, 80), grow=0.0)
 
-    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4")
+    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4", prompts=_prompts())
 
     assert score.gt_iou > 0.9 and score.pred_iou == pytest.approx(0.9) and score.model == "v5.4"
     assert score.prompt == "circle" and score.downsample == 1
@@ -90,7 +97,7 @@ def test_a_polygon_the_model_only_half_covers_scores_about_a_half(volume, cache)
     record = odata.record_from_entity(_entity(12, 4, "POLYGON ((1000 1000, 1200 1000, 1200 1200, 1000 1200, 1000 1000))"))
     client = ScoringClient(lambda _id: _square(1000, 1000, 1100, 1200), grow=0.0)
 
-    score = score_module.score_record(record, VOLUME, volume, client, cache)
+    score = score_module.score_record(record, VOLUME, volume, client, cache, prompts=_prompts())
 
     assert 0.4 < score.gt_iou < 0.6 and score.prompt == "inscribed circle"
 
@@ -99,7 +106,7 @@ def test_a_small_object_is_scored_at_its_crops_level_and_says_nothing_more(volum
     record = odata.record_from_entity(_entity(11, 1, "POINT (1400 1600)", radius=80))
     client = ScoringClient(lambda _id: _disc(1400, 1600, 80), grow=0.0)
 
-    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1)
+    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1, prompts=_prompts())
 
     assert score.downsample == 1 and not score.coarser_than_native and score.checkpoint_label == "v5.4"
 
@@ -125,17 +132,39 @@ def test_the_tiled_engine_scores_a_large_object_at_ds1(volume, cache) -> None:
     square = lambda X, Y, grow: (abs(X - 1550) <= 750 + grow) & (abs(Y - 1550) <= 750 + grow)  # noqa: E731
     client = ScoringClient(lambda _id: square, grow=0.0, size=640)
 
-    score = score_module.score_record(record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1)
+    score = score_module.score_record(
+        record, VOLUME, volume, client, cache, model="v5.4", native_downsample=1, prompts=_prompts(),
+    )
 
     assert score.downsample == 1 and not score.coarser_than_native and score.checkpoint_label == "v5.4"
     assert score.gt_iou > 0.9
+    (start,) = client.starts
+    assert not start.locations, "a polygon's seed circle is not the location's prompt: never cached"
+    assert start.foreground_feature.shapes[0].circle.radius > 0
+
+
+def test_a_tiled_circle_score_is_the_locations_own_cached_prompt(volume, cache) -> None:
+    record = odata.record_from_entity(_entity(11, 1, "POINT (1400 1600)", radius=80))
+    client = ScoringClient(lambda _id: _disc(1400, 1600, 80))
+
+    score_module.score_record(record, VOLUME, volume, client, cache, prompts=_prompts())
+
+    (start,) = client.starts
+    assert [ref.id for ref in start.locations] == [11]
+
+
+def test_the_tiled_score_needs_the_volumes_odata(volume, cache) -> None:
+    record = odata.record_from_entity(_entity(11, 1, "POINT (1400 1600)", radius=80))
+
+    with pytest.raises(SegmentationFailed, match="not_configured"):
+        score_module.score_record(record, VOLUME, volume, ScoringClient(lambda _id: _disc(1400, 1600, 80)), cache)
 
 
 def test_an_empty_mask_is_a_score_of_zero_not_an_error(volume, cache) -> None:
     record = odata.record_from_entity(_entity(13, 1, "POINT (1400 1600)", radius=80))
     client = ScoringClient(lambda _id: (lambda X, Y, grow: np.zeros(np.broadcast(X, Y).shape, dtype=bool)))
 
-    assert score_module.score_record(record, VOLUME, volume, client, cache).gt_iou == 0.0
+    assert score_module.score_record(record, VOLUME, volume, client, cache, prompts=_prompts()).gt_iou == 0.0
 
 
 # ---- after a refresh: stored, reported, and never fatal ---------------------------------------------------------------
@@ -149,6 +178,7 @@ def _after(tmp_path, volume, cache, entity, client=None, make_client=None):
         load_volume=lambda: volume,
         volume_key=f"test-{tmp_path}",
         make_cache=lambda: cache,
+        make_prompts=_prompts,
     )
 
 

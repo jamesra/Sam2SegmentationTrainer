@@ -44,6 +44,24 @@ All defined in `docs/depth_relative_trust.md`:
 
 ## Algorithmic decisions
 
+- **2026-11-04 The converter's tiled requests come from Viking's shared prompt library.** Why: the segmentation server
+  caches results by request, so a gallery proposal and a Viking proposal for the same location share a row only when
+  both send identical bytes, and both must prompt v5 as it was trained. The library (Viking dev `a05539e6`, native for
+  Linux, called through ctypes) builds the request: mosaic DS 1, the true circle disc plus a centre click (training's
+  circle family), a polygon as a +3 correction outline with the server clicking its deepest pixel (training's polygon
+  family, server Viking `eff9927d`), and Viking's neighbour rule limited to cells (what v5 saw as negatives). Before
+  this the gallery sent a circle with no click, a polygon as a seed with a click the server doubled, and no neighbours.
+  Rejected: re-implementing the rules in Python (two copies drift, and the cache keys then differ); a polygon as a seed
+  (v5 never saw an existing outline at seed strength). The score's polygon seed circle is not the location's own prompt
+  and is sent without the location, so it is never cached as the location's result. Checked: the image's library and
+  the gallery's binding reproduce the .NET tests' golden request digest. Where: `annotation-gallery/converter/prompts.py`,
+  `prompts_native.py`, `engines/tiled.py`, `score.py`, `Dockerfile`; protos gRPC_Protos `2e4824c`.
+- **2026-11-04 Builds keep their results in the server cache; reviewed outlines go to the server.** A job per build
+  (made on the first run, deleted with the build) keeps its proposals from eviction, so Viking opening a card later is a
+  cache hit. An approved or retraced card's outline is stored as the location's reviewed outline against the
+  LastModified the card was built from, so it lapses when the location is edited. Best effort: the review and the build
+  never wait on the server. Where: `annotation-gallery/converter/serverreview.py`.
+
 - **2026-11-02 Refreshing a Gold card discards edits and withdraws approval.** Why: a Gold card is reviewed, its mask
   edited into shape, then approved; only approved cards belong to the validation set. Refresh redraws the mask from the
   annotation database (OData) into `masks/` and `source_masks/`, so an edited mask must not survive it silently:
