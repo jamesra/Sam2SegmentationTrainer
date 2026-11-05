@@ -368,13 +368,15 @@ class SegmentationClient:
         """False when the server had no such job."""
         return bool(self._stub.DeleteJob(pb.DeleteJobRequest(volume=volume, job_id=job_id), timeout=15).deleted)
 
-    def put_reviewed_outlines(
-        self, volume: str, outlines: Sequence["pb.ReviewedOutline"], remove_location_ids: Sequence[int] = ()
-    ) -> "pb.PutReviewedOutlinesResponse":
-        """Store outlines a person reviewed, and remove others; the server sends a stored one with every later
-        segmentation of its location until the location is edited."""
-        request = pb.PutReviewedOutlinesRequest(volume=volume, outlines=outlines, remove_location_ids=list(remove_location_ids))
-        return self._stub.PutReviewedOutlines(request, timeout=30)
+    def put_manual_traces(
+        self, annotation_context_id: int, traces: Sequence["pb.ManualTrace"], remove_location_ids: Sequence[int] = ()
+    ) -> "pb.PutManualTracesResponse":
+        """Store outlines people traced, and remove others; a stored one is its location's answer, instead of a
+        segmentation, until the location is edited."""
+        request = pb.PutManualTracesRequest(
+            annotation_context_id=annotation_context_id, traces=traces, remove_location_ids=list(remove_location_ids)
+        )
+        return self._stub.PutManualTraces(request, timeout=30)
 
     def model_id(self) -> Optional[str]:
         """The model id requests carry: the one given, else the one the server reports (it refuses requests without it

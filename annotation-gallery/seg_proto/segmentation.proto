@@ -54,10 +54,15 @@ service SegmentationService {
   // Version, load and the served model, for health and selection.
   rpc GetServerStatus (ServerStatusRequest) returns (ServerStatusResponse) {}
 
-  // Store or remove outlines a person reviewed (approved or retraced) for single locations. A stored outline is sent
-  // as SegmentationResponse.reviewed with every later segmentation of that location until the location is edited.
-  // Only a pending proposal is ever made from it: nothing is written to the annotation database.
-  rpc PutReviewedOutlines (PutReviewedOutlinesRequest) returns (PutReviewedOutlinesResponse) {}
+  // Store or remove outlines people traced for single locations (the gallery's converter, which cannot write to the
+  // annotation database). A stored trace is the location's cached answer, sent as SegmentationResponse.manual_trace
+  // instead of a segmentation until the location is edited, and is never evicted. A client that saves it calls
+  // ForgetLocations.
+  rpc PutManualTraces (PutManualTracesRequest) returns (PutManualTracesResponse) {}
+
+  // The locations were written to the annotation database: every cached row of theirs, model results and manual
+  // traces alike, is dropped.
+  rpc ForgetLocations (ForgetLocationsRequest) returns (ForgetLocationsResponse) {}
 
   // A job is a reason to keep cached segmentations: rows linked to a job (SegmentTilesRequest.job_id) are never evicted
   // by the cache's size or age limits. Deleting a job only lifts that protection.
@@ -343,8 +348,9 @@ message SegmentLocationResponse {
 message SegmentationResponse {
   // Was labeled_image, width, height, origin_x, origin_y and requested_tiles: each segment's logits carry their own
   // placement.
-  reserved 1, 2, 3, 5, 6, 7;
-  reserved "labeled_image", "width", "height", "origin_x", "origin_y", "requested_tiles";
+  // reviewed (10) was an outline a person reviewed, sent alongside the model's logits; it became manual_trace.
+  reserved 1, 2, 3, 5, 6, 7, 10;
+  reserved "labeled_image", "width", "height", "origin_x", "origin_y", "requested_tiles", "reviewed";
   // One per island of the object prompt (one when the prompt does not split), in island order. An island that finds
   // nothing has no result, so island numbers can have gaps.
   repeated SegmentResult segments = 4;
@@ -352,13 +358,13 @@ message SegmentationResponse {
   uint64 request_id = 8;
   // Set when this answer came from the server's cache instead of the model.
   optional CacheInfo cache = 9;
-  // An outline a person reviewed for the request's single location (PutReviewedOutlines), when one is stored and the
-  // location has not been edited since. A client shows it as the proposal; `segments` still holds the model's logits.
-  optional ReviewedOutline reviewed = 10;
   // The mask_threshold the server grew this result at. It is at or below the request's: a cached result grown at a
   // lower threshold answers any higher one. The logits are good for drawing at this value or above; drawing below it
   // needs a new request with the lower threshold. Unset from servers older than this field.
   optional float growth_threshold = 11;
+  // Set when the answer is an outline a person traced for the request's single location (PutManualTraces) instead
+  // of a segmentation: `segments` is then empty, and growth_threshold unset. `cache` says when it was stored.
+  optional ManualTrace manual_trace = 12;
 }
 
 message CacheInfo {
@@ -369,33 +375,43 @@ message CacheInfo {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Reviewed outlines
+// Manual traces
 
-message ReviewedOutline {
+message ManualTrace {
   int64 location_id = 1;
-  // The location's LastModified (UTC ticks) the outline was reviewed against.
+  // The location's LastModified (UTC ticks) the outline was traced against; the trace answers only while it matches.
   int64 last_modified_ticks = 2;
-  // The outline in MOSAIC pixels at downsample 1 (X right, Y up), on the location's section.
+  // The outline in MOSAIC pixels at downsample 1 (X right, Y up), on the location's section: a polygon.
   viking.geometry.v1.Shape outline = 3;
-  // "approved" or "retraced".
-  string state = 4;
-  // When it was reviewed, UTC, in .NET ticks.
-  int64 reviewed_ticks = 5;
-  string reviewer = 6;
+  // Who traced it.
+  string tracer = 4;
+  // When it was traced, UTC, in .NET ticks.
+  int64 traced_ticks = 5;
 }
 
-message PutReviewedOutlinesRequest {
-  // TileGrid.volume: the VikingXML volume name.
-  string volume = 1;
-  // Stored, replacing any outline for the same location.
-  repeated ReviewedOutline outlines = 2;
-  // Locations whose stored outline is removed.
+message PutManualTracesRequest {
+  // The annotation context the locations belong to (ReadableVolume.annotation_context_id).
+  int64 annotation_context_id = 1;
+  // Stored, replacing any trace of the same location.
+  repeated ManualTrace traces = 2;
+  // Locations whose stored trace is removed.
   repeated int64 remove_location_ids = 3;
 }
 
-message PutReviewedOutlinesResponse {
+message PutManualTracesResponse {
   uint32 stored = 1;
   uint32 removed = 2;
+}
+
+message ForgetLocationsRequest {
+  // The annotation context the locations belong to (ReadableVolume.annotation_context_id).
+  int64 annotation_context_id = 1;
+  repeated int64 location_ids = 2;
+}
+
+message ForgetLocationsResponse {
+  // Cached rows removed: model results, including merged groups a location belonged to, and manual traces.
+  uint32 removed = 1;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

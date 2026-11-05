@@ -1000,10 +1000,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if action in ("ignore", "restore"):
             # A rejected mask stops being a negative for its neighbors, so the whole tile's layers are stale.
             drop_card_masks(crops, location_image_keys(crops, [location_id]))
-        if action != "restore" and converter_web.is_converter_crops(crops):
-            # An approved card's outline goes to the segmentation server, so Viking proposes it; unapproving or
-            # rejecting takes it back. Restore leaves the card unapproved, which it already was on the server.
-            self._publish_review(crops, volume, location_id, image_key, keep=action == "approve")
+        if converter_web.is_converter_crops(crops):
+            # A retraced card's trace goes to the segmentation server, so Viking proposes it; unapproving or rejecting
+            # takes it back. Restore leaves the card unapproved, which it already was on the server.
+            self._sync_traces(crops, volume, location_id, image_key, action)
         self._send_json({
             "ok": True,
             "location_id": location_id,
@@ -1140,17 +1140,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except converter_web.EditRejected as rejected:
             self._send_json({"error": str(rejected)}, status=400)
             return
-        self._publish_review(crops, volume, location_id, image_key, keep=True)
+        self._sync_traces(crops, volume, location_id, image_key, "retrace")
         self._send_json(edited)
 
-    def _publish_review(self, crops: Path, volume: str, location_id: int, image_key: str | None, *, keep: bool) -> None:
-        """Store (``keep``) or remove a converter card's reviewed outline on the segmentation server, in the background."""
+    def _sync_traces(self, crops: Path, volume: str, location_id: int, image_key: str | None, action: str) -> None:
+        """Mark what ``action`` asks of a retraced card's trace on the segmentation server, then send the build's
+        pending traces in the background: this one, and any an earlier click could not deliver."""
         principal = self._principal()
-        serverreview.publish(
-            crops, volume, location_id, image_key, keep=keep,
-            reviewer=principal.display_name or principal.subject or "unknown",
-            make_client=converter_jobs.OVERRIDES.get("make_client", converter_jobs.default_client),
-        )
+        tracer = principal.display_name or principal.subject or "unknown"
+        if serverreview.mark_trace(crops, location_id, image_key, action, tracer) or action != "restore":
+            serverreview.sync(crops, volume, converter_jobs.OVERRIDES.get("make_client", converter_jobs.default_client))
 
     # ---- gold sets ------------------------------------------------------------------------------------------------
 
@@ -2229,6 +2228,8 @@ def main() -> None:
     start_thumbnail_watch(registry_dir())
     # Builds cut short by a restart go on by themselves; their cards fill in whether or not a page is open.
     converter_jobs.resume_unfinished(converter_web.converter_root(env_map()))
+    # Traces a review could not deliver while the segmentation server was away.
+    serverreview.sync_all(converter_web.converter_root(env_map()), converter_jobs.default_client)
     print(f"annotation-gallery HTTP on {host}:{http_port}", flush=True)
     if https_server is not None:
         print(f"annotation-gallery HTTPS on {host}:{https_port}", flush=True)

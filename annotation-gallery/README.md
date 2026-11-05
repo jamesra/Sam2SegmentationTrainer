@@ -93,9 +93,12 @@ provider's (`Viking\Servers\SegmentationServer\prompt_providers`). The refresh b
 the same way; a polygon is scored from its seed circle as a shape override, which the server never caches.
 
 **The server's cache.** Each build has a segmentation job (`segmentation_job.json` in the build folder), so its results are
-kept until the build is deleted. Approving or retracing a card stores its outline on the server as the location's reviewed
-outline (until the location is edited); unapproving or rejecting removes it. Card links carry `&propose=1`, asking Viking to
-segment the location on arrival. All three are best effort: a server that is down costs only the cache.
+kept until the build is deleted. A retraced card's outline belongs in the annotation database, which the gallery cannot
+write yet, so it is stored on the server as the location's manual trace: Viking proposes it instead of a segmentation until
+the location is edited, and clears it when it saves the location. Retracing or approving a retraced card stores it;
+unapproving or rejecting removes it; an unedited card sends nothing. A trace the server did not take stays pending on its
+card and is sent with the next review action or at gallery start. Card links carry `&propose=1`, asking Viking to segment
+the location on arrival.
 
 ## Gold standard review (`/gold/`)
 

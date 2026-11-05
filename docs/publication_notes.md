@@ -67,6 +67,18 @@ All defined in `docs/depth_relative_trust.md`:
   and is sent without the location, so it is never cached as the location's result. Checked: the image's library and
   the gallery's binding reproduce the .NET tests' golden request digest. Where: `annotation-gallery/converter/prompts.py`,
   `prompts_native.py`, `engines/tiled.py`, `score.py`, `Dockerfile`; protos gRPC_Protos `2e4824c`.
+- **2026-11-05 Retraced outlines are manual traces, not reviewed outlines (supersedes the 2026-11-04 entry's second
+  half).** A person's traced outline belongs in the annotation database; approved model output does not need storing
+  twice. Nothing can write there from the gallery yet (WCF refuses its token, the gRPC annotation service checks no
+  per-volume rights, and both need the client to compute the volume shape from the stos transforms), so a retraced
+  card's outline is stored on the segmentation server as the location's cached answer, a row that holds the polygon
+  and no logits, never evicted. Viking proposes it as the person's trace and clears it with ForgetLocations when it
+  saves the location. Only retraced cards send anything; an unedited card's model result is already kept by the
+  build's job. Rejected: sending the outline alongside the model's logits (it mixed human and model output in one
+  answer); rasterising the trace into logits (it would no longer be the traced polygon). Delivery is recorded on the
+  card (`trace_pending`) so a server outage loses nothing. Later: a direct writer to the annotation database, after
+  which the gallery writes and calls ForgetLocations instead. Where: `annotation-gallery/converter/serverreview.py`;
+  protos gRPC_Protos `14dd53e`.
 - **2026-11-04 Builds keep their results in the server cache; reviewed outlines go to the server.** A job per build
   (made on the first run, deleted with the build) keeps its proposals from eviction, so Viking opening a card later is a
   cache hit. An approved or retraced card's outline is stored as the location's reviewed outline against the

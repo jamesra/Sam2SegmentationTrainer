@@ -1,7 +1,8 @@
-"""What the converter tells the segmentation server's cache: a job per build and the outlines reviewers approved."""
+"""What the converter tells the segmentation server's cache: a job per build and the outlines reviewers traced."""
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from catalog import connect
@@ -49,28 +50,61 @@ def test_the_builds_job_is_in_every_tiled_request(tmp_path: Path, volume, cache)
     assert [call.job_id for call in segmenter.located] == [41]
 
 
-def test_an_approved_card_is_stored_against_the_locations_last_modified(tmp_path: Path, volume, cache) -> None:
-    crops = _built(tmp_path, volume, cache)
-    client = FakeSegmenter(lambda _id: None)
-    serverreview.publish(crops, "RC1", 11, KEY, keep=True, reviewer="Ann", make_client=lambda: client).join(5)
-    ((name, (outline,), removed),) = client.reviewed
-    assert name == "RC1" and removed == []
-    assert outline.location_id == 11 and outline.state == "approved" and outline.reviewer == "Ann"
-    assert outline.last_modified_ticks == odata.last_modified_ticks("2026-10-01T00:00:00Z")
-    assert len(outline.outline.polygon.exterior.points) >= 3 and outline.reviewed_ticks > outline.last_modified_ticks
-
-
-def test_a_retraced_card_is_stored_as_retraced_and_an_unapproved_one_removed(tmp_path: Path, volume, cache) -> None:
-    crops = _built(tmp_path, volume, cache)
+def _retrace(crops: Path) -> None:
     connection = connect(crops)
     connection.execute("UPDATE converter_cards SET reason = 'retraced' WHERE location_id = 11")
     connection.commit()
     connection.close()
+    assert serverreview.mark_trace(crops, 11, KEY, "retrace", "Ann")
+
+
+def test_a_retraced_card_is_stored_against_the_locations_last_modified(tmp_path: Path, volume, cache) -> None:
+    crops = _built(tmp_path, volume, cache)
+    _retrace(crops)
     client = FakeSegmenter(lambda _id: None)
-    serverreview.publish(crops, "RC1", 11, KEY, keep=True, reviewer="Ann", make_client=lambda: client).join(5)
-    serverreview.publish(crops, "RC1", 11, KEY, keep=False, reviewer="Ann", make_client=lambda: client).join(5)
-    assert client.reviewed[0][1][0].state == "retraced"
-    assert client.reviewed[1] == ("RC1", [], [11])
+    assert serverreview.sync_now(crops, "RC1", client) == 1
+    ((context_id, (trace,), removed),) = client.traces
+    assert context_id == 7 and removed == []
+    assert trace.location_id == 11 and trace.tracer == "Ann"
+    assert trace.last_modified_ticks == odata.last_modified_ticks("2026-10-01T00:00:00Z")
+    assert len(trace.outline.polygon.exterior.points) >= 3 and trace.traced_ticks > trace.last_modified_ticks
+    assert serverreview.sync_now(crops, "RC1", client) == 0, "nothing is pending once the server has it"
+
+
+def test_unapproving_a_retraced_card_removes_its_trace_and_approving_stores_it_again(tmp_path: Path, volume, cache) -> None:
+    crops = _built(tmp_path, volume, cache)
+    _retrace(crops)
+    client = FakeSegmenter(lambda _id: None)
+    serverreview.sync_now(crops, "RC1", client)
+    assert serverreview.mark_trace(crops, 11, None, "unapprove")
+    serverreview.sync_now(crops, "RC1", client)
+    assert serverreview.mark_trace(crops, 11, None, "approve")
+    serverreview.sync_now(crops, "RC1", client)
+    assert client.traces[1] == (7, [], [11])
+    assert client.traces[2][1][0].tracer == "Ann", "approving keeps who traced it"
+
+
+def test_an_unedited_card_sends_nothing(tmp_path: Path, volume, cache) -> None:
+    crops = _built(tmp_path, volume, cache)
+    assert not serverreview.mark_trace(crops, 11, None, "approve")
+    assert not serverreview.mark_trace(crops, 11, None, "ignore")
+    assert serverreview.pending_traces(crops) == ([], [], [])
+
+
+def test_a_trace_the_server_did_not_take_is_sent_with_the_next_sync(tmp_path: Path, volume, cache) -> None:
+    # Laid out as under the converter root: <root>/<structure set>/<volume>.
+    crops = Path(shutil.move(str(_built(tmp_path, volume, cache)), str(tmp_path / "root" / "structure-500" / "RC1")))
+    _retrace(crops)
+    client = FakeSegmenter(lambda _id: None)
+    client.refuse_traces = True
+    serverreview.sync(crops, "RC1", lambda: client).join(5)
+    assert client.traces == [] and serverreview.pending_traces(crops)[2], "still pending"
+
+    client.refuse_traces = False
+    (thread,) = serverreview.sync_all(tmp_path / "root", lambda: client)
+    thread.join(5)
+    assert [trace.location_id for trace in client.traces[0][1]] == [11]
+    assert serverreview.pending_traces(crops) == ([], [], [])
 
 
 def test_a_card_built_before_cards_recorded_last_modified_is_not_stored(tmp_path: Path, volume, cache) -> None:
@@ -79,4 +113,7 @@ def test_a_card_built_before_cards_recorded_last_modified_is_not_stored(tmp_path
     connection.execute("UPDATE converter_cards SET last_modified_ticks = NULL")
     connection.commit()
     connection.close()
-    assert serverreview.publish(crops, "RC1", 11, KEY, keep=True, reviewer="Ann", make_client=lambda: None) is None
+    _retrace(crops)
+    client = FakeSegmenter(lambda _id: None)
+    serverreview.sync_now(crops, "RC1", client)
+    assert client.traces == [] and serverreview.pending_traces(crops)[2] == [], "dropped, not retried forever"

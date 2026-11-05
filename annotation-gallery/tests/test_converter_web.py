@@ -175,11 +175,16 @@ def test_review_marks_and_deleting_reach_the_segmentation_servers_cache(httpd, b
     key = f"{fixtures.VOLUME}_7_D1_L11"
     try:
         assert request(httpd, "POST", f"/api/volumes/RC1/approve?set={SET}", {"location_id": 11, "image_key": key})[0] == 200
-        _wait_for(lambda: len(client.reviewed) == 1)
-        assert [(o.location_id, o.state) for o in client.reviewed[0][1]] == [(11, "approved")]
-        assert request(httpd, "POST", f"/api/volumes/RC1/unapprove?set={SET}", {"location_id": 11, "image_key": key})[0] == 200
-        _wait_for(lambda: len(client.reviewed) == 2)
-        assert client.reviewed[1] == ("RC1", [], [11])
+        time.sleep(0.2)
+        assert client.traces == [], "an unedited card is the model's answer, already cached"
+        ring = [[100, 100], [200, 100], [200, 160], [100, 160], [100, 100]]
+        edited = request(httpd, "POST", f"/api/volumes/RC1/converter/edit?set={SET}", {"location_id": 11, "image_key": key, "rings": [ring]})
+        assert edited[0] == 200
+        _wait_for(lambda: len(client.traces) == 1)
+        assert [t.location_id for t in client.traces[0][1]] == [11]
+        assert request(httpd, "POST", f"/api/volumes/RC1/ignore?set={SET}", {"location_id": 11, "image_key": key})[0] == 200
+        _wait_for(lambda: len(client.traces) == 2)
+        assert client.traces[1] == (7, [], [11])
         assert request(httpd, "POST", "/api/converter/delete", {"set": SET, "volume": "RC1"})[0] == 200
         _wait_for(lambda: ("delete", "RC1", 41) in client.jobs)
     finally:

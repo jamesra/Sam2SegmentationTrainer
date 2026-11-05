@@ -180,9 +180,11 @@ class FakeSegmenter:
         self.locations: Dict[int, Any] = {}
         self.unreadable: set = set()
         self.cancelled = False
-        # The cache calls (converter.serverreview): jobs made and deleted, reviewed outlines stored and removed.
+        # The cache calls (converter.serverreview): jobs made and deleted, manual traces stored and removed.
+        # ``refuse_traces`` makes PutManualTraces fail, as a server that is down would.
         self.jobs: List[Any] = []
-        self.reviewed: List[Any] = []
+        self.traces: List[Any] = []
+        self.refuse_traces = False
 
     def model_id(self):
         return "v5"
@@ -201,8 +203,10 @@ class FakeSegmenter:
         self.jobs.append(("delete", volume, job_id))
         return True
 
-    def put_reviewed_outlines(self, volume, outlines, remove_location_ids=()):
-        self.reviewed.append((volume, list(outlines), list(remove_location_ids)))
+    def put_manual_traces(self, annotation_context_id, traces, remove_location_ids=()):
+        if self.refuse_traces:
+            raise RuntimeError("unavailable")
+        self.traces.append((annotation_context_id, list(traces), list(remove_location_ids)))
 
     # The tiled engine's calls: SegmentLocation names the location and the server builds its prompt (a circle's disc
     # and centre click, a polygon's outline, or the override); retried as the real client retries.
