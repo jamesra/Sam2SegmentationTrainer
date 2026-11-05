@@ -3,8 +3,9 @@ grows the object across as many 1024 tiles as it needs, the way the model was tr
 segments.
 
 Nothing here is used by the single-window engine, and it never picks a coarser level to make an object fit: a large
-object takes more tiles, not a smaller picture. The request itself is built by Viking's shared prompt library
-(:mod:`converter.prompts`), so it is the request Viking sends for the same location and the server answers both from one
+object takes more tiles, not a smaller picture. The gallery names the location and the segmentation server builds its
+prompt (SegmentLocation, :meth:`converter.seg_client.SegmentationClient.segment_location`) from the database and the
+images it reads itself, so it is the request Viking gets for the same location and the server answers both from one
 cache row: a circle is its TRUE disc and a click at its centre, a polygon an outline to correct (the server clicks its
 deepest pixel), and the neighbouring cells are the background.
 """
@@ -12,68 +13,71 @@ deepest pixel), and the neighbouring cells are the background.
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, List, Optional
+from typing import Any, Optional
 
 from converter import contour as contour_module
 from converter import odata, seed
 from converter.engines import Segmentation
-from converter.prompts import LocationPrompts
-from converter.prompts_native import PromptRejected, PromptTooLarge
 from converter.seg_client import SegmentationFailed
-from converter.tilesource import SectionTiles
 
-# The shared library builds requests at full resolution only (the level every tiled model so far was trained at).
-LIBRARY_LEVEL = 1
+# The server builds location prompts at full resolution only (the level every tiled model so far was trained at).
+LOCATION_LEVEL = 1
+
+
+def location_context(client: Any, volume_name: str) -> int:
+    """The server's annotation context for ``volume_name``. SegmentLocation needs the server to read the volume's
+    images itself (the gallery never uploads tiles to it); a volume it cannot read is refused here, as the build dialog
+    shows it greyed out."""
+    volume = client.readable_volume(volume_name)
+    if volume is None:
+        raise SegmentationFailed(f"no_local_images: the segmentation server is not assigned {volume_name}")
+    if not volume.readable:
+        raise SegmentationFailed(f"no_local_images: the segmentation server cannot read {volume_name}'s images")
+    return int(volume.annotation_context_id)
 
 
 class TiledEngine:
     """Segments each location at the model's tile level; the card is laid out by the caller."""
 
+    volume_name: str
+    client: Any
+    annotation_context_id: int
+    tile_downsample: int
+    threshold: float
+    job_id: int
+    semaphore: Optional[threading.Semaphore]
+
     def __init__(
         self,
         volume_name: str,
         client: Any,
-        section: Callable[[int, int], SectionTiles],
-        levels: Callable[[int], List[int]],
         *,
-        prompts: LocationPrompts,
+        annotation_context_id: int,
         tile_downsample: int = 1,
         threshold: float = 0.5,
+        job_id: int = 0,
         semaphore: Optional[threading.Semaphore] = None,
     ) -> None:
         self.volume_name = volume_name
-        self.prompts = prompts
         self.client = client
-        self.section = section
-        self.levels = levels
+        self.annotation_context_id = annotation_context_id
         self.tile_downsample = tile_downsample
         self.threshold = threshold
+        self.job_id = job_id
         self.semaphore = semaphore
 
     def segment(self, record: odata.LocationRecord) -> Segmentation:
         level = self.tile_downsample
-        if level != LIBRARY_LEVEL:
-            raise SegmentationFailed(f"no_level: the model's tile level is DS {level}; the shared prompt library builds DS 1 only")
-        if level not in self.levels(record.z):
-            raise SegmentationFailed(f"no_level: section {record.z}'s tileset has no level {level}, the model's tile level")
+        if level != LOCATION_LEVEL:
+            raise SegmentationFailed(f"no_level: the model's tile level is DS {level}; the server builds location prompts at DS 1 only")
         if record.is_circle and record.radius < 1:
             raise seed.NotSeedable("circle radius is below one pixel at this downsample")
-        section = self.section(record.z, level)
-        try:
-            prompt_input = self.prompts.input_for(
-                [record], section.tileset.name or section.tileset.channel, model_id=self.client.model_id(),
-                threshold=self.threshold, request_id=record.id,
-            )
-        except PromptRejected as error:
-            raise seed.NotSeedable(str(error)) from error
         if self.semaphore is not None:
             self.semaphore.acquire()
         try:
-            result = self.prompts.segment(self.client, prompt_input, section.protocol_tile, threshold=self.threshold)
-        except PromptRejected as error:
-            raise seed.NotSeedable(str(error)) from error
-        except PromptTooLarge as error:
-            raise SegmentationFailed(f"too_large: {error}") from error
+            result = self.client.retrying(lambda: self.client.segment_location(
+                self.annotation_context_id, record.id, threshold=self.threshold, job_id=self.job_id,
+            ))
         finally:
             if self.semaphore is not None:
                 self.semaphore.release()

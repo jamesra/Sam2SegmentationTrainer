@@ -71,7 +71,6 @@ from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
 from converter import jobs as converter_jobs
-from converter.prompts import LocationPrompts
 from converter import odata as odata_module
 from converter import serverreview
 from converter import web as converter_web
@@ -1116,6 +1115,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError, json.JSONDecodeError):
             self._send_json({"error": "invalid build settings"}, status=400)
             return
+        if converter_jobs.missing_local_images([volume]):
+            self._send_json({"error": f"{volume} (Missing local images): the segmentation server cannot read its images"}, status=409)
+            return
         started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
         self._send_json(started.snapshot())
 
@@ -1369,6 +1371,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
 
         with ThreadPoolExecutor(max_workers=max(1, min(8, len(volumes)))) as pool:
             counts = dict(zip(volumes, pool.map(count, volumes)))
+        for volume in converter_jobs.missing_local_images(volumes):
+            counts[volume]["localImages"] = False
         self._send_json({"structureId": structure_id, "volumes": counts})
 
     def _handle_converter_delete(self) -> None:
@@ -1431,6 +1435,9 @@ class GalleryHandler(BaseHTTPRequestHandler):
             params = self._build_params(volume, structure_id, body)
         except (TypeError, ValueError):
             self._send_json({"error": "invalid build settings"}, status=400)
+            return
+        if converter_jobs.missing_local_images([volume]):
+            self._send_json({"error": f"{volume} (Missing local images): the segmentation server cannot read its images"}, status=409)
             return
         converter_jobs.write_source(crops, params.odata_base, structure_id, params.viking_xml, params.tile_base)
         started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
@@ -1842,11 +1849,6 @@ class GalleryHandler(BaseHTTPRequestHandler):
             volume_key=viking_xml or volume,
             make_cache=converter_jobs.OVERRIDES.get("make_cache", converter_jobs.tile_cache),
             semaphore=converter_jobs.streams(),
-            make_prompts=lambda: LocationPrompts(
-                volume, odata_endpoint(volume, source),
-                get_json=converter_jobs.OVERRIDES.get("get_json", odata_module.http_get_json),
-                prompt_library=converter_jobs.OVERRIDES.get("prompt_library"),
-            ),
         )
 
     def _handle_import_location(self, volume: str) -> None:

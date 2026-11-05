@@ -78,23 +78,19 @@ viewer, approve and reject are the gallery's own.
 | `GALLERY_CONVERTER_VIKINGXML` | URL template of the volume's VikingXML, with `{volume}`: where the tile pyramids are listed. |
 | `GALLERY_CONVERTER_TILE_CACHE` | Optional folder for cached tiles (revalidated by ETag). |
 | `GALLERY_CONVERTER_STREAMS` | Segmentation streams at once across all builds (default 1). |
-| `GALLERY_ANNOTATION_CONTEXT_<VOLUME>` | Optional Identity annotation context of the volume (e.g. `GALLERY_ANNOTATION_CONTEXT_RC2`): the segmentation server then reads the tiles itself instead of asking the gallery to upload them. |
-| `GALLERY_PROMPTS_LIBRARY` | Optional path of the native prompt library (default `/app/native/Viking.SegmentationPrompts.Native.so`, built into the image). |
 
 What the approved batch holds (`type_code` 6, plain `POLYGON` control points in mosaic pixels, the source shape's hash, the
 model and the overlap with the old outline) is for a later database writer; none exists yet.
 
-**Requests (tiled engine).** Viking's shared prompt library (`Viking\SegmentationPrompts`, called through ctypes,
-`converter/prompts_native.py`) builds every location's request, so the gallery and Viking send the same bytes for the same
-location and share the segmentation server's cache rows. The gallery gathers its input (`converter/prompts.py`): the
-location as the database holds it, the section's cell-level circles and polygons as candidate neighbours (read once per
-section, cut to the library's reach) and their structures for the descendant walk. The rules are the library's (its
-README): mosaic space at DS 1, `channel` and `transform` the VikingXML tileset name, a circle as its true disc and one
-click at its centre, a polygon as an outline to correct (the server clicks its deepest pixel), and Viking's neighbour rule
-(other cells, never the target's structure or its descendants). The image builds the library in its first stage from the
-named build contexts `segmentation_prompts` and `grpc_protos` (Viking's folders, `VIKING_REPO` in compose, default
-`../../Viking`); the build fails when the vendored `seg_proto` differs from those protos or when the library does not give
-the .NET tests' golden request. Outside the image (the Windows checkout) the tests use a stand-in, `tests/fake_prompts.py`.
+**Requests (tiled engine).** The gallery names each location and the segmentation server builds its prompt
+(`SegmentLocation`, `SegmentationClient.segment_location`): the server reads the location, its neighbours and the images
+itself and builds the request Viking gets for the same location, so both share its cache rows. The gallery sends no tiles
+and no neighbours; it takes the volume's annotation context from the server's status (`readable_volumes`, matched by name).
+A volume whose images the server does not read is shown as "<name> (Missing local images)" in the build dialog, greyed out,
+and a build there is refused. Stopping a build cancels the call in flight. The prompt rules (mosaic DS 1, a circle as its
+true disc and a click at its centre, a polygon as an outline to correct, Viking's neighbour rule) are the server's prompt
+provider's (`Viking\Servers\SegmentationServer\prompt_providers`). The refresh button's tiled score names the location
+the same way; a polygon is scored from its seed circle as a shape override, which the server never caches.
 
 **The server's cache.** Each build has a segmentation job (`segmentation_job.json` in the build folder), so its results are
 kept until the build is deleted. Approving or retracing a card stores its outline on the server as the location's reviewed

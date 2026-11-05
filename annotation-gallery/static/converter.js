@@ -184,9 +184,23 @@
     return `This permanently deletes structure ${build.structureId} of ${build.volume}: ${lost.join(" and ")}, their images and masks.${review} It cannot be undone.`;
   }
 
+  /** A preview volume a build can start in: it has annotations and the segmentation server reads its images. */
+  function buildable(info) {
+    return Boolean(info && info.count > 0 && info.localImages !== false);
+  }
+
+  /** A volume's entry in the dialog's list; one the segmentation server cannot read is named so (and greyed out). */
+  function volumeOption(name, info) {
+    if (info && info.localImages === false) {
+      return `${name} (Missing local images)`;
+    }
+    const text = !info || info.error ? "could not check" : `${info.count} annotation${info.count === 1 ? "" : "s"}`;
+    return `${name} — ${text}`;
+  }
+
   /** The volume a preview recommends: the one with annotations (the first when several), else "" . */
   function pickVolume(volumes) {
-    const found = Object.entries(volumes || {}).filter(([, info]) => info && info.count > 0);
+    const found = Object.entries(volumes || {}).filter(([, info]) => buildable(info));
     return found.length ? found[0][0] : "";
   }
 
@@ -196,8 +210,12 @@
     if (!entries.length) {
       return "You do not have review rights on a volume to build in.";
     }
-    const found = entries.filter(([, info]) => info && info.count > 0);
+    const found = entries.filter(([, info]) => buildable(info));
     if (!found.length) {
+      const unreadable = entries.filter(([, info]) => info && info.count > 0 && info.localImages === false);
+      if (unreadable.length) {
+        return `The annotations are in ${unreadable.map(([name]) => name).join(", ")}, whose images the segmentation server cannot read (Missing local images).`;
+      }
       const failed = entries.filter(([, info]) => info && info.error).map(([name]) => name);
       const where = entries.map(([name]) => name).join(", ");
       return failed.length
@@ -250,6 +268,6 @@
 
   return {
     active, onConverterPath, attachCards, edgePixels, outlineCanvas, infoLines, batchHref, applyChrome,
-    humanReason, buildLabel, countsLine, deleteWarning, pickVolume, previewLine,
+    humanReason, buildLabel, countsLine, deleteWarning, buildable, volumeOption, pickVolume, previewLine,
   };
 });

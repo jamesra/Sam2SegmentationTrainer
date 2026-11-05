@@ -19,10 +19,10 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from converter import builder as builder_module
-from converter import odata
+from converter import engines, odata
 from converter import serverreview
 from converter.seg_client import SegmentationClient
 from converter.tilesource import TileCache, Volume, load_volume
@@ -103,7 +103,6 @@ class BuildJob:
         make_volume: Callable[[str], Volume] = default_volume,
         make_cache: Callable[[], TileCache] = tile_cache,
         get_json: odata.GetJson = odata.http_get_json,
-        prompt_library: Any = None,
     ) -> None:
         self.set_name = set_name
         self.volume = volume
@@ -113,10 +112,10 @@ class BuildJob:
         self._make_volume = make_volume
         self._make_cache = make_cache
         self._get_json = get_json
-        # None: the process's native prompt library, loaded when the tiled engine first builds a request.
-        self._prompt_library = prompt_library
         self._lock = threading.Lock()
         self._cancel = threading.Event()
+        # The running build's client, so a stop also ends the segmentation calls in flight.
+        self._client: Optional[SegmentationClient] = None
         self.phase = "starting"
         self.total = 0
         self.processed = 0
@@ -140,6 +139,11 @@ class BuildJob:
 
     def cancel(self) -> None:
         self._cancel.set()
+        with self._lock:
+            client = self._client
+        stop = getattr(client, "cancel", None)
+        if callable(stop):
+            stop()
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -188,6 +192,10 @@ class BuildJob:
         save_state(self.crops, "running", self.params)
         try:
             client = self._make_client()
+            with self._lock:
+                self._client = client
+            if self._cancel.is_set():
+                self.cancel()
             if self.params.viking_xml:
                 # The volume's own record of where its tiles are (source.json), not a guess from a template.
                 volume = load_volume(self.params.viking_xml, host=self.params.tile_base or None)
@@ -197,7 +205,7 @@ class BuildJob:
             job_id = serverreview.build_job(self.crops, client, self.params.volume, self.set_name)
             builder = builder_module.Builder(
                 self.params, self.crops, volume, client, cache, get_json=self._get_json, semaphore=streams(),
-                prompt_library=self._prompt_library, job_id=job_id,
+                job_id=job_id,
             )
             with self._lock:
                 self.phase = "building"
@@ -305,6 +313,39 @@ def write_source(
         if viking_xml:
             document["tiles"] = {"vikingXml": viking_xml, "base": tile_base or ""}
         path.write_text(json.dumps(document, indent=1), encoding="utf-8")
+
+
+MISSING_IMAGES_SECONDS = 60.0
+_MISSING_LOCK = threading.Lock()
+# (when read, the lower-case names of the volumes the server reads; None when every volume can be built)
+_READABLE: Optional[Tuple[float, Optional[Set[str]]]] = None
+
+
+def missing_local_images(volumes: List[str]) -> List[str]:
+    """The volumes a build cannot run in because the segmentation server does not read their images itself, which
+    the tiled engine's SegmentLocation needs (the single-window engine uploads its own tiles). The server's answer is
+    kept for a minute. A server that cannot be asked marks nothing: the build then reports why it failed."""
+    global _READABLE
+    with _MISSING_LOCK:
+        held = _READABLE
+    if held is None or time.monotonic() - held[0] > MISSING_IMAGES_SECONDS:
+        readable: Optional[Set[str]] = None
+        try:
+            client = OVERRIDES.get("make_client", default_client)()
+            try:
+                if engines.choose(client).kind == engines.TILED:
+                    readable = {v.name.lower() for v in client.status().readable_volumes if v.readable}
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+        except Exception as error:  # noqa: BLE001 - not configured or unreachable
+            LOGGER.info("could not ask the segmentation server which volumes it reads: %s", error)
+        held = (time.monotonic(), readable)
+        with _MISSING_LOCK:
+            _READABLE = held
+    known = held[1]
+    return [volume for volume in volumes if known is not None and volume.lower() not in known]
 
 
 # Tests replace the pieces a job reaches over the network: {"make_client": ..., "make_volume": ..., "make_cache": ..., "get_json": ...}.

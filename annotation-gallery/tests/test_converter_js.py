@@ -123,6 +123,19 @@ def test_the_preview_picks_the_volume_that_has_the_structure_and_warns_about_amb
 
 
 @needs_node
+def test_a_volume_the_segmentation_server_cannot_read_is_greyed_out_and_never_picked() -> None:
+    got = _run(
+        "const v = {RC1: {count: 5, localImages: false}, RC2: {count: 2}};"
+        "return [C.pickVolume(v), C.buildable(v.RC1), C.buildable(v.RC2), C.volumeOption('RC1', v.RC1),"
+        "C.volumeOption('RC2', v.RC2), C.previewLine({RC1: v.RC1}, ''), C.previewLine(v, 'RC2')];"
+    )
+    assert got[:3] == ["RC2", False, True]
+    assert got[3] == "RC1 (Missing local images)" and got[4] == "RC2 — 2 annotations"
+    assert "Missing local images" in got[5] and "RC1" in got[5]
+    assert got[6] == "2 annotations to convert in RC2."
+
+
+@needs_node
 def test_the_delete_warning_names_what_is_lost() -> None:
     text = _run(
         "return C.deleteWarning({structureId: 410, volume: 'RC1', built: 57, failed: 5, approved: 3, rejected: 1});"

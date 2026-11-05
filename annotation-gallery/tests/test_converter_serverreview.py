@@ -8,8 +8,7 @@ from catalog import connect
 from converter import builder as builder_module
 from converter import odata
 from converter import serverreview
-from tests.fake_prompts import FakePromptLibrary
-from tests.test_converter_builder import VOLUME, FakeSegmenter, _disc, _entity, _make, cache, volume  # noqa: F401
+from tests.test_converter_builder import VOLUME, FakeSegmenter, _disc, _entity, _make, _remember, cache, volume  # noqa: F401
 
 KEY = f"{VOLUME}_7_D1_L11"
 
@@ -38,15 +37,16 @@ def test_a_server_that_cannot_make_a_job_leaves_the_build_without_one(tmp_path: 
     assert serverreview.stored_job(tmp_path) == 0, "nothing stored, so the next run asks again"
 
 
-def test_the_builds_job_is_in_every_tiled_prompt(tmp_path: Path, volume, cache) -> None:
-    library = FakePromptLibrary()
+def test_the_builds_job_is_in_every_tiled_request(tmp_path: Path, volume, cache) -> None:
     params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500)
     entities = [_entity(11, 1, "POINT (1400 1600)", radius=80)]
+    segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    _remember(segmenter, entities)
     builder_module.Builder(
-        params, tmp_path / "crops", volume, FakeSegmenter(lambda _id: _disc(1400, 1600, 80)), cache,
-        get_json=lambda url: {"@odata.count": 1, "value": entities}, prompt_library=library, job_id=41,
+        params, tmp_path / "crops", volume, segmenter, cache,
+        get_json=lambda url: {"@odata.count": 1, "value": entities}, job_id=41,
     ).run()
-    assert [i.job_id for i in library.inputs] == [41]
+    assert [call.job_id for call in segmenter.located] == [41]
 
 
 def test_an_approved_card_is_stored_against_the_locations_last_modified(tmp_path: Path, volume, cache) -> None:

@@ -9,6 +9,7 @@ import sys
 import threading
 from http.client import HTTPConnection
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
 import pytest
@@ -19,7 +20,6 @@ for folder in (GALLERY_ROOT, Path(__file__).resolve().parent):
         sys.path.insert(0, str(folder))
 
 import test_converter_builder as fixtures  # noqa: E402
-from fake_prompts import FakePromptLibrary  # noqa: E402
 from converter import builder as builder_module  # noqa: E402
 from converter import web  # noqa: E402
 from server import make_server  # noqa: E402
@@ -51,10 +51,11 @@ def built(converter_root: Path) -> Path:
     ]
     truth = {11: fixtures._disc(1400, 1600, 80), 12: fixtures._disc(1700, 1900, 80)}
     segmenter = fixtures.FakeSegmenter(lambda location_id: truth[location_id], size=256)
+    fixtures._remember(segmenter, entities)
     params = builder_module.BuildParams(volume="RC1", odata_base="http://odata.test/RC1", structure_id=500)
     builder = builder_module.Builder(
         params, crops, volume, segmenter, fixtures.TileCache(None, fixtures.tile_http),
-        get_json=lambda url: {"@odata.count": 3, "value": entities}, prompt_library=FakePromptLibrary(),
+        get_json=lambda url: {"@odata.count": 3, "value": entities},
     )
     summary = builder.run()
     assert (summary.built, summary.failed) == (2, 1)
@@ -263,17 +264,22 @@ def job_env(tmp_path: Path, converter_root: Path, monkeypatch: pytest.MonkeyPatc
     def get_json(url: str):
         return {"@odata.count": 2, "value": entities}
 
+    def remembering(segmenter):
+        fixtures._remember(segmenter, entities)
+        return segmenter
+
     jobs._JOBS.clear()
+    jobs._READABLE = None
     jobs.OVERRIDES.update(
-        make_client=lambda: fixtures.FakeSegmenter(lambda location_id: truth[location_id], size=256),
+        make_client=lambda: remembering(fixtures.FakeSegmenter(lambda location_id: truth[location_id], size=256)),
         make_volume=lambda name: volume,
         make_cache=lambda: fixtures.TileCache(None, fixtures.tile_http),
         get_json=get_json,
-        prompt_library=FakePromptLibrary(),
     )
     yield
     jobs.OVERRIDES.clear()
     jobs._JOBS.clear()
+    jobs._READABLE = None
 
 
 def wait_until_done(httpd, set_name: str = SET, seconds: float = 20.0) -> Dict[str, Any]:
@@ -490,6 +496,23 @@ def test_preview_says_which_volume_has_the_structure(clean_httpd, tmp_path: Path
     jobs.OVERRIDES["get_json"] = counts
     status, payload = call_json(clean_httpd, "/api/converter/preview", {"structureId": 500})
     assert status == 200 and payload["volumes"] == {"RC1": {"count": 7}, "RC2": {"count": 0}}
+
+
+def test_a_volume_the_segmentation_server_cannot_read_is_greyed_out_and_cannot_be_built(clean_httpd, tmp_path: Path) -> None:
+    (tmp_path / "gallery-volumes" / "RC2").mkdir(parents=True)
+    client = fixtures.FakeSegmenter(lambda _id: None)
+    client.status = lambda: SimpleNamespace(
+        model=SimpleNamespace(contract_json=""),
+        readable_volumes=[SimpleNamespace(name="RC1", readable=True), SimpleNamespace(name="RC2", readable=False)],
+    )
+    jobs.OVERRIDES["make_client"] = lambda: client
+    jobs.OVERRIDES["get_json"] = lambda url: {"@odata.count": 4, "value": []}
+
+    payload = call_json(clean_httpd, "/api/converter/preview", {"structureId": 500})[1]
+    status, refused = call_json(clean_httpd, "/api/converter/structures", {"structureId": 500, "volume": "RC2"})
+
+    assert payload["volumes"] == {"RC1": {"count": 4}, "RC2": {"count": 4, "localImages": False}}
+    assert status == 409 and "Missing local images" in refused["error"]
 
 
 def test_preview_reports_an_unreachable_volume_without_hiding_the_others(clean_httpd, tmp_path: Path) -> None:

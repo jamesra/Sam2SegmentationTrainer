@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+import grpc
 import numpy as np
 import pytest
 from PIL import Image
@@ -17,9 +18,8 @@ from PIL import Image
 import catalog
 from converter import builder as builder_module
 from converter import contour, engines, geo, odata, seed
-from converter.seg_client import SegmentationClient, SegmentationFailed, SegmentResult
+from converter.seg_client import SegmentationClient, SegmentationFailed, SegmentResult, circle_shape, polygon_shape
 from converter.tilesource import SectionTiles, TileCache, flip_for_protocol, parse_viking_xml
-from tests.fake_prompts import FakePromptLibrary
 
 VOLUME = "RC1"
 TILE = 512
@@ -175,13 +175,23 @@ class FakeSegmenter:
         self.grow = grow
         self.fail = fail or {}
         self.calls: List[Any] = []
-        self.starts: List[Any] = []
+        # SegmentLocation calls, and the locations the fake server "reads" to build their prompts.
+        self.located: List[Any] = []
+        self.locations: Dict[int, Any] = {}
+        self.unreadable: set = set()
+        self.cancelled = False
         # The cache calls (converter.serverreview): jobs made and deleted, reviewed outlines stored and removed.
         self.jobs: List[Any] = []
         self.reviewed: List[Any] = []
 
     def model_id(self):
         return "v5"
+
+    def readable_volume(self, volume_name):
+        return SimpleNamespace(annotation_context_id=7, name=volume_name, readable=volume_name not in self.unreadable)
+
+    def cancel(self):
+        self.cancelled = True
 
     def create_job(self, volume, *, title, kind, **_):
         self.jobs.append(("create", volume, kind))
@@ -194,18 +204,26 @@ class FakeSegmenter:
     def put_reviewed_outlines(self, volume, outlines, remove_location_ids=()):
         self.reviewed.append((volume, list(outlines), list(remove_location_ids)))
 
-    # The tiled engine's calls: a start from the prompt library, retried as the real client retries.
+    # The tiled engine's calls: SegmentLocation names the location and the server builds its prompt (a circle's disc
+    # and centre click, a polygon's outline, or the override); retried as the real client retries.
     retrying = staticmethod(SegmentationClient.retrying)
 
-    def segment_request(self, start, tiles, answer_background, *, threshold):
-        self.starts.append(start)
-        identity = SimpleNamespace(downsample=start.grid.downsample, channel=start.grid.channel, transform=start.grid.transform)
-        prompt = SimpleNamespace(
-            foreground_mask=None,
-            foreground_points=[(p.x, p.y) for p in start.foreground_feature.points],
-            foreground_shapes=list(start.foreground_feature.shapes) + list(start.correction_feature.shapes),
-        )
-        return self.segment_with_retry(identity, prompt, tiles, None, threshold=threshold, request_id=start.request_id)
+    def segment_location(self, annotation_context_id, location_id, *, threshold, job_id=0, shape_override=None, cache_mode=0, progress=None):
+        self.located.append(SimpleNamespace(
+            context=annotation_context_id, location_id=location_id, threshold=threshold, job_id=job_id,
+            shape_override=shape_override, cache_mode=cache_mode,
+        ))
+        record = self.locations[location_id]
+        if shape_override is not None:
+            centre = shape_override.circle.center
+            points, shapes = [(centre.x, centre.y)], [shape_override]
+        elif record.is_circle:
+            points, shapes = [record.center], [circle_shape(*record.center, record.radius)]
+        else:
+            points, shapes = [], [polygon_shape(record.polygons[0][0])]
+        identity = SimpleNamespace(downsample=1, channel="TEM", transform="TEM")
+        prompt = SimpleNamespace(foreground_mask=None, foreground_points=points, foreground_shapes=shapes)
+        return self.segment_with_retry(identity, prompt, lambda row, col: None, None, threshold=threshold, request_id=location_id)
 
     def segment_with_retry(self, identity, prompt, tiles, background, *, threshold, request_id, **_):
         self.calls.append((identity, prompt, request_id))
@@ -247,8 +265,9 @@ def _disc(cx, cy, r):
     return lambda X, Y, grow: (X - cx) ** 2 + (Y - cy) ** 2 <= (r + grow) ** 2
 
 
-def _make(tmp_path, volume, cache, segmenter, entities, engine=None, prompt_library=None, **params):
+def _make(tmp_path, volume, cache, segmenter, entities, engine=None, **params):
     pages = {"value": entities}
+    _remember(segmenter, entities)
 
     def get_json(url: str):
         if "$top=1" in url:
@@ -258,8 +277,15 @@ def _make(tmp_path, volume, cache, segmenter, entities, engine=None, prompt_libr
     build_params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500, **params)
     return builder_module.Builder(
         build_params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, engine=engine,
-        prompt_library=prompt_library or FakePromptLibrary(),
     )
+
+
+def _remember(segmenter, entities):
+    """The locations the fake server reads by id, as the real one reads them from OData."""
+    for entity in entities:
+        record = odata.record_from_entity(entity)
+        if record is not None:
+            segmenter.locations[record.id] = record
 
 
 def test_a_circle_is_built_into_a_gallery_card(tmp_path: Path, volume, cache) -> None:
@@ -328,10 +354,8 @@ def test_the_tiled_engine_segments_a_big_polygon_at_ds1_and_only_draws_its_card_
     summary = builder.run()
     assert builder.engine_kind == engines.TILED and summary.built == 1
     assert [identity.downsample for identity, _prompt, _id in segmenter.calls] == [1], "no coarser request"
-    (start,) = segmenter.starts
-    assert not start.foreground_feature.points, "no click: the server clicks the outline's deepest pixel"
-    assert len(start.correction_feature.shapes) == 1, "the polygon is an outline to correct"
-    assert [ref.id for ref in start.locations] == [13], "the location, so the server caches the result"
+    (call,) = segmenter.located
+    assert call.location_id == 13 and call.shape_override is None, "the location itself, so the server caches the result"
     row = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite").execute(
         "SELECT downsample, iou, engine, candidate_wkt FROM converter_cards"
     ).fetchone()
@@ -340,14 +364,20 @@ def test_the_tiled_engine_segments_a_big_polygon_at_ds1_and_only_draws_its_card_
     assert "2300" in row[3] or "2301" in row[3] or "2302" in row[3], "the proposal is stored in mosaic pixels"
 
 
-def test_a_tiled_circle_is_its_true_disc_and_a_click_at_its_centre_on_the_tilesets_mosaic_grid(tmp_path: Path, volume, cache) -> None:
+def test_a_tiled_location_is_named_to_the_server_in_the_volumes_context(tmp_path: Path, volume, cache) -> None:
     segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
-    _make(tmp_path, volume, cache, segmenter, [_entity(11, 1, "POINT (1400 1600)", radius=80)]).run()
-    (start,) = segmenter.starts
-    assert start.grid.downsample == 1 and start.grid.channel == start.grid.transform != ""
-    assert [(p.x, p.y) for p in start.foreground_feature.points] == [(1400, 1600)]
-    (shape,) = start.foreground_feature.shapes
-    assert shape.circle.radius == 80
+    builder = _make(tmp_path, volume, cache, segmenter, [_entity(11, 1, "POINT (1400 1600)", radius=80)], threshold=0.25)
+    builder.run()
+    (call,) = segmenter.located
+    assert (call.context, call.location_id, call.threshold, call.cache_mode) == (7, 11, 0.25, 0)
+
+
+def test_a_volume_the_server_cannot_read_is_refused_before_any_location(tmp_path: Path, volume, cache) -> None:
+    segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    segmenter.unreadable = {VOLUME}
+    with pytest.raises(SegmentationFailed, match="no_local_images"):
+        _make(tmp_path, volume, cache, segmenter, [_entity(11, 1, "POINT (1400 1600)", radius=80)])
+    assert not segmenter.located
 
 
 def test_cards_made_before_the_engine_split_are_built_again(tmp_path: Path, volume, cache) -> None:
@@ -413,6 +443,23 @@ def test_cancel_stops_before_the_next_location(tmp_path: Path, volume, cache) ->
     segmenter.segment_with_retry = cancelling
     summary = _make(tmp_path, volume, cache, segmenter, entities).run(cancel=cancel)
     assert summary.cancelled and summary.built == 1
+
+
+def test_a_call_cancelled_by_the_stop_ends_the_build_without_a_failure(tmp_path: Path, volume, cache) -> None:
+    entities = [_entity(51, 1, "POINT (1400 1600)", radius=80), _entity(52, 1, "POINT (1500 1700)", radius=80)]
+    cancel = threading.Event()
+    segmenter = FakeSegmenter(lambda _id: _disc(1450, 1650, 120))
+
+    def cancelled_mid_call(*args, **kwargs):
+        cancel.set()
+        raise SegmentationFailed("CANCELLED: Locally cancelled by application!", grpc.StatusCode.CANCELLED)
+
+    segmenter.segment_with_retry = cancelled_mid_call
+    summary = _make(tmp_path, volume, cache, segmenter, entities).run(cancel=cancel)
+
+    assert summary.cancelled and (summary.built, summary.failed) == (0, 0)
+    connection = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite")
+    assert connection.execute("SELECT COUNT(*) FROM converter_cards").fetchone()[0] == 0
 
 
 def test_choose_downsample_and_card_origin() -> None:
@@ -545,10 +592,10 @@ def test_location_links_are_stored_once_each_and_replaced_on_every_run(tmp_path:
 
     params = builder_module.BuildParams(volume=VOLUME, odata_base="http://odata.test/RC1", structure_id=500)
     segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
-    library = FakePromptLibrary()
-    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, prompt_library=library).run()
+    _remember(segmenter, entities)
+    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json).run()
     assert converter_web.link_rows(tmp_path / "crops") == [[11, 12], [11, 13]]
 
     links[:] = [{"A": 11, "B": 15}]
-    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json, prompt_library=library).run()
+    builder_module.Builder(params, tmp_path / "crops", volume, segmenter, cache, get_json=get_json).run()
     assert converter_web.link_rows(tmp_path / "crops") == [[11, 15]]

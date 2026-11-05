@@ -11,6 +11,10 @@ Geometry goes as shapes (a circle with its TRUE radius, a polygon with its holes
 itself (for a circle, its radius times the model's circle_diameter_scale), so the client never scales or rasterises them.
 Only a painted bitmap goes as mask tiles; it is used as drawn.
 
+A saved location goes through SegmentLocation instead (:meth:`SegmentationClient.segment_location`): the client names
+the location, and the server reads it, its neighbours and the images itself and builds the prompt Viking gets for the
+same location. The window engine still builds its own prompts and uses SegmentTilesStream.
+
 All coordinates here are mosaic pixels at the request's downsample, X right, **Y up** (world / downsample); the logits
 that come back are rows from the top (largest Y) down and are placed by :func:`sample_centres`.
 """
@@ -21,9 +25,10 @@ import io
 import logging
 import math
 import queue
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import grpc
 import numpy as np
@@ -314,7 +319,8 @@ def _shape_key(shape: "geo.Shape") -> bytes:
 
 
 class SegmentationClient:
-    """One gRPC channel to a segmentation server; ``segment`` runs one object through SegmentTilesStream."""
+    """One gRPC channel to a segmentation server: ``segment`` runs a window prompt the gallery built through
+    SegmentTilesStream, ``segment_location`` a saved location whose prompt the server builds (SegmentLocation)."""
 
     def __init__(
         self,
@@ -342,6 +348,10 @@ class SegmentationClient:
         self._model_probed = model_id is not None
         self._idle_timeout = idle_timeout_seconds
         self._total_timeout = total_timeout_seconds
+        self._readable: Optional[Dict[str, "pb.ReadableVolume"]] = None
+        self._calls_lock = threading.Lock()
+        self._calls: Set[grpc.Future] = set()
+        self._cancelled = False
 
     def close(self) -> None:
         self._channel.close()
@@ -432,17 +442,61 @@ class SegmentationClient:
             lambda needed: new_background([_cell_of(cell) for cell in needed.background_cells]), threshold,
         )
 
-    def segment_request(
+    def readable_volume(self, volume_name: str) -> Optional["pb.ReadableVolume"]:
+        """The server's annotation context for ``volume_name`` (matched without case), None when the server is not
+        assigned the volume. ``readable`` says whether it reads the volume's images itself, which SegmentLocation
+        needs: the gallery never uploads tiles there."""
+        if self._readable is None:
+            self._readable = {volume.name.lower(): volume for volume in self.status().readable_volumes}
+        return self._readable.get(volume_name.lower())
+
+    def segment_location(
         self,
-        start: "pb.SegmentTilesRequest",
-        tiles: TileProvider,
-        answer_background: Callable[["pb.TilesNeeded"], Sequence["geo.Shape"]],
+        annotation_context_id: int,
+        location_id: int,
         *,
         threshold: float = 0.5,
+        cache_mode: int = pb.CACHE_MODE_USE,
+        job_id: int = 0,
+        shape_override: Optional["geo.Shape"] = None,
+        progress: Optional[Callable[["pb.SegmentProgress"], None]] = None,
     ) -> SegmentResult:
-        """Run a ``start`` built elsewhere (the shared prompt library, :mod:`converter.prompts`). ``answer_background``
-        gives the background shapes for one ``TilesNeeded``; the start is sent as given (its model_id included)."""
-        return self._converse(start, [], tiles, answer_background, threshold)
+        """Segment a saved location with the prompt the server builds from the database (SegmentLocation), as Viking
+        does for the same location, so both are answered from one cache row. The server reads the images itself: the
+        gallery says it provides none and half-closes after the start. ``shape_override`` (mosaic, DS 1) replaces the
+        location's own shape and is never cached; ``progress`` sees the server's stages. :meth:`cancel` ends the call."""
+        options = pb.SegmentOptions(mask_threshold=threshold, cache_mode=cache_mode)
+        if job_id:
+            options.job_id = job_id
+        start = pb.LocationStart(annotation_context_id=annotation_context_id, location_id=location_id, options=options)
+        if shape_override is not None:
+            start.shape_override.CopyFrom(shape_override)
+        call = self._stub.SegmentLocation(iter([pb.SegmentLocationRequest(start=start)]), timeout=self._total_timeout)
+        with self._calls_lock:
+            if self._cancelled:
+                call.cancel()
+            self._calls.add(call)
+        try:
+            for message in call:
+                kind = message.WhichOneof("update")
+                if kind == "result":
+                    return self._finish(message.result, threshold, 0, 0)
+                if kind == "progress" and progress is not None:
+                    progress(message.progress)
+        except grpc.RpcError as error:
+            raise self._failure(error) from error
+        finally:
+            with self._calls_lock:
+                self._calls.discard(call)
+        raise SegmentationFailed("the stream ended without a result")
+
+    def cancel(self) -> None:
+        """Cancel every SegmentLocation call in flight and any started later (a build being stopped)."""
+        with self._calls_lock:
+            self._cancelled = True
+            calls = list(self._calls)
+        for call in calls:
+            call.cancel()
 
     def _converse(
         self,

@@ -4967,16 +4967,15 @@
           const picker = document.getElementById("build-volume");
           const keep = picker.value;
           picker.innerHTML = Object.entries(result.volumes).map(([name, info]) => {
-            const text = info.error ? "could not check" : `${info.count} annotation${info.count === 1 ? "" : "s"}`;
-            return `<option value="${name}">${name} — ${text}</option>`;
+            const missing = info && info.localImages === false ? " disabled" : "";
+            return `<option value="${name}"${missing}>${window.ConverterMode.volumeOption(name, info)}</option>`;
           }).join("");
-          const chosen = (result.volumes[keep] && result.volumes[keep].count > 0) ? keep : window.ConverterMode.pickVolume(result.volumes);
+          const chosen = window.ConverterMode.buildable(result.volumes[keep]) ? keep : window.ConverterMode.pickVolume(result.volumes);
           if (chosen) {
             picker.value = chosen;
           }
           note.textContent = window.ConverterMode.previewLine(result.volumes, picker.value);
-          const info = result.volumes[picker.value];
-          buildUi.start.disabled = !(info && info.count > 0);
+          buildUi.start.disabled = !window.ConverterMode.buildable(result.volumes[picker.value]);
         } catch (error) {
           if (serial === previewSerial) {
             document.getElementById("build-preview").textContent = `Could not check: ${error.message}`;
@@ -4990,8 +4989,9 @@
     buildUi.zMax.addEventListener("input", schedulePreview);
     document.getElementById("build-volume").addEventListener("change", () => {
       const picked = document.getElementById("build-volume");
-      const match = /(\d+) annotation/.exec(picked.options[picked.selectedIndex] ? picked.options[picked.selectedIndex].text : "");
-      buildUi.start.disabled = !(match && Number(match[1]) > 0);
+      const option = picked.options[picked.selectedIndex];
+      const match = /(\d+) annotation/.exec(option ? option.text : "");
+      buildUi.start.disabled = !(match && Number(match[1]) > 0) || Boolean(option && option.disabled);
     });
 
     // The bar: pick a build, continue it, see what failed.

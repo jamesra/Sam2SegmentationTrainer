@@ -41,8 +41,7 @@ from converter.cardgeom import (  # noqa: F401 - re-exported: scoring and tests 
     shape_bounds,
     union_bounds,
 )
-from converter.engines.tiled import TiledEngine
-from converter.prompts import LocationPrompts
+from converter.engines.tiled import TiledEngine, location_context
 from converter.engines.window import WindowEngine
 from converter.seg_client import SegmentationClient, SegmentationFailed
 from converter.tilesource import SectionTiles, TileCache, Volume
@@ -188,12 +187,11 @@ class Builder:
         get_json: odata.GetJson = odata.http_get_json,
         semaphore: Optional[threading.Semaphore] = None,
         engine: Optional[str] = None,
-        prompt_library: Any = None,
         job_id: int = 0,
     ) -> None:
         """``engine`` forces ``engines.TILED`` or ``engines.WINDOW``; None asks the served model (see :mod:`engines`).
-        ``prompt_library`` replaces the native shared prompt library (tests). ``job_id`` is the build's segmentation
-        server job (:mod:`converter.serverreview`): the tiled engine's results are kept in the server's cache under it."""
+        ``job_id`` is the build's segmentation server job (:mod:`converter.serverreview`): the tiled engine's results
+        are kept in the server's cache under it."""
         self.params = params
         self.crops = Path(crops)
         self.volume = volume
@@ -209,12 +207,9 @@ class Builder:
                 params.volume, client, self._section, self._levels, threshold=params.threshold, semaphore=semaphore
             )
         else:
-            prompts = LocationPrompts(
-                params.volume, params.odata_base, get_json=get_json, prompt_library=prompt_library, job_id=job_id
-            )
             self.engine = TiledEngine(
-                params.volume, client, self._section, self._levels, prompts=prompts,
-                tile_downsample=choice.tile_downsample, threshold=params.threshold, semaphore=semaphore,
+                params.volume, client, annotation_context_id=location_context(client, params.volume),
+                tile_downsample=choice.tile_downsample, threshold=params.threshold, job_id=job_id, semaphore=semaphore,
             )
         LOGGER.info("structure %s: %s engine", params.structure_id, choice.kind)
 
@@ -401,6 +396,10 @@ class Builder:
                 self.build_one(record)
                 summary.built += 1
             except (SegmentationFailed, seed.NotSeedable) as failure:
+                if cancel is not None and cancel.is_set():
+                    # The stop cancelled this location's call: it is not a failure, and the build ends here.
+                    summary.cancelled = True
+                    break
                 reason = str(failure) if "_" in str(failure).split(":")[0] else f"failed: {failure}"
                 self._record_failure(record, reason)
                 summary.note_failure(reason)

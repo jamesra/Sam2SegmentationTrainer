@@ -27,6 +27,24 @@ service SegmentationService {
   // lost.
   rpc SegmentTilesStream (stream SegmentTilesStreamRequest) returns (stream SegmentTilesStreamResponse) {}
 
+  // Segment saved annotation locations: the server reads the locations, their neighbours and the section's images
+  // itself and builds the prompt for the model it serves. The client sends `start`, then, only when it set
+  // provides_images, any tiles it chooses to send unasked and one TilesAnswer per TilesNeeded. The server streams
+  // progress, then the SegmentationResponse, and ends the call. The grid is MOSAIC at downsample 1 on the context's
+  // tileset.
+  //
+  // A client with provides_images false may half-close right after `start`. With it true, a half-close settles every
+  // tile still awaited as unavailable. Tiles sent after `result` fail on the client with CANCELLED.
+  //
+  // Statuses: after `result` the call ends OK; a client that cancels gets no result (a walk that already finished is
+  // still cached). NOT_FOUND for an annotation context this server does not hold or a location its annotation service
+  // does not know. FAILED_PRECONDITION when the context's images are not readable here and provides_images is false,
+  // for a tile sent for a context whose images are readable here (the server reads every pixel of a readable volume
+  // itself, so one cached result never mixes sources), and ("NO_MATCHING_MASK ...") as for SegmentTilesStream.
+  // INVALID_ARGUMENT for a malformed conversation or start. DEADLINE_EXCEEDED when an answer does not arrive within the
+  // idle limit. RESOURCE_EXHAUSTED and UNAVAILABLE as for SegmentTilesStream.
+  rpc SegmentLocation (stream SegmentLocationRequest) returns (stream SegmentLocationResponse) {}
+
   // Which cells SegmentTilesStream would not ask this client for: the server holds them, or reads them from the
   // annotation context's tileset itself. A client calls it before uploading tiles ahead of a request and skips the
   // held ones. A hint only: nothing is pinned, and a cell dropped since is asked for during the request as usual.
@@ -243,6 +261,83 @@ message TilesAnswer {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Location segmentation (SegmentLocation)
+
+// Client to server.
+message SegmentLocationRequest {
+  oneof body {
+    // The first message, once.
+    LocationStart start = 1;
+    // A tile, sent unasked or for a TilesNeeded; only when start.provides_images. `grid` is ignored: the call's grid is
+    // the server's.
+    UploadTileRequest tile = 2;
+    // Reply to a TilesNeeded, one per TilesNeeded, in order, after the tiles it supplies. background_shapes is unused.
+    TilesAnswer answer = 3;
+  }
+}
+
+// What to segment and how.
+message LocationStart {
+  // The Identity annotation context the locations belong to (ReadableVolume.annotation_context_id).
+  int64 annotation_context_id = 1;
+  oneof target {
+    // One location.
+    int64 location_id = 2;
+    // A merged group: one prompt for the locations together.
+    LocationSet locations = 3;
+  }
+  // Replaces the target's own shape, in MOSAIC pixels at downsample 1 on the target's section (a scoring run's seed
+  // circle). Only with a single location_id.
+  optional viking.geometry.v1.Shape shape_override = 4;
+  SegmentOptions options = 5;
+  // The client can supply image tiles: the server may send TilesNeeded.tiles for cells it cannot read itself.
+  bool provides_images = 6;
+}
+
+message LocationSet {
+  repeated int64 ids = 1;
+}
+
+// How the cache takes part in a request.
+enum CacheMode {
+  // Answer from the cache when a result is held; store a new result.
+  CACHE_MODE_USE = 0;
+  // Segment anew and replace the held result.
+  CACHE_MODE_REFRESH = 1;
+  // Neither read nor store.
+  CACHE_MODE_BYPASS = 2;
+}
+
+// Settings of one segmentation.
+message SegmentOptions {
+  // As SegmentTilesRequest.mask_threshold: omitted means 0, and a held result grown at or below the value answers it.
+  optional float mask_threshold = 1;
+  CacheMode cache_mode = 2;
+  // Links the result to a job (CreateJob), which keeps it from eviction. Unset: no job.
+  optional int64 job_id = 3;
+}
+
+// How far a segmentation has got. Sent as it advances; a client may ignore it.
+message SegmentProgress {
+  // "reading annotations", "growing", "waiting for tiles" (asked of the client) or "cached".
+  string stage = 1;
+  // Growth rounds so far: each round the walk reaches cells it lacks tiles or background for. 0 before growth starts.
+  uint32 round = 2;
+}
+
+// Server to client.
+message SegmentLocationResponse {
+  oneof update {
+    // Tiles the server cannot read itself, only when start.provides_images. background_cells is never set: the server
+    // reads the neighbouring annotations itself.
+    TilesNeeded needed = 1;
+    SegmentProgress progress = 2;
+    // The finished segmentation (request_id 0). The server ends the call after sending it.
+    SegmentationResponse result = 3;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Result
 
 message SegmentationResponse {
@@ -398,6 +493,17 @@ message ServerStatusResponse {
   string compile_status = 11;
   // The served model, from its manifest. Always set; a model with no manifest reports model_id "unknown".
   ModelInfo model = 12;
+  // The annotation contexts assigned to this server, and whether it reads their images itself. SegmentLocation needs a
+  // readable one unless the client provides images.
+  repeated ReadableVolume readable_volumes = 14;
+}
+
+message ReadableVolume {
+  int64 annotation_context_id = 1;
+  // The context's volume name, as in TileGrid.volume.
+  string name = 2;
+  // True when the server reads the volume's tiles from local storage.
+  bool readable = 3;
 }
 
 // The identity and feeding contract of the served model, from the model's manifest, which travels with the weights.

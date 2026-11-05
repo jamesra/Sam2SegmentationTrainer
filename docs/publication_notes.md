@@ -44,6 +44,17 @@ All defined in `docs/depth_relative_trust.md`:
 
 ## Algorithmic decisions
 
+- **2026-11-05 The converter names locations; the segmentation server builds their prompts.** Supersedes the
+  2026-11-04 entry below. Why: the shared library only gave identical bytes if every client gathered identical input
+  (location, candidate neighbours, structures, LastModified, model, tileset), which the server can read itself; the
+  library moved into the server as its first prompt provider (Viking dev `8dc014d5`, `6dff0b83`). The converter now
+  sends `SegmentLocation` with the location id, the threshold, the build's job and `provides_images=false`
+  (gRPC_Protos `c357326`); the server reads the images itself, so a volume it cannot read is greyed out as
+  "(Missing local images)" and refused. The score's polygon seed circle goes as a `shape_override` with
+  `CACHE_MODE_BYPASS`, never cached as the location's result. Stopping a build cancels the call in flight (plain gRPC
+  cancellation). Rejected: keeping the ctypes library in the gallery (two places to build and pin it, and the gallery
+  would still upload tiles the server can read). Where: `annotation-gallery/converter/seg_client.py`
+  (`segment_location`), `engines/tiled.py`, `jobs.py`, `score.py`, `static/converter.js`.
 - **2026-11-04 The converter's tiled requests come from Viking's shared prompt library.** Why: the segmentation server
   caches results by request, so a gallery proposal and a Viking proposal for the same location share a row only when
   both send identical bytes, and both must prompt v5 as it was trained. The library (Viking dev `a05539e6`, native for

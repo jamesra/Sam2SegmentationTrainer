@@ -6,6 +6,7 @@ island)."""
 from __future__ import annotations
 
 import io
+import threading
 from concurrent import futures
 from typing import List, Optional, Sequence
 
@@ -456,3 +457,100 @@ def test_a_regions_tiles_are_fetched_together(tmp_path) -> None:
     cache.prefetch([f"http://t/{i}.png" for i in range(8)])
     assert peak > 1
     assert cache.fetch("http://t/3.png") is not None and cache.requests == 8
+
+
+# ---- SegmentLocation ---------------------------------------------------------------------------------------------
+
+class FakeLocations(pb_grpc.SegmentationServiceServicer):
+    """Speaks SegmentLocation: reads the start, sends progress, then the result; ``hold`` blocks before the result until
+    the client cancels."""
+
+    def __init__(self, hold: bool = False):
+        self.hold = hold
+        self.starts: List["pb.LocationStart"] = []
+        self.client_half_closed = False
+        self.cancelled = threading.Event()
+        self.started = threading.Event()
+
+    def GetServerStatus(self, request, context):
+        return pb.ServerStatusResponse(readable_volumes=[
+            pb.ReadableVolume(annotation_context_id=7, name="RC1", readable=True),
+            pb.ReadableVolume(annotation_context_id=9, name="RPC1", readable=False),
+        ])
+
+    def SegmentLocation(self, request_iterator, context):
+        requests = iter(request_iterator)
+        first = next(requests)
+        assert first.WhichOneof("body") == "start"
+        self.starts.append(first.start)
+        self.client_half_closed = next(requests, None) is None
+        yield pb.SegmentLocationResponse(progress=pb.SegmentProgress(stage="reading annotations"))
+        yield pb.SegmentLocationResponse(progress=pb.SegmentProgress(stage="growing", round=1))
+        self.started.set()
+        if self.hold:
+            context.add_callback(self.cancelled.set)
+            self.cancelled.wait(10)
+            return
+        yield pb.SegmentLocationResponse(
+            result=pb.SegmentationResponse(segments=[_segment(_disc_logits(64, 32, 32, 10), origin=(100, 400))])
+        )
+
+
+def test_a_location_is_named_with_its_options_and_the_client_provides_no_images(serve) -> None:
+    fake = FakeLocations()
+    client = serve(fake)
+    stages: List[str] = []
+
+    result = client.segment_location(
+        7, 1234, threshold=0.25, job_id=41, shape_override=circle_shape(10, 20, 5),
+        cache_mode=pb.CACHE_MODE_BYPASS, progress=lambda p: stages.append(p.stage),
+    )
+
+    (start,) = fake.starts
+    assert (start.annotation_context_id, start.location_id, start.provides_images) == (7, 1234, False)
+    assert (start.options.mask_threshold, start.options.job_id, start.options.cache_mode) == (0.25, 41, pb.CACHE_MODE_BYPASS)
+    assert start.shape_override.circle.radius == 5
+    assert fake.client_half_closed, "a client without images half-closes after the start"
+    assert stages == ["reading annotations", "growing"]
+    assert result.island == 1 and result.threshold == 0.25 and result.tiles_uploaded == 0
+
+
+def test_a_location_without_options_uses_the_cache_and_no_job(serve) -> None:
+    fake = FakeLocations()
+    serve(fake).segment_location(7, 5)
+
+    (start,) = fake.starts
+    assert not start.HasField("shape_override") and not start.options.HasField("job_id")
+    assert start.options.cache_mode == pb.CACHE_MODE_USE
+
+
+def test_the_servers_volumes_say_which_it_reads(serve) -> None:
+    client = serve(FakeLocations())
+
+    assert client.readable_volume("rc1").annotation_context_id == 7
+    assert not client.readable_volume("RPC1").readable
+    assert client.readable_volume("RC3") is None
+
+
+def test_cancel_ends_a_call_in_flight_and_any_started_later(serve) -> None:
+    fake = FakeLocations(hold=True)
+    client = serve(fake)
+    outcome: List[BaseException] = []
+
+    def run() -> None:
+        try:
+            client.segment_location(7, 1)
+        except SegmentationFailed as failure:
+            outcome.append(failure)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert fake.started.wait(10)
+    client.cancel()
+    worker.join(10)
+
+    assert not worker.is_alive() and outcome[0].code == grpc.StatusCode.CANCELLED and not outcome[0].retryable
+    assert fake.cancelled.wait(10), "the server saw the cancellation"
+    with pytest.raises(SegmentationFailed) as later:
+        client.segment_location(7, 2)
+    assert later.value.code == grpc.StatusCode.CANCELLED
