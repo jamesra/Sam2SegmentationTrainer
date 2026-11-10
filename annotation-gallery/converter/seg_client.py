@@ -28,7 +28,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import grpc
 import numpy as np
@@ -318,6 +318,20 @@ def _shape_key(shape: "geo.Shape") -> bytes:
     return shape.SerializeToString(deterministic=True)
 
 
+def _same_url(first: str, second: str) -> bool:
+    return first.strip().rstrip("/").lower() == second.strip().rstrip("/").lower()
+
+
+def context_for(volumes: Sequence[Any], volume_name: str, viking_xml: str = "") -> Optional[Any]:
+    """The server's context for a volume. One volume can have several contexts of the same name, each reading another
+    VikingXML (RC1 has three, with different image sets), so a caller that knows its VikingXML names it and gets the
+    context reading that file, or None. Without a VikingXML the name decides, and only when it is not ambiguous."""
+    named = [volume for volume in volumes if volume.name.lower() == volume_name.lower()]
+    if viking_xml:
+        return next((volume for volume in named if _same_url(str(getattr(volume, "viking_xml", "")), viking_xml)), None)
+    return named[0] if len(named) == 1 else None
+
+
 class SegmentationClient:
     """One gRPC channel to a segmentation server: ``segment`` runs a window prompt the gallery built through
     SegmentTilesStream, ``segment_location`` a saved location whose prompt the server builds (SegmentLocation)."""
@@ -348,7 +362,7 @@ class SegmentationClient:
         self._model_probed = model_id is not None
         self._idle_timeout = idle_timeout_seconds
         self._total_timeout = total_timeout_seconds
-        self._readable: Optional[Dict[str, "pb.ReadableVolume"]] = None
+        self._readable: Optional[List["pb.ReadableVolume"]] = None
         self._calls_lock = threading.Lock()
         self._calls: Set[grpc.Future] = set()
         self._cancelled = False
@@ -444,13 +458,13 @@ class SegmentationClient:
             lambda needed: new_background([_cell_of(cell) for cell in needed.background_cells]), threshold,
         )
 
-    def readable_volume(self, volume_name: str) -> Optional["pb.ReadableVolume"]:
-        """The server's annotation context for ``volume_name`` (matched without case), None when the server is not
-        assigned the volume. ``readable`` says whether it reads the volume's images itself, which SegmentLocation
-        needs: the gallery never uploads tiles there."""
+    def readable_volume(self, volume_name: str, viking_xml: str = "") -> Optional["pb.ReadableVolume"]:
+        """The server's annotation context for ``volume_name`` (see :func:`context_for`), None when there is none.
+        ``readable`` says whether it reads the volume's images itself, which SegmentLocation needs: the gallery never
+        uploads tiles there."""
         if self._readable is None:
-            self._readable = {volume.name.lower(): volume for volume in self.status().readable_volumes}
-        return self._readable.get(volume_name.lower())
+            self._readable = list(self.status().readable_volumes)
+        return context_for(self._readable, volume_name, viking_xml)
 
     def segment_location(
         self,
@@ -462,15 +476,19 @@ class SegmentationClient:
         job_id: int = 0,
         shape_override: Optional["geo.Shape"] = None,
         progress: Optional[Callable[["pb.SegmentProgress"], None]] = None,
+        tileset: Optional[str] = None,
     ) -> SegmentResult:
         """Segment a saved location with the prompt the server builds from the database (SegmentLocation), as Viking
         does for the same location, so both are answered from one cache row. The server reads the images itself: the
         gallery says it provides none and half-closes after the start. ``shape_override`` (mosaic, DS 1) replaces the
-        location's own shape and is never cached; ``progress`` sees the server's stages. :meth:`cancel` ends the call."""
+        location's own shape and is never cached; ``progress`` sees the server's stages. ``tileset`` names the tileset to
+        read (ReadableVolume.tilesets); unset, the server uses the volume's default. :meth:`cancel` ends the call."""
         options = pb.SegmentOptions(mask_threshold=threshold, cache_mode=cache_mode)
         if job_id:
             options.job_id = job_id
         start = pb.LocationStart(annotation_context_id=annotation_context_id, location_id=location_id, options=options)
+        if tileset:
+            start.tileset = tileset
         if shape_override is not None:
             start.shape_override.CopyFrom(shape_override)
         call = self._stub.SegmentLocation(iter([pb.SegmentLocationRequest(start=start)]), timeout=self._total_timeout)

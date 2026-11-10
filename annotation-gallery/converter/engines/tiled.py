@@ -24,16 +24,47 @@ from converter.seg_client import SegmentationFailed
 LOCATION_LEVEL = 1
 
 
-def location_context(client: Any, volume_name: str) -> int:
-    """The server's annotation context for ``volume_name``. SegmentLocation needs the server to read the volume's
-    images itself (the gallery never uploads tiles to it); a volume it cannot read is refused here, as the build dialog
-    shows it greyed out."""
-    volume = client.readable_volume(volume_name)
+def readable_context(client: Any, volume_name: str, viking_xml: str = "") -> Any:
+    """The server's annotation context that reads ``viking_xml`` for ``volume_name``. SegmentLocation needs the server to
+    read the volume's images itself (the gallery never uploads tiles to it); a volume it cannot read is refused here, as
+    the build dialog shows it greyed out. The VikingXML picks the context because a volume can have several of one name,
+    each with other images: the cards show this file's tiles, so the segmentation must read the same ones."""
+    volume = client.readable_volume(volume_name, viking_xml)
     if volume is None:
-        raise SegmentationFailed(f"no_local_images: the segmentation server is not assigned {volume_name}")
+        where = f" reading {viking_xml}" if viking_xml else ""
+        raise SegmentationFailed(f"no_local_images: the segmentation server has no context for {volume_name}{where}")
     if not volume.readable:
         raise SegmentationFailed(f"no_local_images: the segmentation server cannot read {volume_name}'s images")
-    return int(volume.annotation_context_id)
+    return volume
+
+
+def location_context(client: Any, volume_name: str, viking_xml: str = "") -> int:
+    """The id of :func:`readable_context`."""
+    return int(readable_context(client, volume_name, viking_xml).annotation_context_id)
+
+
+def is_raw(tileset: str) -> bool:
+    """A raw tileset (TEM.Raw8): unleveled pixels, which the model is not trained on."""
+    return tileset.split(".")[-1].lower().startswith("raw")
+
+
+def ordered_tilesets(names: Any) -> list:
+    """The tileset names to offer, those fit to segment (not raw) first."""
+    return sorted(names, key=lambda name: (is_raw(name), name.lower()))
+
+
+def choose_tileset(names: Any, wanted: Optional[str] = None) -> str:
+    """The tileset to segment on. The common context has exactly one, which is used without asking. With several, the
+    one asked for, else the first that is not raw. A context with none cannot be segmented."""
+    offered = ordered_tilesets(names)
+    if not offered:
+        raise SegmentationFailed("no_tileset: the segmentation server's VikingXML for this volume has no tileset")
+    if wanted:
+        match = next((name for name in offered if name.lower() == wanted.lower()), None)
+        if match is None:
+            raise SegmentationFailed(f"no_tileset: the segmentation server has no tileset {wanted!r}; it has {offered}")
+        return match
+    return offered[0]
 
 
 class TiledEngine:
@@ -45,6 +76,7 @@ class TiledEngine:
     tile_downsample: int
     threshold: float
     job_id: int
+    tileset: Optional[str]
     semaphore: Optional[threading.Semaphore]
 
     def __init__(
@@ -56,6 +88,7 @@ class TiledEngine:
         tile_downsample: int = 1,
         threshold: float = 0.5,
         job_id: int = 0,
+        tileset: Optional[str] = None,
         semaphore: Optional[threading.Semaphore] = None,
     ) -> None:
         self.volume_name = volume_name
@@ -64,6 +97,7 @@ class TiledEngine:
         self.tile_downsample = tile_downsample
         self.threshold = threshold
         self.job_id = job_id
+        self.tileset = tileset
         self.semaphore = semaphore
 
     def segment(self, record: odata.LocationRecord) -> Segmentation:
@@ -76,7 +110,7 @@ class TiledEngine:
             self.semaphore.acquire()
         try:
             result = self.client.retrying(lambda: self.client.segment_location(
-                self.annotation_context_id, record.id, threshold=self.threshold, job_id=self.job_id,
+                self.annotation_context_id, record.id, threshold=self.threshold, job_id=self.job_id, tileset=self.tileset,
             ))
         finally:
             if self.semaphore is not None:

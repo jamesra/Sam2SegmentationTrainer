@@ -41,10 +41,10 @@ from converter.cardgeom import (  # noqa: F401 - re-exported: scoring and tests 
     shape_bounds,
     union_bounds,
 )
-from converter.engines.tiled import TiledEngine, location_context
+from converter.engines.tiled import TiledEngine, choose_tileset, readable_context
 from converter.engines.window import WindowEngine
 from converter.seg_client import SegmentationClient, SegmentationFailed
-from converter.tilesource import SectionTiles, TileCache, Volume
+from converter.tilesource import SectionTiles, TileCache, Volume, viking_xml_url
 
 LOGGER = logging.getLogger("converter.builder")
 SCHEMA = """
@@ -89,6 +89,9 @@ class BuildParams:
     z_max: Optional[int] = None
     channel: Optional[str] = None
     filter_name: Optional[str] = None
+    # The tileset to segment and draw on, such as "TEM.Leveled". Unset: the one the server's VikingXML has, or with
+    # several the first that is not raw (see engines.tiled.choose_tileset).
+    tileset: Optional[str] = None
     model_id: Optional[str] = None
     threshold: float = 0.5
     retry_failed: bool = False
@@ -200,6 +203,8 @@ class Builder:
         self.get_json = get_json
         self.semaphore = semaphore
         self._sections: Dict[Tuple[int, int], SectionTiles] = {}
+        # The tileset the cards are drawn on; None lets the volume's own selection stand (the window engine).
+        self.tileset_name: Optional[str] = None
         choice = engines.choose(client, engine)
         self.engine_kind = choice.kind
         if choice.kind == engines.WINDOW:
@@ -207,9 +212,13 @@ class Builder:
                 params.volume, client, self._section, self._levels, threshold=params.threshold, semaphore=semaphore
             )
         else:
+            # The cards show this VikingXML's tiles, so the server segments the context that reads the same file.
+            context = readable_context(client, params.volume, params.viking_xml or viking_xml_url(params.volume))
+            self.tileset_name = choose_tileset(context.tilesets, params.tileset)
             self.engine = TiledEngine(
-                params.volume, client, annotation_context_id=location_context(client, params.volume),
-                tile_downsample=choice.tile_downsample, threshold=params.threshold, job_id=job_id, semaphore=semaphore,
+                params.volume, client, annotation_context_id=int(context.annotation_context_id),
+                tile_downsample=choice.tile_downsample, threshold=params.threshold, job_id=job_id,
+                tileset=self.tileset_name, semaphore=semaphore,
             )
         LOGGER.info("structure %s: %s engine", params.structure_id, choice.kind)
 
@@ -280,12 +289,12 @@ class Builder:
     def _section(self, z: int, downsample: int) -> SectionTiles:
         key = (z, downsample)
         if key not in self._sections:
-            tileset = self.volume.select(z, self.params.channel, self.params.filter_name)
+            tileset = self.volume.select(z, self.params.channel, self.params.filter_name, self.tileset_name)
             self._sections[key] = SectionTiles(self.volume, tileset, downsample, self.cache)
         return self._sections[key]
 
     def _levels(self, z: int) -> List[int]:
-        return sorted(self.volume.select(z, self.params.channel, self.params.filter_name).levels)
+        return sorted(self.volume.select(z, self.params.channel, self.params.filter_name, self.tileset_name).levels)
 
     def build_one(self, record: odata.LocationRecord) -> Dict[str, Any]:
         """Build one card and commit it. Returns its row; raises ``SegmentationFailed`` for a recorded failure."""

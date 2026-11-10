@@ -474,7 +474,10 @@ class FakeLocations(pb_grpc.SegmentationServiceServicer):
 
     def GetServerStatus(self, request, context):
         return pb.ServerStatusResponse(readable_volumes=[
-            pb.ReadableVolume(annotation_context_id=7, name="RC1", readable=True),
+            pb.ReadableVolume(annotation_context_id=7, name="RC1", readable=True, viking_xml="http://h/RC1/a.xml", tilesets=["TEM"]),
+            pb.ReadableVolume(
+                annotation_context_id=8, name="RC1", readable=True, viking_xml="http://h/RC1_Crush/b.xml", tilesets=["TEM.Raw8"],
+            ),
             pb.ReadableVolume(annotation_context_id=9, name="RPC1", readable=False),
         ])
 
@@ -527,9 +530,29 @@ def test_a_location_without_options_uses_the_cache_and_no_job(serve) -> None:
 def test_the_servers_volumes_say_which_it_reads(serve) -> None:
     client = serve(FakeLocations())
 
-    assert client.readable_volume("rc1").annotation_context_id == 7
     assert not client.readable_volume("RPC1").readable
     assert client.readable_volume("RC3") is None
+
+
+def test_a_volume_with_several_contexts_is_picked_by_the_vikingxml_it_reads_never_by_name(serve) -> None:
+    client = serve(FakeLocations())
+
+    assert client.readable_volume("rc1", "http://h/RC1/a.xml").annotation_context_id == 7
+    assert client.readable_volume("RC1", "HTTP://h/RC1_Crush/b.xml/").annotation_context_id == 8
+    assert client.readable_volume("RC1", "http://h/other.xml") is None
+    assert client.readable_volume("RC1") is None, "two contexts of one name cannot be told apart by the name"
+
+
+def test_a_named_tileset_goes_in_the_start_and_an_unnamed_one_is_left_to_the_server(serve) -> None:
+    fake = FakeLocations()
+    client = serve(fake)
+
+    client.segment_location(7, 1, tileset="TEM.Leveled")
+    client.segment_location(7, 2)
+
+    first, second = fake.starts
+    assert first.HasField("tileset") and first.tileset == "TEM.Leveled"
+    assert not second.HasField("tileset")
 
 
 def test_cancel_ends_a_call_in_flight_and_any_started_later(serve) -> None:

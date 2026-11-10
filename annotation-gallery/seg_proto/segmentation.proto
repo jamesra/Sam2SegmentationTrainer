@@ -297,6 +297,9 @@ message LocationStart {
   SegmentOptions options = 5;
   // The client can supply image tiles: the server may send TilesNeeded.tiles for cells it cannot read itself.
   bool provides_images = 6;
+  // The tileset to read and segment on, one of ReadableVolume.tilesets, such as "TEM.Leveled". Unset: the volume's
+  // default tileset, which is what Viking uses. A section without the tileset is refused (FAILED_PRECONDITION).
+  optional string tileset = 7;
 }
 
 message LocationSet {
@@ -520,6 +523,12 @@ message ReadableVolume {
   string name = 2;
   // True when the server reads the volume's tiles from local storage.
   bool readable = 3;
+  // The context's VikingXML URL. A volume can have several contexts with one name (other VikingXML files, other
+  // image sets); a client that reads the same VikingXML itself picks its context by this, not by name.
+  string viking_xml = 4;
+  // The tilesets any section of the context's VikingXML has, sorted by name, such as "TEM.Leveled" and "TEM.Raw8".
+  // A section has none, one or several of them.
+  repeated string tilesets = 5;
 }
 
 // The identity and feeding contract of the served model, from the model's manifest, which travels with the weights.

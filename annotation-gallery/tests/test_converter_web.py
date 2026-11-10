@@ -520,6 +520,28 @@ def test_a_volume_the_segmentation_server_cannot_read_is_greyed_out_and_cannot_b
     assert status == 409 and "Missing local images" in refused["error"]
 
 
+def test_preview_offers_the_tilesets_of_the_context_that_reads_the_volumes_vikingxml(clean_httpd, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GALLERY_CONVERTER_VIKINGXML", "http://x/{volume}.xml")
+    (tmp_path / "gallery-volumes" / "RC2").mkdir(parents=True)
+    client = fixtures.FakeSegmenter(lambda _id: None)
+    client.status = lambda: SimpleNamespace(
+        model=SimpleNamespace(contract_json=""),
+        readable_volumes=[
+            # RC1 has two contexts: only the one reading the gallery's VikingXML counts, and its two filters are offered.
+            SimpleNamespace(name="RC1", readable=True, viking_xml="http://x/RC1.xml", tilesets=["TEM.Raw8", "TEM.Leveled"]),
+            SimpleNamespace(name="RC1", readable=True, viking_xml="http://y/crush.xml", tilesets=["TEM.Raw8"]),
+            SimpleNamespace(name="RC2", readable=True, viking_xml="http://x/RC2.xml", tilesets=["TEM.Leveled"]),
+        ],
+    )
+    jobs.OVERRIDES["make_client"] = lambda: client
+    jobs.OVERRIDES["get_json"] = lambda url: {"@odata.count": 4, "value": []}
+
+    payload = call_json(clean_httpd, "/api/converter/preview", {"structureId": 500})[1]
+
+    assert payload["volumes"]["RC1"]["tilesets"] == ["TEM.Leveled", "TEM.Raw8"], "the fit one first"
+    assert payload["volumes"]["RC2"]["tilesets"] == ["TEM.Leveled"]
+
+
 def test_preview_reports_an_unreachable_volume_without_hiding_the_others(clean_httpd, tmp_path: Path) -> None:
     (tmp_path / "gallery-volumes" / "RC2").mkdir(parents=True)
 

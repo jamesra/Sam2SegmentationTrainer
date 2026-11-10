@@ -107,17 +107,20 @@ class Volume:
     base_url: str
     tilesets: Mapping[int, Tuple[Tileset, ...]]
 
-    def select(self, section: int, channel: Optional[str] = None, filter_name: Optional[str] = None) -> Tileset:
-        """The section's tileset: the named channel/filter if given, else the first (sorted by name)."""
+    def select(
+        self, section: int, channel: Optional[str] = None, filter_name: Optional[str] = None, name: Optional[str] = None,
+    ) -> Tileset:
+        """The section's tileset: the one called ``name``, or the named channel/filter if given, else the first (sorted
+        by name)."""
         candidates = self.tilesets.get(int(section), ())
         if not candidates:
             raise TileSourceError(f"section {section} has no tileset in the VikingXML")
         for tileset in candidates:
-            if (channel is None or tileset.channel.lower() == channel.lower()) and (
-                filter_name is None or tileset.filter.lower() == filter_name.lower()
-            ):
+            if (name is None or tileset.name.lower() == name.lower()) and (
+                channel is None or tileset.channel.lower() == channel.lower()
+            ) and (filter_name is None or tileset.filter.lower() == filter_name.lower()):
                 return tileset
-        wanted = ".".join(part for part in (channel, filter_name) if part)
+        wanted = name or ".".join(part for part in (channel, filter_name) if part)
         raise TileSourceError(f"section {section} has no tileset {wanted!r}; has {[t.name for t in candidates]}")
 
 
@@ -188,6 +191,16 @@ def default_http_get(url: str, headers: Optional[Mapping[str, str]] = None) -> T
         if attempt < RETRIES - 1:
             time.sleep(1.5 * (2**attempt))
     raise TileSourceError(f"GET {url} failed after {RETRIES} tries: {last}")
+
+
+def viking_xml_url(volume_name: str, environ: Optional[Mapping[str, str]] = None) -> str:
+    """Where the volume's VikingXML is, from ``GALLERY_CONVERTER_VIKINGXML`` (a URL template with ``{volume}`` or
+    ``<volume>``, which survives compose's variable substitution) or, for one volume whose file is not at the usual place,
+    ``GALLERY_CONVERTER_VIKINGXML_<VOLUME>``. Empty when neither is set."""
+    mapping = environ if environ is not None else os.environ
+    specific = "GALLERY_CONVERTER_VIKINGXML_" + "".join(c if c.isalnum() else "_" for c in volume_name.upper())
+    template = (mapping.get(specific) or mapping.get("GALLERY_CONVERTER_VIKINGXML") or "").strip()
+    return template.replace("{volume}", volume_name).replace("<volume>", volume_name)
 
 
 def load_volume(source: str, *, host: Optional[str] = None, http_get: HttpGet = default_http_get) -> Volume:

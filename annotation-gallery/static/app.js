@@ -4869,6 +4869,16 @@
     return builds;
   }
 
+  // The filter list shows only when the volume has a choice: with one tileset there is nothing to ask. The server lists
+  // the fit ones (not raw) first, so the first option is the default.
+  function showBuildTilesets(info) {
+    const names = (info && info.tilesets) || [];
+    const select = document.getElementById("build-tileset");
+    const row = document.getElementById("build-tileset-row");
+    select.innerHTML = names.map((name) => `<option value="${name}">${name}</option>`).join("");
+    row.hidden = names.length < 2;
+  }
+
   function buildSettings(structureId) {
     return {
       structureId,
@@ -4900,6 +4910,7 @@
       typeCodes: [...buildUi.types.querySelectorAll("input:checked")].map((box) => Number(box.value)),
       zMin: buildUi.zMin.value,
       zMax: buildUi.zMax.value,
+      tileset: document.getElementById("build-tileset-row").hidden ? "" : document.getElementById("build-tileset").value,
     };
     buildUi.start.disabled = true;
     try {
@@ -4975,6 +4986,8 @@
             picker.value = chosen;
           }
           note.textContent = window.ConverterMode.previewLine(result.volumes, picker.value);
+          buildUi.volumes = result.volumes;
+          showBuildTilesets(result.volumes[picker.value]);
           buildUi.start.disabled = !window.ConverterMode.buildable(result.volumes[picker.value]);
         } catch (error) {
           if (serial === previewSerial) {
@@ -4990,6 +5003,7 @@
     document.getElementById("build-volume").addEventListener("change", () => {
       const picked = document.getElementById("build-volume");
       const option = picked.options[picked.selectedIndex];
+      showBuildTilesets((buildUi.volumes || {})[picked.value]);
       const match = /(\d+) annotation/.exec(option ? option.text : "");
       buildUi.start.disabled = !(match && Number(match[1]) > 0) || Boolean(option && option.disabled);
     });

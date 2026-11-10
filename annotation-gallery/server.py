@@ -76,6 +76,7 @@ from converter import serverreview
 from converter import web as converter_web
 from converter.builder import BuildParams
 from converter.tilesource import load_volume as load_viking_volume
+from converter.tilesource import viking_xml_url
 import score as score_module
 from gold import draw as gold_draw
 from gold import store as gold_store
@@ -1095,6 +1096,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             z_max=optional_int("zMax"),
             channel=(body.get("channel") or None),
             filter_name=(body.get("filter") or None),
+            tileset=(str(body.get("tileset")).strip() or None) if body.get("tileset") else None,
             retry_failed=bool(body.get("retryFailed", True)),
         )
 
@@ -1372,6 +1374,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
             counts = dict(zip(volumes, pool.map(count, volumes)))
         for volume in converter_jobs.missing_local_images(volumes):
             counts[volume]["localImages"] = False
+        for volume in volumes:
+            # The tilesets the segmentation could use, fit ones first. One is used without asking; the dialog offers a
+            # choice only when there are several.
+            params = self._build_params(volume, structure_id, body)
+            names = converter_jobs.volume_tilesets(volume, params.viking_xml or viking_xml_url(volume))
+            if names and "error" not in counts[volume]:
+                counts[volume]["tilesets"] = names
         self._send_json({"structureId": structure_id, "volumes": counts})
 
     def _handle_converter_delete(self) -> None:

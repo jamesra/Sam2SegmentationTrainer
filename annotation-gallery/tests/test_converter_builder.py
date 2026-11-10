@@ -189,8 +189,10 @@ class FakeSegmenter:
     def model_id(self):
         return "v5"
 
-    def readable_volume(self, volume_name):
-        return SimpleNamespace(annotation_context_id=7, name=volume_name, readable=volume_name not in self.unreadable)
+    def readable_volume(self, volume_name, viking_xml=""):
+        return SimpleNamespace(
+            annotation_context_id=7, name=volume_name, readable=volume_name not in self.unreadable, tilesets=["TEM.Leveled"],
+        )
 
     def cancel(self):
         self.cancelled = True
@@ -212,7 +214,7 @@ class FakeSegmenter:
     # and centre click, a polygon's outline, or the override); retried as the real client retries.
     retrying = staticmethod(SegmentationClient.retrying)
 
-    def segment_location(self, annotation_context_id, location_id, *, threshold, job_id=0, shape_override=None, cache_mode=0, progress=None):
+    def segment_location(self, annotation_context_id, location_id, *, threshold, job_id=0, shape_override=None, cache_mode=0, progress=None, tileset=None):
         self.located.append(SimpleNamespace(
             context=annotation_context_id, location_id=location_id, threshold=threshold, job_id=job_id,
             shape_override=shape_override, cache_mode=cache_mode,
@@ -290,6 +292,21 @@ def _remember(segmenter, entities):
         record = odata.record_from_entity(entity)
         if record is not None:
             segmenter.locations[record.id] = record
+
+
+def test_the_one_tileset_is_used_without_asking_and_several_default_to_one_that_is_not_raw() -> None:
+    from converter.engines.tiled import choose_tileset, ordered_tilesets
+    from converter.seg_client import SegmentationFailed
+
+    assert choose_tileset(["TEM"]) == "TEM"
+    assert choose_tileset(["TEM.Raw8"]) == "TEM.Raw8", "a single tileset is not a choice, even a raw one"
+    assert ordered_tilesets(["TEM.Raw8", "TEM.Quantized", "TEM.Leveled"]) == ["TEM.Leveled", "TEM.Quantized", "TEM.Raw8"]
+    assert choose_tileset(["TEM.Raw8", "TEM.Leveled"]) == "TEM.Leveled"
+    assert choose_tileset(["TEM.Raw8", "TEM.Leveled"], "tem.raw8") == "TEM.Raw8"
+    with pytest.raises(SegmentationFailed):
+        choose_tileset([])
+    with pytest.raises(SegmentationFailed):
+        choose_tileset(["TEM"], "TEM.Leveled")
 
 
 def test_a_circle_is_built_into_a_gallery_card(tmp_path: Path, volume, cache) -> None:

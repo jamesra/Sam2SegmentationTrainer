@@ -24,8 +24,9 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from converter import builder as builder_module
 from converter import engines, odata
 from converter import serverreview
-from converter.seg_client import SegmentationClient
-from converter.tilesource import TileCache, Volume, load_volume
+from converter.engines.tiled import ordered_tilesets
+from converter.seg_client import SegmentationClient, context_for
+from converter.tilesource import TileCache, Volume, load_volume, viking_xml_url
 
 LOGGER = logging.getLogger("converter.jobs")
 
@@ -76,13 +77,11 @@ def default_client(environ: Optional[Dict[str, str]] = None) -> SegmentationClie
 def default_volume(volume_name: str, environ: Optional[Dict[str, str]] = None) -> Volume:
     """The volume's tilesets from its VikingXML: ``GALLERY_CONVERTER_VIKINGXML`` is a URL template with ``{volume}``
     (or ``<volume>``, which survives compose's variable substitution)."""
-    mapping = environ if environ is not None else os.environ
     # One volume can have its own address (RC1's VikingXML is not at the usual place): GALLERY_CONVERTER_VIKINGXML_RC1.
-    specific = "GALLERY_CONVERTER_VIKINGXML_" + "".join(c if c.isalnum() else "_" for c in volume_name.upper())
-    template = (mapping.get(specific) or mapping.get("GALLERY_CONVERTER_VIKINGXML") or "").strip()
-    if not template:
+    url = viking_xml_url(volume_name, environ)
+    if not url:
         raise ConverterNotConfigured("GALLERY_CONVERTER_VIKINGXML is not set (URL template of the VikingXML, with {volume})")
-    return load_volume(template.replace("{volume}", volume_name).replace("<volume>", volume_name))
+    return load_volume(url)
 
 
 def tile_cache(environ: Optional[Dict[str, str]] = None) -> TileCache:
@@ -318,23 +317,38 @@ def write_source(
 MISSING_IMAGES_SECONDS = 60.0
 _MISSING_LOCK = threading.Lock()
 # (when read, the lower-case names of the volumes the server reads; None when every volume can be built)
-_READABLE: Optional[Tuple[float, Optional[Set[str]]]] = None
+_READABLE: Optional[Tuple[float, Optional[List[Any]]]] = None
 
 
 def missing_local_images(volumes: List[str]) -> List[str]:
     """The volumes a build cannot run in because the segmentation server does not read their images itself, which
     the tiled engine's SegmentLocation needs (the single-window engine uploads its own tiles). The server's answer is
     kept for a minute. A server that cannot be asked marks nothing: the build then reports why it failed."""
+    held = server_volumes()
+    known = None if held is None else {v.name.lower() for v in held if v.readable}
+    return [volume for volume in volumes if known is not None and volume.lower() not in known]
+
+
+def volume_tilesets(volume: str, viking_xml: str) -> List[str]:
+    """The tilesets of the server's context that reads ``viking_xml`` for ``volume``, fit ones first. Empty when the
+    server has no such context or cannot be asked."""
+    context = context_for(server_volumes() or [], volume, viking_xml)
+    return ordered_tilesets(getattr(context, "tilesets", ())) if context is not None else []
+
+
+def server_volumes() -> Optional[List[Any]]:
+    """The segmentation server's contexts when the tiled engine is served, kept for a minute; None when every volume
+    can be built (the window engine uploads its own tiles) or the server cannot be asked."""
     global _READABLE
     with _MISSING_LOCK:
         held = _READABLE
     if held is None or time.monotonic() - held[0] > MISSING_IMAGES_SECONDS:
-        readable: Optional[Set[str]] = None
+        readable: Optional[List[Any]] = None
         try:
             client = OVERRIDES.get("make_client", default_client)()
             try:
                 if engines.choose(client).kind == engines.TILED:
-                    readable = {v.name.lower() for v in client.status().readable_volumes if v.readable}
+                    readable = list(client.status().readable_volumes)
             finally:
                 close = getattr(client, "close", None)
                 if callable(close):
@@ -344,8 +358,7 @@ def missing_local_images(volumes: List[str]) -> List[str]:
         held = (time.monotonic(), readable)
         with _MISSING_LOCK:
             _READABLE = held
-    known = held[1]
-    return [volume for volume in volumes if known is not None and volume.lower() not in known]
+    return held[1]
 
 
 # Tests replace the pieces a job reaches over the network: {"make_client": ..., "make_volume": ..., "make_cache": ..., "get_json": ...}.

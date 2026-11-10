@@ -42,7 +42,7 @@ from converter import engines, odata, seed
 from converter.engines.tiled import location_context
 from converter.seg_client import SegmentationFailed, TileIdentity, circle_shape
 from seg_proto import segmentation_pb2 as pb
-from converter.tilesource import SectionTiles, TileCache, Volume
+from converter.tilesource import SectionTiles, TileCache, Volume, viking_xml_url
 
 SEED_CIRCLE_SCALE = 0.95
 """Radius fraction of an inscribed circle sent as a seed (the trainer's ``prompt.circle_diameter_scale``)."""
@@ -134,7 +134,7 @@ def _segment_tiled_once(
     """One SegmentLocation call, the server building the prompt: ``(result, contour or None)``. A circle annotation is
     its own location prompt (the converter's request, answered from the same cache row); a polygon's seed circle goes in
     the location's place, and as it is not the location's prompt the server never caches it."""
-    context = location_context(client, volume_name)
+    context = location_context(client, volume_name, viking_xml_url(volume_name))
     override = None if kind == "circle" else circle_shape(cx, cy, radius)
     if semaphore is not None:
         semaphore.acquire()
