@@ -1435,6 +1435,43 @@ def test_viking_link_falls_back_to_the_plain_link_when_identity_refuses_the_volu
         viking_link("https://i", "tok", "NM", "7", expired)
 
 
+def test_viking_link_asks_for_the_gallerys_annotation_context_by_id() -> None:
+    """RC1 has several contexts under one name; by name Identity picks the first, so the gallery names its own."""
+    from identity import IdentityHttpError
+    from server import viking_link
+
+    calls: list[tuple] = []
+
+    def http_json(url, **kwargs):
+        calls.append((url, kwargs))
+        return {"viking_url": "viking://open?code=abc&volume=https%3A%2F%2Fs%2FRC1_Crush%2Fv.VikingXML&volumeName=RC1"}
+
+    url = viking_link("https://i", "tok", "RC1", "7", http_json, context_id=20107, viking_xml="https://s/RC1_Crush/v.VikingXML")
+    assert json.loads(calls[0][1]["body"]) == {"volume_name": "20107"}
+    assert url.endswith("&location=7")
+
+    def refuse(url, **kwargs):
+        raise IdentityHttpError(403, "forbidden")
+
+    plain = viking_link("https://i", "tok", "RC1", "7", refuse, context_id=20107, viking_xml="https://s/RC1_Crush/v.VikingXML")
+    assert plain == "viking://open?volume=https%3A%2F%2Fs%2FRC1_Crush%2Fv.VikingXML&volumeName=RC1&location=7"
+
+
+def test_working_context_is_the_one_reading_the_volumes_vikingxml(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from converter import jobs
+
+    contexts = [
+        SimpleNamespace(annotation_context_id=2, name="RC1", viking_xml="http://rogue1/RABBIT/rogue1.vikingxml"),
+        SimpleNamespace(annotation_context_id=20107, name="RC1", viking_xml="https://s2/RC1_Crush/SliceToVolume.VikingXML"),
+    ]
+    monkeypatch.setattr(jobs, "server_volumes", lambda: contexts)
+    assert jobs.working_context("RC1", "https://s2/RC1_Crush/SliceToVolume.VikingXML").annotation_context_id == 20107
+    assert jobs.working_context("RC1", "http://rogue1/RABBIT/rogue1.vikingxml").annotation_context_id == 2
+    assert jobs.working_context("RC1", "https://elsewhere/x.VikingXML") is None
+
+
 def test_tokens_are_kept_server_side_and_expire() -> None:
     from server import forget_token, recall_token, remember_token
 

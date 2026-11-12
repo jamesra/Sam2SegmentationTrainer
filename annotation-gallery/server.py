@@ -423,21 +423,29 @@ def viking_link(
     location: str,
     http_json: Callable[..., Any] = default_http_json,
     propose: bool = False,
+    context_id: int | None = None,
+    viking_xml: str = "",
 ) -> str:
     """viking:// link that opens (or jumps) Viking on a location, signed in as the token's user. ``propose`` asks Viking
     to segment the location on arrival (a converter card); a Viking that does not know the parameter ignores it.
 
     Asks Identity for a one-use launch code. When Identity refuses the volume (403) the plain link is returned:
     Viking then signs in by itself. A 401 is raised as IdentityHttpError so the caller can send the user to sign in.
+
+    One database can have several annotation contexts under one name (RC1 has three VikingXMLs); by name Identity
+    picks the first. ``context_id`` (with its ``viking_xml``) names the context the gallery works in, so Viking opens
+    or jumps to that one, the same images the cards were cut from.
     """
     place = "&location=" + quote(location, safe="") + ("&propose=1" if propose else "")
-    plain = "viking://open?volumeName=" + quote(identity_name, safe="") + place
+    target = ("volume=" + quote(viking_xml, safe="") + "&") if viking_xml else ""
+    plain = "viking://open?" + target + "volumeName=" + quote(identity_name, safe="") + place
+    volume_key = str(context_id) if context_id is not None else identity_name
     try:
         payload = http_json(
             api_base.rstrip("/") + "/api/viking/launch-code",
             method="POST",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            body=json.dumps({"volume_name": identity_name}).encode("utf-8"),
+            body=json.dumps({"volume_name": volume_key}).encode("utf-8"),
         )
     except IdentityHttpError as exc:
         if exc.status in {403, 404}:
@@ -1497,8 +1505,17 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "login required", "login": "/login"}, status=401)
             return
         api = os.environ.get("GALLERY_IDENTITY_API") or "https://identity.codepharm.net:6001"
+        # The context the converter reads (the same setting that picks its tiles); by name when the server has none.
+        tiles = self._volume_source(volume).get("tiles")
+        viking_xml = str((tiles or {}).get("vikingXml") or "").strip() if isinstance(tiles, dict) else ""
+        viking_xml = viking_xml or viking_xml_url(volume)
+        context = converter_jobs.working_context(volume, viking_xml) if viking_xml else None
+        context_id = int(context.annotation_context_id) if context is not None else None
         try:
-            url = viking_link(api, token, identity_name, location, propose=body.get("propose") is True)
+            url = viking_link(
+                api, token, identity_name, location, propose=body.get("propose") is True,
+                context_id=context_id, viking_xml=viking_xml if context is not None else "",
+            )
         except IdentityHttpError as exc:
             status = 401 if exc.status == 401 else 502
             self._send_json({"error": "launch code failed", "login": "/login"}, status=status)

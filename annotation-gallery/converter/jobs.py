@@ -332,8 +332,14 @@ def missing_local_images(volumes: List[str]) -> List[str]:
 def volume_tilesets(volume: str, viking_xml: str) -> List[str]:
     """The tilesets of the server's context that reads ``viking_xml`` for ``volume``, fit ones first. Empty when the
     server has no such context or cannot be asked."""
-    context = context_for(server_volumes() or [], volume, viking_xml)
+    context = working_context(volume, viking_xml)
     return ordered_tilesets(getattr(context, "tilesets", ())) if context is not None else []
+
+
+def working_context(volume: str, viking_xml: str) -> Optional[Any]:
+    """The server's annotation context that reads ``viking_xml`` for ``volume``: the one the gallery works in, so Viking
+    links open it too. None when the server has no such context or cannot be asked."""
+    return context_for(server_volumes() or [], volume, viking_xml)
 
 
 def server_volumes() -> Optional[List[Any]]:
