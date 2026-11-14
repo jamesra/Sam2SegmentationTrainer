@@ -1547,10 +1547,11 @@
   const SORTS_PER_COLUMN = 5;
 
   // The filters do not apply to the process layout, which always lays out every card: switch them off while it is on.
+  // The Show boxes stay on: the layout blanks or drops cards of an unticked class (packProcesses).
   function syncLayoutLock() {
     const locked = layoutActive();
     els.filters.querySelectorAll("input, select, button").forEach((control) => {
-      if (control.closest("#sort-filter")) {
+      if (control.closest("#sort-filter") || control.closest("#view-classes")) {
         return;
       }
       if (locked) {
