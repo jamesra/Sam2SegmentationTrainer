@@ -2598,9 +2598,12 @@
     return { cardPx, baseHeight, rowOffsets, ...laid };
   }
 
-  // The process / branch layout: every card at the row and column static/process_layout.js gives it. Cards that are
-  // approved or rejected count as done; the layout drops finished processes. The grid may be wider than the screen.
+  // The process / branch layout: every card at the row and column static/process_layout.js gives it. The Show boxes
+  // (Approved, Rejected, To review) decide what is shown: a card whose class is unticked counts as done, and the layout
+  // drops a process or branch whose cards are all done. A hidden card inside a shown process stays, so the string is
+  // not broken. The grid may be wider than the screen.
   function packProcesses(cards, viewColumns) {
+    const classes = visibleClasses();
     const input = cards.map((windows) => {
       const row = windows[0];
       const radius = Number(row.radius);
@@ -2608,7 +2611,7 @@
         id: String(row.location_id),
         z: Number(row.z) || 0,
         area: Number.isFinite(radius) ? Math.PI * radius * radius : 0,
-        done: reviewClass(row) !== "unknown",
+        done: !classes.has(reviewClass(row)),
       };
     });
     const laid = window.ProcessLayout.layoutProcesses({ cards: input, links: state.convLinks, maxColumns: viewColumns });
