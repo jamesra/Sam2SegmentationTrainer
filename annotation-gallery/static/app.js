@@ -2333,7 +2333,7 @@
   function cellHtml(cell, rowOffset) {
     const row = cell.row;
     return `
-      <article class="card ${joinClasses(cell)}" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="--link-h:${cell.linkH};--link-s:${cell.linkS}%;--link-l:${cell.linkL}%;grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
+      <article class="card ${joinClasses(cell)}${cell.masked ? " masked" : ""}" data-id="${row.location_id}" data-key="${row.image_key || ""}" style="--link-h:${cell.linkH};--link-s:${cell.linkS}%;--link-l:${cell.linkL}%;grid-column:${cell.gc + 1};grid-row:${cell.gr - rowOffset + 1}">
         ${windowHtml(row)}
         ${windowActions(row)}
         <div class="meta"><div class="meta-row"><div>${captionHtml(row)}</div>${cardScoreHtml(row)}${refreshButton(row)}</div></div>
@@ -2600,8 +2600,8 @@
 
   // The process / branch layout: every card at the row and column static/process_layout.js gives it. The Show boxes
   // (Approved, Rejected, To review) decide what is shown: a card whose class is unticked counts as done, and the layout
-  // drops a process or branch whose cards are all done. A hidden card inside a shown process stays, so the string is
-  // not broken. The grid may be wider than the screen.
+  // drops a process or branch whose cards are all done. An unticked card inside a shown process keeps its slot, so the
+  // string is not broken, but is drawn blank (`masked`). The grid may be wider than the screen.
   function packProcesses(cards, viewColumns) {
     const classes = visibleClasses();
     const input = cards.map((windows) => {
@@ -2618,6 +2618,7 @@
     const byId = new Map(cards.map((windows) => [String(windows[0].location_id), windows[0]]));
     const cells = laid.cells.map((cell) => ({
       row: byId.get(cell.id), gr: cell.row, gc: cell.col, group: cell.group, root: Boolean(cell.root),
+      masked: !classes.has(reviewClass(byId.get(cell.id))),
     }));
     const packed = {
       columns: Math.max(laid.columns, viewColumns),
@@ -2702,6 +2703,7 @@
         continue;
       }
       node.hidden = false;
+      node.classList.toggle("masked", Boolean(cell.masked));
       node.classList.toggle("join-n", Boolean(cell.joinN));
       node.classList.toggle("join-e", Boolean(cell.joinE));
       node.classList.toggle("join-s", Boolean(cell.joinS));

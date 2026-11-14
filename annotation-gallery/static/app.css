@@ -431,6 +431,16 @@ button.reverse.active,
   display: none;
 }
 
+/* Process / branch view: a card whose review class is unticked under Show keeps its slot in the chain (the link ring
+   stays) but its image, buttons and caption are not drawn. */
+.card.masked {
+  pointer-events: none;
+}
+
+.card.masked > * {
+  visibility: hidden;
+}
+
 .card button.refresh,
 #viewer-refresh {
   display: inline-flex;
