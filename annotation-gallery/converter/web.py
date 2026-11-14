@@ -279,6 +279,46 @@ def mark_converted(crops: Path, polygon_ids: Iterable[int]) -> List[int]:
     return changed
 
 
+def remove_gone(crops: Path, live_ids: Iterable[int]) -> List[int]:
+    """Remove the cards of locations the structure no longer has: deleted in Viking, most often merged into another
+    location's polygon (the survivor keeps its own card), or moved to another structure. Their catalog rows and approval
+    marks go too, so the page shows one card per location that exists. Returns the removed location ids.
+
+    An empty ``live_ids`` removes nothing: a structure with no locations at all is more likely a bad answer than real.
+    """
+    live = {int(location_id) for location_id in live_ids}
+    if not live or not catalog.sqlite_path(crops).is_file() or not _has_cards(crops):
+        return []
+    connection = catalog.connect(crops)
+    try:
+        rows = connection.execute("SELECT DISTINCT location_id, image_key FROM converter_cards").fetchall()
+        gone = [(int(row[0]), str(row[1] or "")) for row in rows if int(row[0]) not in live]
+        for location_id, _key in gone:
+            connection.execute("DELETE FROM converter_cards WHERE location_id = ?", [location_id])
+            connection.execute("DELETE FROM locations WHERE location_id = ?", [location_id])
+        connection.commit()
+    finally:
+        connection.close()
+    for location_id, key in gone:
+        catalog.unapprove_window(crops, location_id, key)
+    return sorted({location_id for location_id, _key in gone})
+
+
+def replace_links(crops: Path, links: Iterable[Iterable[int]]) -> int:
+    """Store the structure's location links as OData has them now, replacing the build's: a merge in Viking relinks
+    the deleted location's neighbours to the survivor. Returns how many links are stored."""
+    pairs = sorted({(min(int(a), int(b)), max(int(a), int(b))) for a, b in links if int(a) != int(b)})
+    connection = catalog.connect(crops)
+    try:
+        connection.execute("CREATE TABLE IF NOT EXISTS converter_links (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))")
+        connection.execute("DELETE FROM converter_links")
+        connection.executemany("INSERT INTO converter_links (a, b) VALUES (?, ?)", pairs)
+        connection.commit()
+    finally:
+        connection.close()
+    return len(pairs)
+
+
 def build_summary(crops: Path) -> Dict[str, Any]:
     """Counts for the build picker: cards built and failed, and how many of the built ones are approved or rejected.
     Cards converted in the database count as built and approved: they are done."""

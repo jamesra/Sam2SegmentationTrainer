@@ -170,7 +170,11 @@ def test_update_marks_cards_converted_in_viking_as_converted_and_approved(
 
     def odata(url: str):
         asked.append(url)
-        return {"value": [{"ID": 11}, {"ID": 13}]}
+        if "StructureLocationLinks" in url:
+            return {"value": [{"A": 11, "B": 12}, {"A": 13, "B": 12}]}
+        if "TypeCode" in url:
+            return {"value": [{"ID": 11}, {"ID": 13}]}
+        return {"value": [{"ID": 11}, {"ID": 12}, {"ID": 13}]}
 
     monkeypatch.setitem(jobs.OVERRIDES, "get_json", odata)
     status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/sync?set={SET}", {})
@@ -192,7 +196,49 @@ def test_update_marks_cards_converted_in_viking_as_converted_and_approved(
 
     # A second Update finds nothing new.
     status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/sync?set={SET}", {})
-    assert status == 200 and json.loads(raw)["converted"] == 0
+    assert status == 200 and json.loads(raw)["converted"] == 0 and json.loads(raw)["removed"] == []
+
+
+def test_update_removes_cards_of_merged_locations_and_relinks_the_survivor(
+    httpd, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """12 was merged into 11's polygon in Viking: 12 is gone from OData and its neighbour 13 now links to 11. The page
+    then shows one card for the merged cell, and the layout runs through the survivor."""
+    from converter import jobs
+
+    (built / "source.json").write_text(json.dumps({"kind": "converter", "odata": "http://odata.test/RC1/OData", "structureId": 500}))
+    key12 = f"{fixtures.VOLUME}_7_D1_L12"
+    request(httpd, "POST", f"/api/volumes/RC1/approve?set={SET}", {"location_id": 12, "image_key": key12})
+
+    def odata(url: str):
+        if "StructureLocationLinks" in url:
+            return {"value": [{"A": 11, "B": 13}]}
+        if "TypeCode" in url:
+            return {"value": [{"ID": 11}]}
+        return {"value": [{"ID": 11}, {"ID": 13}]}
+
+    monkeypatch.setitem(jobs.OVERRIDES, "get_json", odata)
+    status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/sync?set={SET}", {})
+    payload = json.loads(raw)
+    assert status == 200 and payload["removed"] == [12] and payload["location_ids"] == [11]
+
+    status, cards = get_json(httpd, f"/api/volumes/RC1/converter/cards?set={SET}")
+    assert {c["location_id"] for c in cards["cards"]} == {11, 13} and cards["links"] == [[11, 13]]
+    rows = get_json(httpd, f"/api/volumes/RC1/catalog?set={SET}")[1]["rows"]
+    assert 12 not in {row["location_id"] for row in rows}
+    assert all(location_id != 12 for location_id, _key in web.catalog.load_approved(built))
+
+
+def test_update_removes_nothing_when_odata_lists_no_locations(httpd, built: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty answer is more likely a bad endpoint than a structure with every location deleted."""
+    from converter import jobs
+
+    (built / "source.json").write_text(json.dumps({"kind": "converter", "odata": "http://odata.test/RC1/OData", "structureId": 500}))
+    monkeypatch.setitem(jobs.OVERRIDES, "get_json", lambda url: {"value": []})
+    status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/sync?set={SET}", {})
+    assert status == 200 and json.loads(raw)["removed"] == []
+    status, cards = get_json(httpd, f"/api/volumes/RC1/converter/cards?set={SET}")
+    assert {c["location_id"] for c in cards["cards"]} == {11, 12, 13}
 
 
 def _wait_for(condition, seconds: float = 5.0) -> None:

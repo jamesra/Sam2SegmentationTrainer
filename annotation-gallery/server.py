@@ -1136,8 +1136,13 @@ class GalleryHandler(BaseHTTPRequestHandler):
         self._send_json(started.snapshot())
 
     def _handle_converter_sync(self, volume: str) -> None:
-        """POST: ask OData which of the build's annotations are polygons now (converted in Viking, not through this
-        build) and treat their cards as accepted here: approved, and marked converted so the batch leaves them out."""
+        """POST: bring the build up to date with what was done in Viking.
+
+        - Annotations that are polygons now (converted in Viking, not through this build): their cards are treated as
+          accepted here, approved and marked converted so the batch leaves them out.
+        - Annotations the structure no longer has (deleted, usually merged into another's polygon): their cards go.
+        - The location links are read again, so a merge's survivor takes the deleted location's place in the layout.
+        """
         if not self._review_granted(volume):
             return
         crops = self._granted_crops(volume)
@@ -1150,17 +1155,23 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "this is not a converter build"}, status=400)
             return
         get_json = converter_jobs.OVERRIDES.get("get_json", odata_module.http_get_json)
+        base = odata_endpoint(volume, source)
         try:
             polygons = list(odata_module.iter_type_coded_ids(
-                odata_endpoint(volume, source), structure_id, converter_web.POLYGON_TYPE_CODES, get_json=get_json,
+                base, structure_id, converter_web.POLYGON_TYPE_CODES, get_json=get_json,
             ))
+            live = list(odata_module.iter_type_coded_ids(base, structure_id, (), get_json=get_json))
+            links = list(odata_module.iter_links(base, structure_id, get_json=get_json))
         except Exception as error:  # an unreachable or failing endpoint is reported, nothing is changed
             self._send_json({"error": f"OData could not be read: {str(error)[:200]}"}, status=502)
             return
+        removed = converter_web.remove_gone(crops, live)
+        if live:
+            converter_web.replace_links(crops, links)
         changed = converter_web.mark_converted(crops, polygons)
         if changed:
             review_locations(crops, changed, "approve")
-        self._send_json({"ok": True, "converted": len(changed), "location_ids": changed})
+        self._send_json({"ok": True, "converted": len(changed), "location_ids": changed, "removed": removed})
 
     def _handle_converter_edit(self, volume: str) -> None:
         """POST {location_id, image_key, rings}: a retraced outline replaces the card's proposal (the batch, not the database)."""

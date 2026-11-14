@@ -245,7 +245,8 @@ def iter_links(base: str, structure_id: int, *, get_json: GetJson = http_get_jso
 def iter_type_coded_ids(
     base: str, structure_id: int, type_codes: Sequence[int], *, get_json: GetJson = http_get_json
 ) -> Iterator[int]:
-    """The ids of the structure's locations that have one of ``type_codes`` now, page by page (ids only: cheap)."""
+    """The ids of the structure's locations that have one of ``type_codes`` now, page by page (ids only: cheap). Empty
+    ``type_codes`` lists every location the structure has."""
     expression = filter_text(structure_id, type_codes=type_codes)
     url = f"{base.rstrip('/')}/Locations?$filter={quote(expression, safe='()/')}&$select=ID&$orderby=ID"
     for page in iter_pages(url, get_json):

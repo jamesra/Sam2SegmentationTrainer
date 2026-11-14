@@ -5077,13 +5077,19 @@
           body: "{}",
         });
         const count = Number(result.converted) || 0;
-        els.status.textContent = count
-          ? `${count} location${count === 1 ? "" : "s"} converted in the database: marked converted and approved`
-          : "No newly converted annotations in the database";
+        const removed = (result.removed || []).length;
+        const plural = (n) => (n === 1 ? "" : "s");
+        const parts = [];
         if (count) {
-          await loadCatalog(false, true);
-          await refreshBuilds(build.set, build.volume);
+          parts.push(`${count} location${plural(count)} converted in the database: marked converted and approved`);
         }
+        if (removed) {
+          parts.push(`${removed} card${plural(removed)} removed: the location${plural(removed)} no longer exist${removed === 1 ? "s" : ""} (merged or deleted)`);
+        }
+        els.status.textContent = parts.length ? parts.join(" · ") : "Nothing changed in the database since the last update";
+        // The links are read again every time, so the catalog (cards and links) reloads even when no card changed.
+        await loadCatalog(false, true);
+        await refreshBuilds(build.set, build.volume);
       } catch (error) {
         els.status.textContent = `Update failed: ${error.message || error}`;
       } finally {
