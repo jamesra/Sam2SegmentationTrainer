@@ -434,7 +434,9 @@
       col += width;
     }
     const rootCard = cardById.get(rootId);
-    cells.push({ id: rootId, row: rootRow, col, w: rootCard.w, h: rootCard.h, group: -1, kind: "branch" });
+    // `root` marks where the tree hangs from, so the viewer can open on it: the root sits right of its processes and
+    // can start below the first rows, so the top-left of a wide tree may hold no card at all.
+    cells.push({ id: rootId, row: rootRow, col, w: rootCard.w, h: rootCard.h, group: -1, kind: "branch", root: true });
     for (let r = rootRow; r < rootRow + rootCard.h; r++) {
       occupied.add(key(r, col));
       rightLimit.set(r, col + rootCard.w);

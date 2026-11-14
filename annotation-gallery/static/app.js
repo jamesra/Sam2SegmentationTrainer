@@ -57,6 +57,8 @@
     // The converter's location links ([a, b] pairs) and a counter that changes when the layout must be redone.
     convLinks: [],
     layoutEpoch: 0,
+    // Set when the process / branch layout is opened: the next render scrolls to the first tree's root card.
+    jumpToRoot: false,
     tagIds: null,
     filterNote: "",
     cropSize: 1024,
@@ -2611,7 +2613,9 @@
     });
     const laid = window.ProcessLayout.layoutProcesses({ cards: input, links: state.convLinks, maxColumns: viewColumns });
     const byId = new Map(cards.map((windows) => [String(windows[0].location_id), windows[0]]));
-    const cells = laid.cells.map((cell) => ({ row: byId.get(cell.id), gr: cell.row, gc: cell.col, group: cell.group }));
+    const cells = laid.cells.map((cell) => ({
+      row: byId.get(cell.id), gr: cell.row, gc: cell.col, group: cell.group, root: Boolean(cell.root),
+    }));
     const packed = {
       columns: Math.max(laid.columns, viewColumns),
       viewColumns,
@@ -2724,7 +2728,7 @@
     if (force && filtersCollapsed()) {
       updateFilterSummary();
     }
-    const scroll = els.scroller.scrollTop;
+    let scroll = els.scroller.scrollTop;
     const viewH = els.scroller.clientHeight || 1;
     const page = viewH;
     const covers = !force
@@ -2748,6 +2752,10 @@
     els.spacer.style.width = wide ? `${fullWidth + 32}px` : "";
     els.grid.style.gridAutoRows = `${Math.max(1, baseHeight - GRID_GAP)}px`;
     els.spacer.style.height = `${rowOffsets[rowOffsets.length - 1] || baseHeight}px`;
+    if (state.jumpToRoot && cards.length) {
+      state.jumpToRoot = false;
+      scroll = jumpToLayoutRoot(cells, rowOffsets, cardPx, baseHeight, viewH);
+    }
     const missNote = cards.length ? "" : locationMissNote();
     const notes = [state.filterNote, missNote].filter(Boolean).join(" · ");
     els.status.textContent = `${cards.length} location(s) · ${state.permission}${notes ? ` · ${notes}` : ""}`;
@@ -2786,6 +2794,25 @@
       render(true, reuse);
       measuringRow = false;
     }
+  }
+
+  // Scroll the process / branch layout so the first tree's root card is centred, and return the new scrollTop. The
+  // layout puts a root right of its processes and below the strings that run up from it, so opening at the top-left
+  // can show an empty screen while hundreds of cards sit off to the right. Other layouts, or one without a tree, open
+  // at the top-left.
+  function jumpToLayoutRoot(cells, rowOffsets, cardPx, baseHeight, viewH) {
+    const root = layoutActive() ? cells.find((cell) => cell.root) : null;
+    if (!root) {
+      els.scroller.scrollTop = 0;
+      els.scroller.scrollLeft = 0;
+      return els.scroller.scrollTop;
+    }
+    const viewW = els.scroller.clientWidth || 1;
+    // 16px: the grid's left margin inside the scroller.
+    const left = 16 + root.gc * (cardPx + GRID_GAP);
+    els.scroller.scrollLeft = Math.max(0, left - (viewW - cardPx) / 2);
+    els.scroller.scrollTop = Math.max(0, (rowOffsets[root.gr] || 0) - (viewH - baseHeight) / 2);
+    return els.scroller.scrollTop;
   }
 
   function scheduleRender() {
@@ -2898,6 +2925,8 @@
         : (state.hasCardScores
           ? [{ key: "cardMismatch", desc: true }]
           : [{ key: hasLoss ? "loss" : "z", desc: hasLoss }]);
+      // A newly opened build starts on its root card (render clears the flag once there are cards to place).
+      state.jumpToRoot = state.converter;
     }
     watchCatalogRescores();
     renderSortStack();
@@ -4006,6 +4035,7 @@
     }
     if (select.value === LAYOUT_SORT) {
       state.sorts = [{ key: LAYOUT_SORT, desc: false }];
+      state.jumpToRoot = true;
     } else if (layoutActive()) {
       state.sorts = [{ key: select.value, desc: false }];
     } else {
