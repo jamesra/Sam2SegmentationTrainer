@@ -434,11 +434,13 @@ def viking_link(
 
     One database can have several annotation contexts under one name (RC1 has three VikingXMLs); by name Identity
     picks the first. ``context_id`` (with its ``viking_xml``) names the context the gallery works in, so Viking opens
-    or jumps to that one, the same images the cards were cut from.
+    or jumps to that one, the same images the cards were cut from. The link carries it as ``context=``: Viking finds the
+    window with exactly that context open by it, where the name would match any RC1 window.
     """
     place = "&location=" + quote(location, safe="") + ("&propose=1" if propose else "")
     target = ("volume=" + quote(viking_xml, safe="") + "&") if viking_xml else ""
-    plain = "viking://open?" + target + "volumeName=" + quote(identity_name, safe="") + place
+    context = f"&context={context_id}" if context_id is not None else ""
+    plain = "viking://open?" + target + "volumeName=" + quote(identity_name, safe="") + context + place
     volume_key = str(context_id) if context_id is not None else identity_name
     try:
         payload = http_json(
@@ -454,6 +456,9 @@ def viking_link(
     url = str((payload or {}).get("viking_url") or "")
     if not url.lower().startswith("viking://"):
         return plain
+    # Identity adds context= itself from Viking dev 2026-11-13 on; an older Identity does not.
+    if context and "context=" not in url:
+        url += context
     return url + place
 
 

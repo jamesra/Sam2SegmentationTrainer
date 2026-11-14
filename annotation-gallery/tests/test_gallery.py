@@ -1448,13 +1448,19 @@ def test_viking_link_asks_for_the_gallerys_annotation_context_by_id() -> None:
 
     url = viking_link("https://i", "tok", "RC1", "7", http_json, context_id=20107, viking_xml="https://s/RC1_Crush/v.VikingXML")
     assert json.loads(calls[0][1]["body"]) == {"volume_name": "20107"}
-    assert url.endswith("&location=7")
+    assert url.endswith("&context=20107&location=7"), "Viking picks the window by the context id"
+
+    def identity_with_context(url, **kwargs):
+        return {"viking_url": "viking://open?code=abc&context=20107&volumeName=RC1"}
+
+    url = viking_link("https://i", "tok", "RC1", "7", identity_with_context, context_id=20107)
+    assert url.count("context=") == 1
 
     def refuse(url, **kwargs):
         raise IdentityHttpError(403, "forbidden")
 
     plain = viking_link("https://i", "tok", "RC1", "7", refuse, context_id=20107, viking_xml="https://s/RC1_Crush/v.VikingXML")
-    assert plain == "viking://open?volume=https%3A%2F%2Fs%2FRC1_Crush%2Fv.VikingXML&volumeName=RC1&location=7"
+    assert plain == "viking://open?volume=https%3A%2F%2Fs%2FRC1_Crush%2Fv.VikingXML&volumeName=RC1&context=20107&location=7"
 
 
 def test_working_context_is_the_one_reading_the_volumes_vikingxml(monkeypatch: pytest.MonkeyPatch) -> None:
