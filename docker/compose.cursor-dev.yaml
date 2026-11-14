@@ -52,7 +52,7 @@ x-gallery-env: &gallery-env
   GALLERY_SEGMENTATION_TARGET: "${GALLERY_SEGMENTATION_TARGET:-host.docker.internal:40448}"
   GALLERY_SEGMENTATION_TLS_NAME: "${GALLERY_SEGMENTATION_TLS_NAME:-segmentation.codepharm.net}"
   GALLERY_CONVERTER_VIKINGXML: "${GALLERY_CONVERTER_VIKINGXML:-http://rogue1.codepharm.net/<volume>/SliceToVolume.VikingXML}"
-  GALLERY_CONVERTER_VIKINGXML_RC1: "${GALLERY_CONVERTER_VIKINGXML_RC1:-http://rogue1.codepharm.net/RABBIT/rogue1.vikingxml}"
+  GALLERY_CONVERTER_VIKINGXML_RC1: "${GALLERY_CONVERTER_VIKINGXML_RC1:-https://storage2.connectomes.pitt.edu/RC1_Crush/SliceToVolume.VikingXML}"
   GALLERY_CONVERTER_TILE_CACHE: "${GALLERY_CONVERTER_TILE_CACHE:-/data-local/converter/tile-cache}"
 
 x-nornir-buildmanager: &nornir-buildmanager
