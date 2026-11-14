@@ -13,7 +13,7 @@ import re
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import catalog
 
@@ -244,17 +244,53 @@ def apply_edit(crops: Path, location_id: int, image_key: str, rings: Any) -> Dic
     return {"ok": True, "location_id": location_id, "iou": ratio, "candidate_wkt": wkt}
 
 
+CONVERTED = "converted"
+"""Card state for a location that someone converted outside this build (in Viking): its annotation is now a polygon in the
+database. The card is approved like one accepted here, but it is not in the batch, which must not write it again."""
+
+POLYGON_TYPE_CODES = (4, 6)
+"""Viking's POLYGON and CURVEPOLYGON: what an annotation becomes once it is converted."""
+
+
+def mark_converted(crops: Path, polygon_ids: Iterable[int]) -> List[int]:
+    """Mark the cards of locations that are polygons in the database now but were not when the card was built.
+
+    ``polygon_ids`` are the structure's locations OData lists as polygons. A card built from a polygon is left alone (its
+    source was already one). Returns the location ids whose cards changed, so the caller can approve them.
+    """
+    wanted = {int(location_id) for location_id in polygon_ids}
+    if not wanted or not catalog.sqlite_path(crops).is_file() or not _has_cards(crops):
+        return []
+    codes = ",".join(str(code) for code in POLYGON_TYPE_CODES)
+    connection = catalog.connect(crops)
+    try:
+        rows = connection.execute(
+            f"SELECT DISTINCT location_id FROM converter_cards WHERE state <> ? AND (type_code IS NULL OR type_code NOT IN ({codes}))",
+            [CONVERTED],
+        ).fetchall()
+        changed = sorted(int(row[0]) for row in rows if int(row[0]) in wanted)
+        connection.executemany(
+            "UPDATE converter_cards SET state = ?, reason = ? WHERE location_id = ?",
+            [(CONVERTED, "converted in the database", location_id) for location_id in changed],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return changed
+
+
 def build_summary(crops: Path) -> Dict[str, Any]:
-    """Counts for the build picker: cards built and failed, and how many of the built ones are approved or rejected."""
+    """Counts for the build picker: cards built and failed, and how many of the built ones are approved or rejected.
+    Cards converted in the database count as built and approved: they are done."""
     rows = card_rows(crops)
-    built = [row for row in rows if row["state"] == "built"]
+    built = [row for row in rows if row["state"] in ("built", CONVERTED)]
     approved = catalog.load_approved(crops)
     rejected = {int(row["location_id"]) for row in catalog.list_catalog_rows(crops) if row.get("ignored")}
     built_ids = {int(row["location_id"]) for row in built}
     stamps = [row["built_at"] for row in rows if row.get("built_at")]
     return {
         "built": len(built),
-        "failed": len(rows) - len(built),
+        "failed": sum(1 for row in rows if row["state"] == "failed"),
         "approved": len({location for location, _ in approved if location in built_ids}),
         "rejected": len(rejected & built_ids),
         "updated": max(stamps) if stamps else None,

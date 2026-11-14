@@ -32,6 +32,7 @@
     <select id="converter-build-select" title="A structure that was converted, in the volume it belongs to"></select>
     <button type="button" id="converter-new" class="primary review-only" title="Choose a structure and convert its annotations into proposed polygons">+ Convert a structure</button>
     <button type="button" id="converter-continue" class="review-only" title="Build the cards of this structure that are missing, and retry the failed ones. Cards already built are kept.">Continue build</button>
+    <button type="button" id="converter-sync" class="review-only" title="Check the database for annotations of this build that are polygons now (converted in Viking) and mark their cards converted and approved, as if accepted here. They stay out of the batch.">Update</button>
     <button type="button" id="converter-delete" class="review-only" title="Delete this build: its cards, masks and approvals. Annotations in the database are not touched.">Delete build…</button>
     <button type="button" id="converter-failed" hidden title="Locations that could not be converted, and why">Failed</button>
     <span id="converter-counts" class="converter-counts" aria-live="polite"></span>

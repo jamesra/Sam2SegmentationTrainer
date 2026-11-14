@@ -158,6 +158,43 @@ def test_approve_puts_a_card_in_the_batch_and_unapprove_takes_it_out(httpd) -> N
     assert request(httpd, "GET", f"/api/volumes/RC1/converter/batch?set={SET}")[1] == b""
 
 
+def test_update_marks_cards_converted_in_viking_as_converted_and_approved(
+    httpd, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Locations that are polygons in OData now were converted in Viking: their cards are approved like ones accepted
+    here, but they stay out of the batch, which must not write them a second time."""
+    from converter import jobs
+
+    (built / "source.json").write_text(json.dumps({"kind": "converter", "odata": "http://odata.test/RC1/OData", "structureId": 500}))
+    asked: list = []
+
+    def odata(url: str):
+        asked.append(url)
+        return {"value": [{"ID": 11}, {"ID": 13}]}
+
+    monkeypatch.setitem(jobs.OVERRIDES, "get_json", odata)
+    status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/sync?set={SET}", {})
+    payload = json.loads(raw)
+    assert status == 200 and payload["converted"] == 2 and payload["location_ids"] == [11, 13]
+    from urllib.parse import unquote
+
+    query = unquote(asked[0])
+    assert "ParentID eq 500" in query and "TypeCode eq 4" in query and "TypeCode eq 6" in query
+
+    cards = {c["location_id"]: c for c in get_json(httpd, f"/api/volumes/RC1/converter/cards?set={SET}")[1]["cards"]}
+    assert cards[11]["state"] == "converted" and cards[13]["state"] == "converted" and cards[12]["state"] == "built"
+    rows = {row["location_id"]: row for row in get_json(httpd, f"/api/volumes/RC1/catalog?set={SET}")[1]["rows"]}
+    assert rows[11]["approved"] and not rows[12]["approved"]
+    assert request(httpd, "GET", f"/api/volumes/RC1/converter/batch?set={SET}")[1] == b""
+    summary = web.build_summary(built)
+    # The failed card 13 was converted in Viking too: it is done, so it counts as built and approved, not failed.
+    assert (summary["built"], summary["failed"], summary["approved"]) == (3, 0, 2)
+
+    # A second Update finds nothing new.
+    status, raw, _ = request(httpd, "POST", f"/api/volumes/RC1/converter/sync?set={SET}", {})
+    assert status == 200 and json.loads(raw)["converted"] == 0
+
+
 def _wait_for(condition, seconds: float = 5.0) -> None:
     deadline = time.time() + seconds
     while not condition():

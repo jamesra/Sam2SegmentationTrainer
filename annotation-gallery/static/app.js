@@ -5058,6 +5058,35 @@
       const [set, volume] = document.getElementById("converter-build-select").value.split("|");
       return (state.builds || []).find((build) => build.set === set && build.volume === volume) || null;
     };
+    // Update: cards whose annotations were converted in Viking are marked converted and approved, then the grid reloads
+    // so they drop out of the process layout like cards accepted here.
+    document.getElementById("converter-sync").addEventListener("click", async () => {
+      const build = currentBuild();
+      if (!build) {
+        return;
+      }
+      const button = document.getElementById("converter-sync");
+      button.disabled = true;
+      try {
+        const result = await getJson(`/api/volumes/${encodeURIComponent(build.volume)}/converter/sync?set=${encodeURIComponent(build.set)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const count = Number(result.converted) || 0;
+        els.status.textContent = count
+          ? `${count} location${count === 1 ? "" : "s"} converted in the database: marked converted and approved`
+          : "No newly converted annotations in the database";
+        if (count) {
+          await loadCatalog(false, true);
+          await refreshBuilds(build.set, build.volume);
+        }
+      } catch (error) {
+        els.status.textContent = `Update failed: ${error.message || error}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
     document.getElementById("converter-delete").addEventListener("click", () => {
       const build = currentBuild();
       if (!build) {

@@ -242,6 +242,18 @@ def iter_links(base: str, structure_id: int, *, get_json: GetJson = http_get_jso
                     yield (a, b) if a < b else (b, a)
 
 
+def iter_type_coded_ids(
+    base: str, structure_id: int, type_codes: Sequence[int], *, get_json: GetJson = http_get_json
+) -> Iterator[int]:
+    """The ids of the structure's locations that have one of ``type_codes`` now, page by page (ids only: cheap)."""
+    expression = filter_text(structure_id, type_codes=type_codes)
+    url = f"{base.rstrip('/')}/Locations?$filter={quote(expression, safe='()/')}&$select=ID&$orderby=ID"
+    for page in iter_pages(url, get_json):
+        for entity in page.get("value") or []:
+            if isinstance(entity, dict) and entity.get("ID") is not None:
+                yield int(entity["ID"])
+
+
 def count_locations(base: str, structure_id: int, *, get_json: GetJson = http_get_json, **filters: Any) -> int:
     """How many locations match, from ``$count`` on a one-row page."""
     url = f"{base.rstrip('/')}/Locations?$filter={quote(filter_text(structure_id, **filters), safe='()/')}&$count=true&$top=1&$select=ID"

@@ -939,6 +939,10 @@ class GalleryHandler(BaseHTTPRequestHandler):
         if match:
             self._handle_converter_edit(match.group(1))
             return
+        match = re.fullmatch(r"/api/volumes/([^/]+)/converter/sync", path)
+        if match:
+            self._handle_converter_sync(match.group(1))
+            return
         match = re.fullmatch(r"/api/volumes/([^/]+)/viking-link", path)
         if match:
             self._handle_viking_link(match.group(1))
@@ -1130,6 +1134,33 @@ class GalleryHandler(BaseHTTPRequestHandler):
             return
         started = converter_jobs.start_job(converter_jobs.new_job(set_name, volume, crops, params))
         self._send_json(started.snapshot())
+
+    def _handle_converter_sync(self, volume: str) -> None:
+        """POST: ask OData which of the build's annotations are polygons now (converted in Viking, not through this
+        build) and treat their cards as accepted here: approved, and marked converted so the batch leaves them out."""
+        if not self._review_granted(volume):
+            return
+        crops = self._granted_crops(volume)
+        if crops is None:
+            return
+        source = load_source_document(crops)
+        try:
+            structure_id = int(source.get("structureId"))
+        except (TypeError, ValueError):
+            self._send_json({"error": "this is not a converter build"}, status=400)
+            return
+        get_json = converter_jobs.OVERRIDES.get("get_json", odata_module.http_get_json)
+        try:
+            polygons = list(odata_module.iter_type_coded_ids(
+                odata_endpoint(volume, source), structure_id, converter_web.POLYGON_TYPE_CODES, get_json=get_json,
+            ))
+        except Exception as error:  # an unreachable or failing endpoint is reported, nothing is changed
+            self._send_json({"error": f"OData could not be read: {str(error)[:200]}"}, status=502)
+            return
+        changed = converter_web.mark_converted(crops, polygons)
+        if changed:
+            review_locations(crops, changed, "approve")
+        self._send_json({"ok": True, "converted": len(changed), "location_ids": changed})
 
     def _handle_converter_edit(self, volume: str) -> None:
         """POST {location_id, image_key, rings}: a retraced outline replaces the card's proposal (the batch, not the database)."""

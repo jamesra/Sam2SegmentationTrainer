@@ -112,6 +112,9 @@
     if (card.model_id) {
       lines.push(`model ${String(card.model_id).replace(/[<>&]/g, "")}`);
     }
+    if (card.state === "converted") {
+      lines.push("converted in the database (not in the batch)");
+    }
     if (card.state === "failed" && card.reason) {
       lines.push(`not built: ${String(card.reason).replace(/[<>&]/g, "")}`);
     }
