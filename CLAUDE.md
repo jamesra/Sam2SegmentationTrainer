@@ -16,6 +16,8 @@ loads it when it reads or edits a matching file. After adding or editing a `.cur
 | `.cursor/rules/sam2-pin.mdc` | `docker/Dockerfile` and SAM2 integration (pin `SAM2_GIT_SHA`; tell James when upstream `main` is newer, never unpin silently) |
 | `.cursor/rules/circle-centre-xy.mdc` | Circle annotations in the converter, gallery and exporter: centre is OData `X`, `Y`, never the first point or any average of the `CIRCULARSTRING` ring; `Radius` is mosaic-only. |
 | `.cursor/rules/naming-conventions.mdc` | Naming or exporting training sets (`v#.#`) and models (`v<VERSION>.<EPOCH>`), their metadata sidecars (`training_set.json`, `<stem>.model.json` with an operator `description`), `scripts/WSL/**`, `export_serve.py`, `model_manifest.py`, `data_record.py`. Sets and models have separate version numbers; say which one you mean. |
+| `.cursor/rules/serve-train-prompt-parity.mdc` | `prompt_encoding.py`, prompt building, export, plan docs: serving must encode prompts exactly as training does; bump `PROMPT_ENCODING_VERSION` on any change; lists the five known serve-time mismatches in the server's tiled walk. |
+| `.cursor/rules/circle-prompts.mdc` | Circle prompts in data, config and plan docs: the trainer scales radii, the exporter never does; annotator circles are negatives only; the seed taper is trained, not served on v5; pointers to the v7 trust and carried-circle plans. |
 
 ## Skills (`.cursor/skills/<name>/SKILL.md`)
 
