@@ -27,3 +27,4 @@ Same `SKILL.md` format as Claude skills. Read the SKILL.md when the task matches
 | Skill | Use for |
 |-------|---------|
 | `sam2-grounding` | Planning or editing SAM2 fine-tuning, export-for-serve, checkpoints, Hydra configs or Meta `sam2` API use. Points at the canonical skill in the Viking repo. |
+| `sam2trainer-startup` | Start of a session, or before pausing, resuming, evaluating or exporting a run: check `docs/status.md` against the logs, where everything is, which doc answers what, safe run handling. |
