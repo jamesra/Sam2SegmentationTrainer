@@ -36,7 +36,7 @@ todos:
     content: "Model/caches: run the compiled parity forward under _gpu_lock; validate shapes and orig_hw when loading a disk embedding blob; make flush_stale re-runnable; cap queued predictor builds."
     status: pending
   - id: r2-client
-    content: "Viking client (VikingLegacy-Maintenance first, mirror to VikingLegacy): readable messages for DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED from tile streams. Legacy endpoint remap for http://host with no port is a question for you (see decisions)."
+    content: "Viking client (VikingLegacy-Maintenance first, mirror to Viking-Net4.8): readable messages for DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED from tile streams. Legacy endpoint remap for http://host with no port is a question for you (see decisions)."
     status: pending
 isProject: false
 ---
