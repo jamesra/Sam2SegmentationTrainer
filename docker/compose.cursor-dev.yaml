@@ -45,14 +45,14 @@ x-gallery-env: &gallery-env
   GALLERY_READ_PERMISSION: "${GALLERY_READ_PERMISSION:-Read}"
   GALLERY_REVIEW_PERMISSION: "${GALLERY_REVIEW_PERMISSION:-Annotate}"
   # The converter (/converter/) and gold review (/gold/) pages. Each is off when its root is empty. The roots are under the
-  # mirror, so TEM and SEM keep their own. The converter needs a segmentation server and a VikingXML (<volume> is replaced
-  # by the volume name; RC1's VikingXML is in an older format the converter cannot read yet).
+  # mirror, so TEM and SEM keep their own. The converter needs a segmentation server. It works in each volume's
+  # annotation-database default context (Identity) and reads that context's VikingXML; GALLERY_CONVERTER_VIKINGXML (<volume>
+  # is replaced by the volume name) is used only when the server names no context for the volume.
   GALLERY_CONVERTER_ROOT: "${GALLERY_CONVERTER_ROOT-/data-local/converter}"
   GALLERY_GOLD_ROOT: "${GALLERY_GOLD_ROOT-/data-local/gold}"
   GALLERY_SEGMENTATION_TARGET: "${GALLERY_SEGMENTATION_TARGET:-host.docker.internal:40448}"
   GALLERY_SEGMENTATION_TLS_NAME: "${GALLERY_SEGMENTATION_TLS_NAME:-segmentation.codepharm.net}"
   GALLERY_CONVERTER_VIKINGXML: "${GALLERY_CONVERTER_VIKINGXML:-http://rogue1.codepharm.net/<volume>/SliceToVolume.VikingXML}"
-  GALLERY_CONVERTER_VIKINGXML_RC1: "${GALLERY_CONVERTER_VIKINGXML_RC1:-https://storage2.connectomes.pitt.edu/RC1_Crush/SliceToVolume.VikingXML}"
   GALLERY_CONVERTER_TILE_CACHE: "${GALLERY_CONVERTER_TILE_CACHE:-/data-local/converter/tile-cache}"
 
 x-nornir-buildmanager: &nornir-buildmanager

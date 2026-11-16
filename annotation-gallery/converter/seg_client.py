@@ -322,13 +322,25 @@ def _same_url(first: str, second: str) -> bool:
     return first.strip().rstrip("/").lower() == second.strip().rstrip("/").lower()
 
 
+def _is_database_default(volume: Any) -> bool:
+    """Whether the context is its annotation database's default (Identity's Default Annotation Context)."""
+    context_id = int(getattr(volume, "annotation_context_id", 0) or 0)
+    return context_id > 0 and context_id == int(getattr(volume, "database_default_context_id", 0) or 0)
+
+
 def context_for(volumes: Sequence[Any], volume_name: str, viking_xml: str = "") -> Optional[Any]:
-    """The server's context for a volume. One volume can have several contexts of the same name, each reading another
-    VikingXML (RC1 has three, with different image sets), so a caller that knows its VikingXML names it and gets the
-    context reading that file, or None. Without a VikingXML the name decides, and only when it is not ambiguous."""
+    """The server's context for a volume. One volume can have several contexts of the same name (RC1 has three, over
+    one annotation database), so the database's default context decides: the context the gallery works in. A caller that
+    knows its VikingXML names it and gets a context reading that file, the default among them, or None. Without a
+    VikingXML: the database default, else the only context of that name, else None."""
     named = [volume for volume in volumes if volume.name.lower() == volume_name.lower()]
     if viking_xml:
-        return next((volume for volume in named if _same_url(str(getattr(volume, "viking_xml", "")), viking_xml)), None)
+        named = [volume for volume in named if _same_url(str(getattr(volume, "viking_xml", "")), viking_xml)]
+    default = next((volume for volume in named if _is_database_default(volume)), None)
+    if default is not None:
+        return default
+    if viking_xml:
+        return named[0] if named else None
     return named[0] if len(named) == 1 else None
 
 

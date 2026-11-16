@@ -1478,6 +1478,32 @@ def test_working_context_is_the_one_reading_the_volumes_vikingxml(monkeypatch: p
     assert jobs.working_context("RC1", "https://elsewhere/x.VikingXML") is None
 
 
+def test_working_context_is_the_annotation_databases_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from converter import jobs
+
+    crush = "https://s2/RC1_Crush/SliceToVolume.VikingXML"
+    # Two contexts read the same file over one database (RC1 2 and 20107); the database names 2 as its default.
+    contexts = [
+        SimpleNamespace(annotation_context_id=20107, database_default_context_id=2, name="RC1", viking_xml=crush),
+        SimpleNamespace(annotation_context_id=2, database_default_context_id=2, name="RC1", viking_xml=crush),
+        SimpleNamespace(annotation_context_id=20045, database_default_context_id=2, name="RC1", viking_xml="https://s1/V2.VikingXML"),
+    ]
+    monkeypatch.setattr(jobs, "server_volumes", lambda: contexts)
+    monkeypatch.setenv("GALLERY_CONVERTER_VIKINGXML", "http://template/{volume}.xml")
+
+    assert jobs.working_context("RC1").annotation_context_id == 2
+    assert jobs.working_context("RC1", crush).annotation_context_id == 2, "the default among the contexts reading the file"
+    assert jobs.working_viking_xml("RC1") == crush, "tiles come from the default context's VikingXML, not the template"
+
+    # Without a default, several contexts of one name are ambiguous and the template stands.
+    for context in contexts:
+        context.database_default_context_id = 0
+    assert jobs.working_context("RC1") is None
+    assert jobs.working_viking_xml("RC1") == "http://template/RC1.xml"
+
+
 def test_tokens_are_kept_server_side_and_expire() -> None:
     from server import forget_token, recall_token, remember_token
 

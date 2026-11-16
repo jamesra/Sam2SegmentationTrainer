@@ -76,7 +76,6 @@ from converter import serverreview
 from converter import web as converter_web
 from converter.builder import BuildParams
 from converter.tilesource import load_volume as load_viking_volume
-from converter.tilesource import viking_xml_url
 import score as score_module
 from gold import draw as gold_draw
 from gold import store as gold_store
@@ -1433,7 +1432,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
             # The tilesets the segmentation could use, fit ones first. One is used without asking; the dialog offers a
             # choice only when there are several.
             params = self._build_params(volume, structure_id, body)
-            names = converter_jobs.volume_tilesets(volume, params.viking_xml or viking_xml_url(volume))
+            names = converter_jobs.volume_tilesets(volume, params.viking_xml or "")
             if names and "error" not in counts[volume]:
                 counts[volume]["tilesets"] = names
         self._send_json({"structureId": structure_id, "volumes": counts})
@@ -1552,16 +1551,16 @@ class GalleryHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "login required", "login": "/login"}, status=401)
             return
         api = os.environ.get("GALLERY_IDENTITY_API") or "https://identity.codepharm.net:6001"
-        # The context the converter reads (the same setting that picks its tiles); by name when the server has none.
+        # The context the gallery works in (the annotation database's default); by name when the server names none.
         tiles = self._volume_source(volume).get("tiles")
-        viking_xml = str((tiles or {}).get("vikingXml") or "").strip() if isinstance(tiles, dict) else ""
-        viking_xml = viking_xml or viking_xml_url(volume)
-        context = converter_jobs.working_context(volume, viking_xml) if viking_xml else None
+        own_xml = str((tiles or {}).get("vikingXml") or "").strip() if isinstance(tiles, dict) else ""
+        context = converter_jobs.working_context(volume, own_xml)
         context_id = int(context.annotation_context_id) if context is not None else None
+        viking_xml = str(getattr(context, "viking_xml", "") or "") if context is not None else ""
         try:
             url = viking_link(
                 api, token, identity_name, location, propose=body.get("propose") is True,
-                context_id=context_id, viking_xml=viking_xml if context is not None else "",
+                context_id=context_id, viking_xml=viking_xml,
             )
         except IdentityHttpError as exc:
             status = 401 if exc.status == 401 else 502

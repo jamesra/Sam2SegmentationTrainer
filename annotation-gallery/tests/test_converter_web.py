@@ -603,17 +603,21 @@ def test_a_volume_the_segmentation_server_cannot_read_is_greyed_out_and_cannot_b
     assert status == 409 and "Missing local images" in refused["error"]
 
 
-def test_preview_offers_the_tilesets_of_the_context_that_reads_the_volumes_vikingxml(clean_httpd, tmp_path: Path, monkeypatch) -> None:
+def test_preview_offers_the_tilesets_of_the_annotation_databases_default_context(clean_httpd, tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GALLERY_CONVERTER_VIKINGXML", "http://x/{volume}.xml")
     (tmp_path / "gallery-volumes" / "RC2").mkdir(parents=True)
     client = fixtures.FakeSegmenter(lambda _id: None)
     client.status = lambda: SimpleNamespace(
         model=SimpleNamespace(contract_json=""),
         readable_volumes=[
-            # RC1 has two contexts: only the one reading the gallery's VikingXML counts, and its two filters are offered.
-            SimpleNamespace(name="RC1", readable=True, viking_xml="http://x/RC1.xml", tilesets=["TEM.Raw8", "TEM.Leveled"]),
-            SimpleNamespace(name="RC1", readable=True, viking_xml="http://y/crush.xml", tilesets=["TEM.Raw8"]),
-            SimpleNamespace(name="RC2", readable=True, viking_xml="http://x/RC2.xml", tilesets=["TEM.Leveled"]),
+            # RC1 has two contexts over one database: the database's default (8) counts, not the template's file.
+            SimpleNamespace(annotation_context_id=2, database_default_context_id=8, name="RC1", readable=True,
+                            viking_xml="http://x/RC1.xml", tilesets=["TEM.Raw8"]),
+            SimpleNamespace(annotation_context_id=8, database_default_context_id=8, name="RC1", readable=True,
+                            viking_xml="http://y/crush.xml", tilesets=["TEM.Raw8", "TEM.Leveled"]),
+            # RC2's database names no default: its only context is used.
+            SimpleNamespace(annotation_context_id=15, database_default_context_id=0, name="RC2", readable=True,
+                            viking_xml="http://x/RC2.xml", tilesets=["TEM.Leveled"]),
         ],
     )
     jobs.OVERRIDES["make_client"] = lambda: client

@@ -27,11 +27,14 @@ LOCATION_LEVEL = 1
 def readable_context(client: Any, volume_name: str, viking_xml: str = "") -> Any:
     """The server's annotation context that reads ``viking_xml`` for ``volume_name``. SegmentLocation needs the server to
     read the volume's images itself (the gallery never uploads tiles to it); a volume it cannot read is refused here, as
-    the build dialog shows it greyed out. The VikingXML picks the context because a volume can have several of one name,
-    each with other images: the cards show this file's tiles, so the segmentation must read the same ones."""
+    the build dialog shows it greyed out. A volume can have several contexts of one name, each with other images: without
+    a VikingXML the annotation database's default context is used (the one whose tiles the cards show)."""
     volume = client.readable_volume(volume_name, viking_xml)
     if volume is None:
-        where = f" reading {viking_xml}" if viking_xml else ""
+        where = (
+            f" reading {viking_xml}" if viking_xml
+            else " (several contexts read it: set the annotation database's default context in Identity)"
+        )
         raise SegmentationFailed(f"no_local_images: the segmentation server has no context for {volume_name}{where}")
     if not volume.readable:
         raise SegmentationFailed(f"no_local_images: the segmentation server cannot read {volume_name}'s images")

@@ -529,6 +529,10 @@ message ReadableVolume {
   // The tilesets any section of the context's VikingXML has, sorted by name, such as "TEM.Leveled" and "TEM.Raw8".
   // A section has none, one or several of them.
   repeated string tilesets = 5;
+  // The default context of the context's annotation database (Identity: the annotation database's Default Annotation
+  // Context), 0 when it names none. Several contexts can read one database (RC1 has three); a client that does not
+  // choose a VikingXML itself works in the context whose annotation_context_id equals this.
+  int64 database_default_context_id = 6;
 }
 
 // The identity and feeding contract of the served model, from the model's manifest, which travels with the weights.

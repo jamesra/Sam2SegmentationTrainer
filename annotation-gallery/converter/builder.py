@@ -44,7 +44,7 @@ from converter.cardgeom import (  # noqa: F401 - re-exported: scoring and tests 
 from converter.engines.tiled import TiledEngine, choose_tileset, readable_context
 from converter.engines.window import WindowEngine
 from converter.seg_client import SegmentationClient, SegmentationFailed
-from converter.tilesource import SectionTiles, TileCache, Volume, viking_xml_url
+from converter.tilesource import SectionTiles, TileCache, Volume
 
 LOGGER = logging.getLogger("converter.builder")
 SCHEMA = """
@@ -212,8 +212,9 @@ class Builder:
                 params.volume, client, self._section, self._levels, threshold=params.threshold, semaphore=semaphore
             )
         else:
-            # The cards show this VikingXML's tiles, so the server segments the context that reads the same file.
-            context = readable_context(client, params.volume, params.viking_xml or viking_xml_url(params.volume))
+            # The cards show the working context's tiles (or the build's own VikingXML's), so the server segments the
+            # context that reads the same file: the annotation database's default context when no file is named.
+            context = readable_context(client, params.volume, params.viking_xml or "")
             self.tileset_name = choose_tileset(context.tilesets, params.tileset)
             self.engine = TiledEngine(
                 params.volume, client, annotation_context_id=int(context.annotation_context_id),

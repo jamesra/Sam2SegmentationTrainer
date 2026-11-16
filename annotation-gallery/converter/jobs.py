@@ -77,8 +77,7 @@ def default_client(environ: Optional[Dict[str, str]] = None) -> SegmentationClie
 def default_volume(volume_name: str, environ: Optional[Dict[str, str]] = None) -> Volume:
     """The volume's tilesets from its VikingXML: ``GALLERY_CONVERTER_VIKINGXML`` is a URL template with ``{volume}``
     (or ``<volume>``, which survives compose's variable substitution)."""
-    # One volume can have its own address (RC1's VikingXML is not at the usual place): GALLERY_CONVERTER_VIKINGXML_RC1.
-    url = viking_xml_url(volume_name, environ)
+    url = working_viking_xml(volume_name, environ)
     if not url:
         raise ConverterNotConfigured("GALLERY_CONVERTER_VIKINGXML is not set (URL template of the VikingXML, with {volume})")
     return load_volume(url)
@@ -329,17 +328,28 @@ def missing_local_images(volumes: List[str]) -> List[str]:
     return [volume for volume in volumes if known is not None and volume.lower() not in known]
 
 
-def volume_tilesets(volume: str, viking_xml: str) -> List[str]:
-    """The tilesets of the server's context that reads ``viking_xml`` for ``volume``, fit ones first. Empty when the
-    server has no such context or cannot be asked."""
+def volume_tilesets(volume: str, viking_xml: str = "") -> List[str]:
+    """The tilesets of the context the gallery works in for ``volume`` (see :func:`working_context`), fit ones first.
+    Empty when the server has no such context or cannot be asked."""
     context = working_context(volume, viking_xml)
     return ordered_tilesets(getattr(context, "tilesets", ())) if context is not None else []
 
 
-def working_context(volume: str, viking_xml: str) -> Optional[Any]:
-    """The server's annotation context that reads ``viking_xml`` for ``volume``: the one the gallery works in, so Viking
-    links open it too. None when the server has no such context or cannot be asked."""
+def working_context(volume: str, viking_xml: str = "") -> Optional[Any]:
+    """The server's annotation context the gallery works in for ``volume``, so builds, segmentation and Viking links
+    all use it: the annotation database's default context (set in Identity), or the only context of that name. A
+    ``viking_xml`` (a volume's own source.json tiles) narrows it to the contexts reading that file. None when the server
+    has no such context or cannot be asked."""
     return context_for(server_volumes() or [], volume, viking_xml)
+
+
+def working_viking_xml(volume: str, environ: Optional[Dict[str, str]] = None) -> str:
+    """The VikingXML the gallery reads ``volume``'s tiles from: the working context's (:func:`working_context`), so the
+    cards show the images that context segments; ``GALLERY_CONVERTER_VIKINGXML`` (a URL template) when the server names
+    none. Empty when neither is known."""
+    context = working_context(volume)
+    url = str(getattr(context, "viking_xml", "") or "").strip() if context is not None else ""
+    return url or viking_xml_url(volume, environ)
 
 
 def server_volumes() -> Optional[List[Any]]:
