@@ -1,5 +1,11 @@
 """Display contrast for quantized ("crushed") tiles: a port of Viking's ``CrushInfo`` window and gamma rules.
 
+This is the one implementation every reader of tile images for user display shares: the gallery converter and score
+(``annotation-gallery/converter/tilesource.py``) and Nornir's training-crop export (``stitch.disk_tile_loader``), so a
+crop, a card and Viking all show the same gray for the same code. It lives in ``annotation_crops``, which both the
+gallery image and Nornir already import. Readers of already-exported crops (thumbnails, masks, the viewer) need nothing:
+the export has written display gray.
+
 Nornir's ``Quantized`` filter stores a small integer code per pixel (``floor(counts / step)``), not a contrast-stretched
 intensity, so the raw PNG looks nearly black. Viking shows it through a display window (black code .. white code) and a
 gamma; both come from the section's code histogram unless the user saves their own. This module reproduces Viking's
@@ -18,7 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 from xml.etree import ElementTree
 
 import numpy as np
@@ -28,19 +34,19 @@ STORAGE_MAXIMUM = 255.0
 MAX_BITS = 8
 
 
-def _attr_ci(node: ElementTree.Element, name: str) -> Optional[str]:
+def _attr_ci(attributes: Mapping[str, str], name: str) -> Optional[str]:
     lowered = name.lower()
-    for key, value in node.attrib.items():
-        if key.lower() == lowered:
+    for key, value in attributes.items():
+        if str(key).lower() == lowered:
             return value
     return None
 
 
-def _float(node: ElementTree.Element, name: str) -> Optional[float]:
-    value = _attr_ci(node, name)
+def _float(attributes: Mapping[str, str], name: str) -> Optional[float]:
+    value = _attr_ci(attributes, name)
     try:
         return float(value) if value is not None else None
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -60,26 +66,34 @@ class CrushInfo:
         return self.bits <= MAX_BITS
 
     @staticmethod
-    def from_element(element: ElementTree.Element) -> Optional["CrushInfo"]:
-        """The element's crush parameters, or None when it is not marked crushed or its attributes are unusable."""
-        if _attr_ci(element, "CrushVersion") is None:
+    def from_attributes(
+        attributes: Mapping[str, str], histogram: Optional[Sequence[int]] = None
+    ) -> Optional["CrushInfo"]:
+        """Crush parameters from ``Crush*`` attributes (VikingXML tileset or Nornir filter), or None when the element is
+        not marked crushed or its attributes are unusable. ``histogram`` is the per-code pixel count, if known."""
+        if _attr_ci(attributes, "CrushVersion") is None:
             return None
-        step, bits = _float(element, "CrushStep"), _float(element, "CrushBits")
+        step, bits = _float(attributes, "CrushStep"), _float(attributes, "CrushBits")
         if step is None or bits is None or int(step) < 1 or int(bits) < 1:
             return None
-        offset = _float(element, "CrushOffset")
-        low, high = _float(element, "CrushDisplayMin"), _float(element, "CrushDisplayMax")
+        offset = _float(attributes, "CrushOffset")
+        low, high = _float(attributes, "CrushDisplayMin"), _float(attributes, "CrushDisplayMax")
         display = (low, high) if low is not None and high is not None and high > low else None
+        counts = tuple(int(v) for v in histogram) if histogram is not None and len(histogram) else None
+        return CrushInfo(int(step), int(offset or 0), int(bits), display, counts)
+
+    @staticmethod
+    def from_element(element: ElementTree.Element) -> Optional["CrushInfo"]:
+        """:meth:`from_attributes` for a VikingXML element, reading its optional ``CodeHistogram`` child."""
         histogram = None
         for child in element:
             if child.tag.split("}")[-1].lower() == "codehistogram":
                 try:
-                    counts = tuple(int(part) for part in (child.text or "").split())
+                    histogram = [int(part) for part in (child.text or "").split()]
                 except ValueError:
-                    counts = ()
-                histogram = counts or None
+                    histogram = None
                 break
-        return CrushInfo(int(step), int(offset or 0), int(bits), display, histogram)
+        return CrushInfo.from_attributes(element.attrib, histogram)
 
     def _histogram_range(self, low_fraction: float, high_fraction: float) -> Optional[Tuple[float, float]]:
         """The codes holding the given fractions of the pixels, skipping bin 0 (the empty section edge)."""

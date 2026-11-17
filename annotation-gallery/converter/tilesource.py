@@ -29,7 +29,7 @@ from xml.etree import ElementTree
 import numpy as np
 from PIL import Image
 
-from converter.crush import CrushInfo, apply_display, display_lut
+from annotation_crops.crush_display import CrushInfo, apply_display, display_lut
 
 LOGGER = logging.getLogger("converter.tilesource")
 PROTOCOL_TILE = 1024
