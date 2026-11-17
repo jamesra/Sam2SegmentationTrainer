@@ -69,6 +69,13 @@ converter the edit replaces the proposal, in the gallery it is only shown.
 Each build is a training set `structure-<id>` under `GALLERY_CONVERTER_ROOT`, laid out like any crops folder, so the grid,
 viewer, approve and reject are the gallery's own.
 
+**Quantized tiles.** When the VikingXML tileset is Nornir's `Quantized` filter (it carries `CrushVersion`, `CrushStep`,
+`CrushBits` and a `CodeHistogram`), the tiles hold codes, not intensities. The converter fetches them as stored and shows
+them through Viking's default (Auto) window and gamma (`converter/crush.py`, a port of Viking's `CrushInfo`), so cards and
+segmentation tiles look as they do in Viking. Pick the filter with the build's `filter` field (`Quantized`). Contrast is not
+customisable yet; codes wider than 8 bits are left as stored, as in Viking.
+
+
 | Setting | Meaning |
 |---|---|
 | `GALLERY_CONVERTER_ROOT` | Folder builds are kept in. Unset turns the converter off. |

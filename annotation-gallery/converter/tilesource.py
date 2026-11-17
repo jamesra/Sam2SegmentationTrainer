@@ -29,6 +29,8 @@ from xml.etree import ElementTree
 import numpy as np
 from PIL import Image
 
+from converter.crush import CrushInfo, apply_display, display_lut
+
 LOGGER = logging.getLogger("converter.tilesource")
 PROTOCOL_TILE = 1024
 
@@ -58,6 +60,8 @@ class Tileset:
     prefix: str
     postfix: str
     levels: Mapping[int, Level]
+    # Set when the tiles hold quantized codes (Nornir's ``Quantized`` filter), not display intensities.
+    crush: Optional[CrushInfo] = None
 
     @property
     def channel(self) -> str:
@@ -157,6 +161,7 @@ def parse_viking_xml(text: str, *, source: str, host: Optional[str] = None) -> V
                         path=_attr(node, "path", "Path") or "", tile_x=_int(_attr(node, "TileXDim", "tilexdim")),
                         tile_y=_int(_attr(node, "TileYDim", "tileydim")), prefix=_attr(node, "FilePrefix", "fileprefix") or "",
                         postfix=_attr(node, "FilePostfix", "filepostfix") or ".png", levels=levels,
+                        crush=CrushInfo.from_element(node),
                     )
                 )
     return Volume(
@@ -306,9 +311,20 @@ class SectionTiles:
         self.tileset = tileset
         self.downsample = downsample
         self.cache = cache
+        # Quantized codes are shown through Viking's default window and gamma, so cards and segmentation tiles look as
+        # they do in Viking. Wider than 8-bit codes are left as stored, as Viking does.
+        crush = tileset.crush
+        self._display = display_lut(crush) if crush is not None and crush.is_supported else None
 
     def region(self, x0: int, y0: int, width: int, height: int) -> np.ndarray:
-        """Pixels ``[x0, x0+width) x [y0, y0+height)`` of the stitched level, stored orientation (row 0 = lowest y)."""
+        """Pixels ``[x0, x0+width) x [y0, y0+height)`` of the stitched level, stored orientation (row 0 = lowest y).
+
+        Quantized tiles come back as display gray (window and gamma applied); everything else as stored."""
+        stitched = self._stitch(x0, y0, width, height)
+        return apply_display(stitched, self._display) if self._display is not None else stitched
+
+    def _stitch(self, x0: int, y0: int, width: int, height: int) -> np.ndarray:
+        """The stitched pixels exactly as the tiles hold them (codes for a quantized tileset)."""
         tx, ty = self.tileset.tile_x, self.tileset.tile_y
         canvas = np.zeros((height, width), dtype=np.uint8)
         # A cold region needs a dozen or more tiles; fetched one by one over a slow link they can outlast the
@@ -335,9 +351,10 @@ class SectionTiles:
 
     def protocol_tile(self, row: int, col: int) -> Optional[bytes]:
         """PNG bytes of the segmentation server's tile (row, col): the 1024 region, flipped for the protocol."""
-        region = self.region(col * PROTOCOL_TILE, row * PROTOCOL_TILE, PROTOCOL_TILE, PROTOCOL_TILE)
-        if not region.any():
-            return None
+        stored = self._stitch(col * PROTOCOL_TILE, row * PROTOCOL_TILE, PROTOCOL_TILE, PROTOCOL_TILE)
+        if not stored.any():
+            return None  # judged on the stored codes: a window can turn dim tissue black, which is not an empty tile
+        region = apply_display(stored, self._display) if self._display is not None else stored
         out = io.BytesIO()
         Image.fromarray(flip_for_protocol(region), mode="L").save(out, format="PNG")
         return out.getvalue()
