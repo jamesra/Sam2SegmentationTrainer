@@ -271,7 +271,7 @@ sam2-em-train -benchmark model.activation_checkpointing=true model.activation_ch
 # /data-local/current tree. Trash moves a mask from masks/ to ignored/.
 # A running sam2-em-train rebuilds its inventory at the next epoch when
 # ignore.json is newer than the last read, or when a listed tile is missing.
-# TEM gallery http://127.0.0.1:8081, SEM gallery http://127.0.0.1:8082 (plain HTTP, debugging; sign-in needs the HTTPS names).
+# TEM gallery http://127.0.0.1:8081, SEM gallery http://127.0.0.1:8082 (plain HTTP on loopback only, debugging; sign-in needs the HTTPS names).
 # Public: https://tem.gallery.codepharm.net, https://sem.gallery.codepharm.net; https://gallery.codepharm.net redirects to
 # the modality the trainer runs. See "Gallery hostnames, certificate and access" below.
 # Reopen in Container starts it. From the CLI:
@@ -356,7 +356,8 @@ pip show sam2-segmentation-trainer
   compose network. `gallery-router` (nginx, `docker/gallery-router/gallery.conf`) terminates TLS for both and for
   `gallery.codepharm.net`, which 302-redirects to the modality the trainer runs. `run-cursor-dev.ps1` / `docker-build.ps1`
   write that choice (`active.conf` in `SAM2_GALLERY_ROUTER_DIR`) and reload the router. Ports: router HTTP 8080 / HTTPS 8442,
-  TEM gallery 8081, SEM gallery 8082. The reverse proxy's stream map sends all three names to 8442; plain HTTP for the tem. and sem.
+  TEM gallery 127.0.0.1:8081, SEM gallery 127.0.0.1:8082 (loopback only: the galleries can write, so they are not
+  published on plain HTTP). The reverse proxy's stream map sends all three names to 8442; plain HTTP for the tem. and sem.
   names is a redirect in the proxy's `custom/http.conf`.
 - One certificate (lineage `gallery.codepharm.net`, SANs for all three names) from `annotation-gallery-certbot-renewer`, which restarts
   `gallery-router` after a renewal. The renewer only requests extra names for a new lineage. To widen an existing one, run once:

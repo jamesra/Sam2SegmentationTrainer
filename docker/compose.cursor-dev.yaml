@@ -141,7 +141,8 @@ services:
 
   # Two galleries from one image: TEM and SEM mirrors side by side, independent of which modality the trainer runs.
   # Both listen on plain HTTP on the compose network only; gallery-router terminates TLS for
-  # tem. / sem.gallery.codepharm.net. Published HTTP ports (debugging): TEM 8081, SEM 8082.
+  # tem. / sem.gallery.codepharm.net. The galleries can write (Review), so plain HTTP is published on loopback only,
+  # for debugging on this machine: TEM 127.0.0.1:8081, SEM 127.0.0.1:8082.
   annotation-gallery-tem:
     <<: *gallery
     environment:
@@ -152,7 +153,7 @@ services:
       GALLERY_OIDC_CLIENT_ID: "${GALLERY_TEM_OIDC_CLIENT_ID:-}"
       GALLERY_OIDC_CLIENT_SECRET: "${GALLERY_TEM_OIDC_CLIENT_SECRET:-}"
     ports:
-      - "${GALLERY_TEM_HTTP_PUBLISH:-8081:80}"
+      - "127.0.0.1:8081:80"
     volumes:
       - type: bind
         source: ${SAM2_LOCAL_DATA_HOST_TEM:?set SAM2_LOCAL_DATA_HOST_TEM in the shared .env (the TEM mirror)}
@@ -169,7 +170,7 @@ services:
       GALLERY_OIDC_CLIENT_ID: "${GALLERY_SEM_OIDC_CLIENT_ID:-}"
       GALLERY_OIDC_CLIENT_SECRET: "${GALLERY_SEM_OIDC_CLIENT_SECRET:-}"
     ports:
-      - "${GALLERY_SEM_HTTP_PUBLISH:-8082:80}"
+      - "127.0.0.1:8082:80"
     volumes:
       - type: bind
         source: ${SAM2_LOCAL_DATA_HOST_SEM:?set SAM2_LOCAL_DATA_HOST_SEM in the shared .env (the SEM mirror)}
