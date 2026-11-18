@@ -27,6 +27,7 @@ import numpy as np
 from PIL import Image
 
 import catalog
+import thumbs
 from converter import contour as contour_module
 from converter import engines, odata, seed
 from converter.cardgeom import (  # noqa: F401 - re-exported: scoring and tests use them from here
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS converter_cards (
     built_at TEXT,
     engine TEXT,
     last_modified_ticks INTEGER,
+    display_version INTEGER,
     PRIMARY KEY (location_id, image_key)
 )
 """
@@ -77,6 +79,10 @@ CREATE TABLE IF NOT EXISTS converter_links (
 )
 """
 BUILT, FAILED = "built", "failed"
+# How a card's image turns tile pixels into gray. Bump it when that changes: the next build re-crops the image of every
+# card cut under an older version (its outline and proposal are kept). 1: quantized tilesets shown through Viking's
+# default window and gamma (8e941df); cards cut before it hold the raw codes and look dim.
+DISPLAY_VERSION = 1
 
 
 @dataclass
@@ -236,6 +242,9 @@ class Builder:
         if "last_modified_ticks" not in columns:
             # The location's LastModified the card was built from, for the outline a reviewer approves (serverreview).
             connection.execute("ALTER TABLE converter_cards ADD COLUMN last_modified_ticks INTEGER")
+        if "display_version" not in columns:
+            # Cards from before the version was recorded say none, so their images are checked by the next build.
+            connection.execute("ALTER TABLE converter_cards ADD COLUMN display_version INTEGER")
         return connection
 
     def _store_links(self) -> None:
@@ -265,9 +274,9 @@ class Builder:
             connection.execute("DELETE FROM converter_cards WHERE location_id = ?", [record.id])
             connection.execute(
                 "INSERT INTO converter_cards (location_id, image_key, state, reason, iou, source_hash, model_id, z, downsample, "
-                "origin_x, origin_y, original_wkt, candidate_wkt, type_code, built_at, engine, last_modified_ticks) "
+                "origin_x, origin_y, original_wkt, candidate_wkt, type_code, built_at, engine, last_modified_ticks, display_version) "
                 "VALUES (:location_id, :image_key, :state, :reason, :iou, :source_hash, :model_id, :z, :downsample, "
-                ":origin_x, :origin_y, :original_wkt, :candidate_wkt, :type_code, :built_at, :engine, :last_modified_ticks)",
+                ":origin_x, :origin_y, :original_wkt, :candidate_wkt, :type_code, :built_at, :engine, :last_modified_ticks, :display_version)",
                 row,
             )
             if row["state"] == BUILT:
@@ -338,6 +347,7 @@ class Builder:
             "candidate_wkt": candidate_polygon_wkt(segmented.shape, segmented.level), "type_code": record.type_code,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "engine": self.engine_kind,
             "last_modified_ticks": odata.last_modified_ticks(record.last_modified),
+            "display_version": DISPLAY_VERSION,
         }
         self._commit_card(record, row, int(candidate.sum()))
         return row
@@ -360,6 +370,7 @@ class Builder:
             "origin_x": None, "origin_y": None, "original_wkt": record.wkt, "candidate_wkt": None,
             "type_code": record.type_code, "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "engine": self.engine_kind, "last_modified_ticks": odata.last_modified_ticks(record.last_modified),
+            "display_version": None,
         }
         self._commit_card(record, row, 0)
 
@@ -381,6 +392,37 @@ class Builder:
             return self.params.retry_failed
         return False
 
+    def recut_stale_image(self, record: odata.LocationRecord) -> bool:
+        """Re-crop the image of a built card cut under an older :data:`DISPLAY_VERSION`, keeping its outline and proposal.
+        Only a quantized tileset's image changes; any other card is just stamped. Returns True when the image was rewritten."""
+        connection = self._connect()
+        try:
+            existing = self._existing(connection, record.id)
+        finally:
+            connection.close()
+        if existing is None or existing["state"] != BUILT or existing["display_version"] == DISPLAY_VERSION:
+            return False
+        section = self._section(existing["z"], existing["downsample"])
+        key = existing["image_key"]
+        rewritten = section.has_display
+        if rewritten:
+            image = section.crop(existing["origin_x"], existing["origin_y"], CARD_SIZE, CARD_SIZE)
+            _write_png(self.crops / "images" / f"{key}.png", image)
+            # The grid's cached JPEGs were drawn from the old image.
+            if thumbs.IMAGE_KEY.fullmatch(key) is not None:
+                for size in thumbs.THUMB_SIZES:
+                    (self.crops / "overlays" / "thumb" / str(size) / f"{key}.jpg").unlink(missing_ok=True)
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE converter_cards SET display_version = ? WHERE location_id = ? AND image_key = ?",
+                [DISPLAY_VERSION, record.id, key],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return rewritten
+
     def run(
         self,
         progress: Optional[Callable[[BuildSummary, Optional[odata.LocationRecord]], None]] = None,
@@ -400,7 +442,15 @@ class Builder:
             if progress:
                 progress(summary, record)
             if not self.should_build(record):
-                summary.skipped += 1
+                try:
+                    recut = self.recut_stale_image(record)
+                except Exception:  # the card keeps its old image; the next build tries again
+                    LOGGER.exception("location %s: image not re-cut", record.id)
+                    recut = False
+                if recut:
+                    summary.built += 1
+                else:
+                    summary.skipped += 1
                 continue
             try:
                 self.build_one(record)

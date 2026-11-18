@@ -409,6 +409,48 @@ def test_cards_made_before_the_engine_split_are_built_again(tmp_path: Path, volu
     assert summary.built == 1 and len(again.calls) == 1, "a card from the other engine is rebuilt"
 
 
+def test_a_card_cut_under_an_older_display_has_only_its_image_cut_again(tmp_path: Path, volume, cache, monkeypatch) -> None:
+    # Build 8888 on RC1 was cut from TEM.Quantized before quantized tiles were windowed: its cards held raw codes.
+    entities = [_entity(61, 1, "POINT (1400 1600)", radius=80)]
+    segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    _make(tmp_path, volume, cache, segmenter, entities).run()
+    crops = tmp_path / "crops"
+    key = f"{VOLUME}_7_D1_L61"
+    image_path, mask_path = crops / "images" / f"{key}.png", crops / "masks" / f"{key}_61.png"
+    good, mask = image_path.read_bytes(), mask_path.read_bytes()
+    thumb = crops / "overlays" / "thumb" / "256" / f"{key}.jpg"
+    thumb.parent.mkdir(parents=True)
+    thumb.write_bytes(b"old")
+    connection = sqlite3.connect(crops / "annotation_crops.sqlite")
+    connection.execute("UPDATE converter_cards SET display_version = NULL")
+    connection.commit()
+    Image.fromarray(np.zeros((1024, 1024), np.uint8), mode="L").save(image_path)
+    calls = len(segmenter.calls)
+
+    monkeypatch.setattr(SectionTiles, "has_display", property(lambda self: True))
+    summary = _make(tmp_path, volume, cache, segmenter, entities).run()
+
+    assert summary.built == 1 and len(segmenter.calls) == calls, "the image is cut again without segmenting"
+    assert image_path.read_bytes() == good and mask_path.read_bytes() == mask
+    assert not thumb.exists(), "the grid's cached JPEG of the old image is dropped"
+    assert connection.execute("SELECT display_version FROM converter_cards").fetchone()[0] == builder_module.DISPLAY_VERSION
+    assert _make(tmp_path, volume, cache, segmenter, entities).run().skipped == 1, "a current card is left alone"
+
+
+def test_a_card_from_a_plain_tileset_is_only_stamped_with_the_display_version(tmp_path: Path, volume, cache) -> None:
+    entities = [_entity(62, 1, "POINT (1400 1600)", radius=80)]
+    segmenter = FakeSegmenter(lambda _id: _disc(1400, 1600, 80))
+    _make(tmp_path, volume, cache, segmenter, entities).run()
+    connection = sqlite3.connect(tmp_path / "crops" / "annotation_crops.sqlite")
+    connection.execute("UPDATE converter_cards SET display_version = NULL")
+    connection.commit()
+
+    summary = _make(tmp_path, volume, cache, segmenter, entities).run()
+
+    assert summary.skipped == 1
+    assert connection.execute("SELECT display_version FROM converter_cards").fetchone()[0] == builder_module.DISPLAY_VERSION
+
+
 def test_failures_are_recorded_with_a_reason_and_do_not_stop_the_structure(tmp_path: Path, volume, cache) -> None:
     entities = [
         _entity(21, 1, "POINT (1400 1600)", radius=80),

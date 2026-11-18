@@ -316,6 +316,11 @@ class SectionTiles:
         crush = tileset.crush
         self._display = display_lut(crush) if crush is not None and crush.is_supported else None
 
+    @property
+    def has_display(self) -> bool:
+        """True when :meth:`region` maps the stored pixels to display gray (a quantized tileset), not returns them as stored."""
+        return self._display is not None
+
     def region(self, x0: int, y0: int, width: int, height: int) -> np.ndarray:
         """Pixels ``[x0, x0+width) x [y0, y0+height)`` of the stitched level, stored orientation (row 0 = lowest y).
 
