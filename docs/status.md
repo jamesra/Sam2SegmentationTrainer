@@ -29,8 +29,10 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
 - **Serve-time prompt mismatches.** Should the five mismatches in `serve-train-prompt-parity.mdc` be fixed in the
   server, in the trainer, or both?
 - **Open questions in `docs/mask_refinement_plan.md` §11:** τ, λ_leak, the merge threshold, the prompt mix, M_corr.
-- **Viking proto proposal** (`docs/proposals/segmentation-proto-circle-seeds.md` in the Viking repo, uncommitted):
-  migration scope, ellipses, several foreground circles per request, `split_islands`, island numbering.
+- ~~Viking proto proposal~~ settled 2026-10-25: James applied the design in Viking `ee14a0b0`. It is in
+  `gRPC_Protos` `Common/geometry.proto` and `segmentation.proto`, plus `segmentation.rst`. The proposal is kept,
+  marked superseded. The Sam2Trainer copy, `annotation-gallery/seg_proto/segmentation.proto`, follows it (updated
+  2026-11-16).
 
 ## Data (Nornir notes as of 2026-10-26; recheck)
 
