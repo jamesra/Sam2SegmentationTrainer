@@ -59,8 +59,8 @@ The specs and the code are the source of truth. Session summaries are not.
   servers. Don't restart `viking-segmentation-v4-1`.
 - **To pause,** send SIGINT to the trainer. It finishes the step, writes `last.pt` and exits.
 - **To resume,** use `sam2-em-train training.run_name=<run>` with the same `data.*` overrides it was started
-  with. The command line is in the script that launched it under `/outputs` (for example
-  `circle_seed_trust_then_resume.sh`). Resume refuses a different prompt layout, `freeze_mode`,
+  with (v5: `data.root=/data-local/v3 data.registration_root=/storage4 data.corrections_root=/tmp/corrections`). Write a
+  launcher script only in your scratchpad or `/outputs/_scratch`, and delete it once the run is back. Resume refuses a different prompt layout, `freeze_mode`,
   `unfreeze_mask_cnn` or optimizer groups. A batch-size change resumes at the same sample.
 - **To start a new run,** use `training.run_name=auto` with `-refresh` from the pretrained weights, not a
   resume of an older run. Pass `data.frozen_split=v5` so its validation scores stay comparable.
