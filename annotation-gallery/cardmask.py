@@ -188,7 +188,12 @@ def _ensure(crops: Path, size: int, image_key: str, location_id: int) -> tuple[b
     except OSError:
         pass
     finally:
-        temporary.unlink(missing_ok=True)
+        # An unusable cache folder (a file in its place) makes unlink raise NotADirectoryError, which missing_ok does
+        # not cover; the cache is optional, so that is ignored too.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
     return data, True
 
 

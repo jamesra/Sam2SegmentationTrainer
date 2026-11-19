@@ -205,5 +205,10 @@ def negative_bitmask(crops: Path, image_key: str, location_id: int) -> tuple[byt
     except OSError:
         pass
     finally:
-        temporary.unlink(missing_ok=True)
+        # An unusable cache folder (a file in its place) makes unlink raise NotADirectoryError, which missing_ok does
+        # not cover; the cache is optional, so that is ignored too.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
     return data, count
