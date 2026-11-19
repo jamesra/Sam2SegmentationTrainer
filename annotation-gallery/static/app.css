@@ -343,11 +343,12 @@ button.reverse.active,
 .spacer { width: 100%; }
 
 /* Process / branch mini-map (app.js drawMinimap): floats over the scroller's top-right corner, under the viewer and
-   dialogs, and lets clicks through to the cards beneath. */
+   dialogs. A click or drag on it moves the view. */
 .minimap {
   position: fixed;
   z-index: 10;
-  pointer-events: none;
+  cursor: pointer;
+  touch-action: none;
   background: rgba(15, 18, 23, 0.85);
   box-shadow: 0 0 0 1px #2a2f3a;
 }

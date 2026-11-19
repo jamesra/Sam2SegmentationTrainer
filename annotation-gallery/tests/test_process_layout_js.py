@@ -204,3 +204,68 @@ def test_a_string_of_only_omitted_types_between_branches_leaves_them_linked() ->
     assert sorted(out["at"]) == sorted(cards)
     # R and B are joined directly (no cards between them), so B sits in a column of its own and U, V hang from it.
     assert out["at"]["B"][1] >= 0 and out["at"]["U"][1] >= out["at"]["B"][1] and out["at"]["V"][1] >= out["at"]["B"][1]
+
+
+# ------------------------------------------------------------------------------------------------- snaking tails
+
+
+def _long_arm_star(arm=60):
+    """Root R with two short processes and one arm of `arm` cards running down past them."""
+    cards, links = _star(below=True, lengths=(3, 2))
+    c, l, ids = _chain("T", arm, 101)
+    cards.update(c)
+    links += l + [("R", ids[0])]
+    return cards, links, ids
+
+
+def _assert_path_touches(at, ids):
+    for a, b in zip(ids, ids[1:]):
+        (ra, ca), (rb, cb) = at[a], at[b]
+        assert abs(ra - rb) + abs(ca - cb) == 1, (a, at[a], b, at[b])
+
+
+@needs_node
+def test_a_tail_past_the_other_processes_snakes_in_five_row_layers() -> None:
+    cards, links, ids = _long_arm_star(60)
+    out = _layout(cards, links, aspect=16 / 9)
+    at = out["at"]
+    _assert_path_touches(at, ids)
+    assert len(set(at.values())) == len(at), "two cards share a cell"
+    # The arm hangs from R and is longest, so it is the leftmost column; past the other columns (rows >= 3) it snakes.
+    lone = [at[i] for i in ids if at[i][0] >= 3]
+    first_row = min(r for r, _ in lone)
+    layer_cols = sorted({c for r, c in lone if sum(1 for rr, cc in lone if cc == c) > 1})
+    assert all(b - a == 2 for a, b in zip(layer_cols, layer_cols[1:]))
+    gap_cols = {c for _r, c in lone} - set(layer_cols)
+    for c in gap_cols:
+        assert sum(1 for _r, cc in lone if cc == c) <= 2  # one turn card per band
+    # Each band is 5 rows; nothing lands above the first lone row.
+    assert first_row == 3
+    assert all(r >= first_row for r, _ in lone)
+
+
+@needs_node
+def test_snake_shape_follows_the_aspect() -> None:
+    cards, links, _ids = _long_arm_star(200)
+    wide = _layout(cards, links, aspect=4.0)
+    tall = _layout(cards, links, aspect=0.5)
+    assert wide["columns"] > tall["columns"]
+    assert wide["totalRows"] < tall["totalRows"]
+
+
+@needs_node
+def test_a_short_tail_is_left_straight() -> None:
+    cards, links, ids = _long_arm_star(8)  # 8 cards, 3 of them in the rows of the other processes: tail of 5
+    at = _layout(cards, links)["at"]
+    assert {at[i][1] for i in ids} == {at[ids[0]][1]}
+
+
+@needs_node
+def test_a_long_unbranched_string_snakes_too() -> None:
+    c1, l1, long_ids = _chain("A", 40, 1)
+    c2, l2, _ = _chain("B", 4, 1)
+    out = _layout({**c1, **c2}, l1 + l2, aspect=1.0)
+    at = out["at"]
+    _assert_path_touches(at, long_ids)
+    assert len(set(at.values())) == len(at)
+    assert out["totalRows"] < 40

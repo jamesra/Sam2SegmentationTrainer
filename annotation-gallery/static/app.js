@@ -2623,7 +2623,9 @@
         done: !classes.has(reviewClass(row)),
       };
     });
-    const laid = window.ProcessLayout.layoutProcesses({ cards: input, links: state.convLinks, maxColumns: viewColumns });
+    const laid = window.ProcessLayout.layoutProcesses({
+      cards: input, links: state.convLinks, maxColumns: viewColumns, aspect: screenAspectCells(),
+    });
     const byId = new Map(cards.map((windows) => [String(windows[0].location_id), windows[0]]));
     const cells = laid.cells.map((cell) => ({
       row: byId.get(cell.id), gr: cell.row, gc: cell.col, group: cell.group, root: Boolean(cell.root),
@@ -2663,6 +2665,14 @@
   function showLocations() {
     els.scroller.scrollTop = 0;
     render(true);
+  }
+
+  // The screen's shape in grid cells (columns over rows), which the layouts' snakes and boxes aim for.
+  function screenAspectCells() {
+    const cardPx = cardPixelSize();
+    const across = Math.max(1, els.scroller.clientWidth - 32) / (cardPx + GRID_GAP);
+    const down = Math.max(1, els.scroller.clientHeight) / (rowStride || (cardPx + 20));
+    return across / down;
   }
 
   // How many cards fit across the screen: the scroller's width less the grid's 16px margins. The grid itself can be
@@ -2831,17 +2841,19 @@
   }
 
   // minimap-begin
-  // The Process / branch layout's mini-map, floating in the scroller's top-right corner. Each card slot is a 4px
+  // The Process / branch layouts' mini-map, floating in the scroller's top-right corner. Each card slot is an 8px
   // square with a 1px gap, coloured by its review state; a card whose Show box is unticked, or that the layout dropped,
-  // has no square. A 1px red box is the part of the grid on screen. The map takes the layout's shape but covers at most
-  // one card's area and half the screen each way; a layout too large for that is drawn with smaller squares.
-  const MINIMAP_PITCH = 5;
+  // has no square. A 1px red box is the part of the grid on screen. The map takes the layout's shape and stays inside
+  // the scroller (8px margins); a layout too large for that is drawn with smaller squares. A click or drag on the map
+  // centres the view there.
+  const MINIMAP_PITCH = 9;
+  const MINIMAP_MARGIN = 8;
   const MINIMAP_COLOURS = { unknown: "#4ade80", approved: "#7dd3fc", rejected: "#f87171" };
   const MINIMAP_VIEW = "#ef4444";
 
   /**
    * Size of the map and the screen's box on it, in CSS pixels.
-   * @param {{columns: number, rows: number, cardPx: number, colPitch: number, rowPitch: number, viewW: number,
+   * @param {{columns: number, rows: number, colPitch: number, rowPitch: number, viewW: number,
    *          viewH: number, scrollLeft: number, scrollTop: number, gridLeft: number}} g
    *   `colPitch`/`rowPitch` are a grid cell's stride on screen; `gridLeft` is the grid's offset inside the scroller.
    * @returns {{width: number, height: number, pitch: number, tile: number,
@@ -2852,9 +2864,8 @@
     const naturalH = g.rows * MINIMAP_PITCH - 1;
     const scale = Math.min(
       1,
-      Math.sqrt((g.cardPx * g.cardPx) / (naturalW * naturalH)),
-      g.viewW / 2 / naturalW,
-      g.viewH / 2 / naturalH,
+      Math.max(1, g.viewW - 2 * MINIMAP_MARGIN) / naturalW,
+      Math.max(1, g.viewH - 2 * MINIMAP_MARGIN) / naturalH,
     );
     const pitch = MINIMAP_PITCH * scale;
     const width = Math.max(1, Math.round(naturalW * scale));
@@ -2866,9 +2877,51 @@
     const y1 = clamp(((g.scrollTop + g.viewH) / g.rowPitch) * pitch, height);
     return { width, height, pitch, tile: pitch - scale, view: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
   }
+
+  /**
+   * The scroll that centres the screen on a point of the map.
+   * @param {{pitch: number}} geo  from minimapGeometry
+   * @param {number} x  map x in CSS pixels
+   * @param {number} y  map y in CSS pixels
+   * @param {{colPitch: number, rowPitch: number, viewW: number, viewH: number, gridLeft: number}} g
+   * @returns {{scrollLeft: number, scrollTop: number}}
+   */
+  function minimapTarget(geo, x, y, g) {
+    const col = x / geo.pitch;
+    const row = y / geo.pitch;
+    return {
+      scrollLeft: Math.max(0, g.gridLeft + col * g.colPitch - g.viewW / 2),
+      scrollTop: Math.max(0, row * g.rowPitch - g.viewH / 2),
+    };
+  }
   // minimap-end
 
   let minimapFrame = 0;
+  let minimapLast = null; // {geo, g} of the last drawing, for clicks
+
+  function minimapInputs() {
+    const cardPx = cardPixelSize();
+    const scroller = els.scroller;
+    return {
+      colPitch: cardPx + GRID_GAP,
+      rowPitch: rowStride || (cardPx + 20),
+      viewW: scroller.clientWidth || 1,
+      viewH: scroller.clientHeight || 1,
+      scrollLeft: scroller.scrollLeft,
+      scrollTop: scroller.scrollTop,
+      gridLeft: 16,
+    };
+  }
+
+  function travelMinimap(event) {
+    if (!minimapLast) {
+      return;
+    }
+    const box = els.minimap.getBoundingClientRect();
+    const target = minimapTarget(minimapLast.geo, event.clientX - box.left, event.clientY - box.top, minimapLast.g);
+    els.scroller.scrollLeft = target.scrollLeft;
+    els.scroller.scrollTop = target.scrollTop;
+  }
 
   function scheduleMinimap() {
     if (!minimapFrame) {
@@ -2886,24 +2939,14 @@
       canvas.hidden = true;
       return;
     }
-    const cardPx = cardPixelSize();
     const scroller = els.scroller;
-    const geo = minimapGeometry({
-      columns: packed.columns,
-      rows: packed.totalRows,
-      cardPx,
-      colPitch: cardPx + GRID_GAP,
-      rowPitch: rowStride || (cardPx + 20),
-      viewW: scroller.clientWidth || 1,
-      viewH: scroller.clientHeight || 1,
-      scrollLeft: scroller.scrollLeft,
-      scrollTop: scroller.scrollTop,
-      gridLeft: 16,
-    });
+    const g = minimapInputs();
+    const geo = minimapGeometry({ columns: packed.columns, rows: packed.totalRows, ...g });
+    minimapLast = { geo, g };
     const box = scroller.getBoundingClientRect();
     const scrollbar = scroller.offsetWidth - scroller.clientWidth;
-    canvas.style.top = `${box.top + 8}px`;
-    canvas.style.left = `${box.right - scrollbar - 8 - geo.width}px`;
+    canvas.style.top = `${box.top + MINIMAP_MARGIN}px`;
+    canvas.style.left = `${box.right - scrollbar - MINIMAP_MARGIN - geo.width}px`;
     canvas.style.width = `${geo.width}px`;
     canvas.style.height = `${geo.height}px`;
     const dpr = window.devicePixelRatio || 1;
@@ -4424,6 +4467,20 @@
     setFiltersCollapsed(!filtersCollapsed(), true);
     // The scroller gained or lost the controls' height, so lay the cards out for the new size.
     render(true);
+  });
+
+  els.minimap.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    els.minimap.setPointerCapture(event.pointerId);
+    travelMinimap(event);
+  });
+  els.minimap.addEventListener("pointermove", (event) => {
+    if (els.minimap.hasPointerCapture(event.pointerId)) {
+      travelMinimap(event);
+    }
   });
 
   els.scroller.addEventListener("scroll", () => {
