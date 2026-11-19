@@ -1294,6 +1294,13 @@
     return `overlays/thumb/${cardPixelSize()}/${row.image_key}.jpg`;
   }
 
+  // Tissue is cached a day without asking (TISSUE_CACHE); the display version changes the URL when a build re-cuts it.
+  function tissueUrl(row) {
+    const url = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+    const version = state.config.displayVersion;
+    return version ? `${url}&d=${version}` : url;
+  }
+
   function syncCardSizeButtons() {
     document.body.dataset.cardSize = state.cardSize;
     document.querySelectorAll("[data-card-size]").forEach((button) => {
@@ -1801,7 +1808,7 @@
   }
 
   function windowHtml(row) {
-    const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+    const image = tissueUrl(row);
     const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
     const layer = layerUrl(row);
     const hue = overlayHue();
@@ -3688,7 +3695,7 @@
         mask: mediaUrl(state.volume, row.mask_relpath, row.location_id),
         hue: overlayHue(),
         visibility: String(overlayVisibility()),
-        image: mediaUrl(state.volume, tissueRelpath(row), row.location_id),
+        image: tissueUrl(row),
       },
     };
     return openViewer(node);
@@ -4509,7 +4516,7 @@
       if (!row) {
         return;
       }
-      const image = mediaUrl(state.volume, tissueRelpath(row), row.location_id);
+      const image = tissueUrl(row);
       const mask = mediaUrl(state.volume, row.mask_relpath, row.location_id);
       node.dataset.gen = gen;
       node.dataset.image = image;

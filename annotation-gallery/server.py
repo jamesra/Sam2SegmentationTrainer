@@ -74,7 +74,7 @@ from converter import jobs as converter_jobs
 from converter import odata as odata_module
 from converter import serverreview
 from converter import web as converter_web
-from converter.builder import BuildParams
+from converter.builder import DISPLAY_VERSION, BuildParams
 from converter.tilesource import load_volume as load_viking_volume
 import score as score_module
 from gold import draw as gold_draw
@@ -794,6 +794,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
                     "vikingUrl": viking_template(),
                     "converter": converter_web.converter_root(env_map()) is not None,
                     "gold": gold_store.gold_root(env_map()) is not None,
+                    # In the tissue URLs: the browser keeps those a day, and a version bump re-cuts the images in place.
+                    "displayVersion": DISPLAY_VERSION,
                 }
             )
             return
