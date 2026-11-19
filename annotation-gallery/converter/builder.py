@@ -467,6 +467,13 @@ class Builder:
                 LOGGER.exception("location %s failed", record.id)
                 self._record_failure(record, f"error: {error}")
                 summary.note_failure("error")
+        # Every card size's thumbnails now, so changing the card size in the gallery finds them ready instead of
+        # encoding each from its full crop on first view. Converter builds are outside the registry the startup
+        # backfill walks.
+        try:
+            thumbs.backfill_crops(self.crops)
+        except OSError:
+            LOGGER.exception("thumbnail backfill of %s failed", self.crops)
         if progress:
             progress(summary, None)
         return summary

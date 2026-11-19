@@ -419,7 +419,7 @@ def test_a_card_cut_under_an_older_display_has_only_its_image_cut_again(tmp_path
     image_path, mask_path = crops / "images" / f"{key}.png", crops / "masks" / f"{key}_61.png"
     good, mask = image_path.read_bytes(), mask_path.read_bytes()
     thumb = crops / "overlays" / "thumb" / "256" / f"{key}.jpg"
-    thumb.parent.mkdir(parents=True)
+    thumb.parent.mkdir(parents=True, exist_ok=True)
     thumb.write_bytes(b"old")
     connection = sqlite3.connect(crops / "annotation_crops.sqlite")
     connection.execute("UPDATE converter_cards SET display_version = NULL")
@@ -432,7 +432,7 @@ def test_a_card_cut_under_an_older_display_has_only_its_image_cut_again(tmp_path
 
     assert summary.built == 1 and len(segmenter.calls) == calls, "the image is cut again without segmenting"
     assert image_path.read_bytes() == good and mask_path.read_bytes() == mask
-    assert not thumb.exists(), "the grid's cached JPEG of the old image is dropped"
+    assert thumb.read_bytes() != b"old", "the grid's cached JPEG of the old image is replaced"
     assert connection.execute("SELECT display_version FROM converter_cards").fetchone()[0] == builder_module.DISPLAY_VERSION
     assert _make(tmp_path, volume, cache, segmenter, entities).run().skipped == 1, "a current card is left alone"
 
