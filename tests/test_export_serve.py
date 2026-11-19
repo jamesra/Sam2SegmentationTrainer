@@ -298,7 +298,7 @@ class ExportServeTests(unittest.TestCase):
             "sam2_segmentation_trainer.export_serve.load_finetuned_model", return_value=model
         ):
             out = export_serve_checkpoint(
-                finetuned=Path("f.pt"), base_ckpt=Path("b.pt"), out=Path(tmp) / "nested" / "serve.pt",
+                finetuned=Path(tmp) / "run" / "f.pt", base_ckpt=Path("b.pt"), out=Path(tmp) / "nested" / "serve.pt",
                 circle_diameter_scale=0.8, model_id="v1", epoch=0,
             )
             payload = torch.load(out, weights_only=True)
