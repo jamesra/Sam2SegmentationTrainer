@@ -136,6 +136,18 @@ All defined in `docs/depth_relative_trust.md`:
 - **2026-10-25 Oversize augmentation and `circle_oversize` validation.** The annotator-like jitter only draws circles
   smaller than the inscribed one (`scale_range` 0.45-1.0 of depth), so training never showed an oversized circle; about
   10% of circle seeds scaled 1.2-2x, kept modest so the size cue survives.
+- **2026-11-18 Converter card layouts (gallery, not the model).** The converter's "Process / branch" view places one
+  structure's cards on a grid by how their locations are linked. Two layouts:
+  - *Process / branch* (`static/process_layout.js`): processes are columns hung from their branch in Z order. A
+    process's tail, past every other process, snakes in 5-card layers two columns apart, one turn card in the empty
+    column; the layers per band are chosen to match the screen's shape.
+  - *Process / branch (HV)* (`static/hv_layout.js`): an HV-style orthogonal tree drawing with Z vertical. Subtrees are
+    boxes; the largest process on each free side of a branch hangs straight off it, the rest from a bus of connector
+    cells on the branch's row; long processes wind (Chan et al. 2002); the wind height is the one of {4, 6, 8, 12, 16,
+    24, none} whose drawing best matches the screen's shape.
+  Why connectors: requiring every pair of linked cards to touch is a unit-length grid embedding, NP-complete for trees
+  of degree 4 (Bhatt & Cosmadakis 1987) and for binary trees (Gregori 1989), and impossible at a branch with more than
+  four links. James chose connector cells over repeated "ghost" branch cards (2026-11-18).
 
 ## Discussion points
 
@@ -150,6 +162,15 @@ All defined in `docs/depth_relative_trust.md`:
   what training with the new encoding gives.
 
 ## References
+
+- Bhatt, S. N., & Cosmadakis, S. S. (1987). The complexity of minimizing wire lengths in VLSI layouts. *Information
+  Processing Letters*, 25(4), 263-267 (verify). Used for: unit-length grid embedding of trees is NP-complete, so the
+  converter's HV layout draws connectors.
+- Chan, T. M., Goodrich, M. T., Kosaraju, S. R., & Tamassia, R. (2002). Optimizing area and aspect ratio in
+  straight-line orthogonal tree drawings. *Computational Geometry*, 23(2), 153-162 (GD 1996, LNCS 1190, 63-75).
+  Used for: winding long chains into zig-zags to control a tree drawing's aspect ratio (converter HV layout).
+- Gregori, A. (1989). Unit-length embedding of binary trees on a square grid. *Information Processing Letters*, 31(4),
+  167-173 (verify). Used for: the same NP-completeness for binary trees.
 
 - Hildebrand, T., & Rüegsegger, P. (1997). A new method for the model-independent assessment of thickness in
   three-dimensional images. *Journal of Microscopy*, 185(1), 67-75. doi:10.1046/j.1365-2818.1997.1340694.x (verify).

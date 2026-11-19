@@ -43,6 +43,81 @@
   function layoutProcesses(input) {
     const maxColumns = Math.max(1, Number(input.maxColumns) || 1);
     const aspect = Number(input.aspect) > 0 ? Number(input.aspect) : 16 / 9;
+    const { cardById, trees, strings, leftovers } = analyseLinks(input);
+    const cells = [];
+    let bottom = 0;
+    let columns = 1;
+
+    const place = (list) => {
+      const top = Math.min(...list.map((cell) => cell.row));
+      for (const cell of list) {
+        cell.row += bottom - top;
+        cells.push(cell);
+        columns = Math.max(columns, cell.col + cell.w);
+      }
+      bottom = Math.max(...list.map((cell) => cell.row + cell.h));
+    };
+
+    for (const tree of trees) {
+      place(snakeTails(layoutTree(tree, cardById), aspect));
+    }
+
+    // Unbranched strings: columns, longest first, each running down from its lower-Z end.
+    if (strings.length) {
+      let col = 0;
+      const list = [];
+      for (const component of strings) {
+        const p = component.processes[0];
+        const nodes = p.nodes.slice();
+        if (cardById.get(nodes[0]).z > cardById.get(nodes[nodes.length - 1]).z) {
+          nodes.reverse();
+        }
+        const width = Math.max(...nodes.map((id) => cardById.get(id).w));
+        let row = 0;
+        for (const id of nodes) {
+          const card = cardById.get(id);
+          list.push({ id, row, col, w: card.w, h: card.h, group: p.index, kind: "process" });
+          row += card.h;
+        }
+        col += width;
+      }
+      place(snakeTails(list, aspect));
+    }
+
+    // Unlinked cards, and branches left with nothing attached, in Z order wrapping at maxColumns.
+    if (leftovers.length) {
+      const list = [];
+      let row = 0;
+      let col = 0;
+      let rowHeight = 1;
+      for (const id of leftovers) {
+        const card = cardById.get(id);
+        if (col > 0 && col + card.w > maxColumns) {
+          row += rowHeight;
+          col = 0;
+          rowHeight = 1;
+        }
+        list.push({ id, row, col, w: card.w, h: card.h, group: -1, kind: "single" });
+        col += card.w;
+        rowHeight = Math.max(rowHeight, card.h);
+      }
+      place(list);
+    }
+
+    cells.sort((a, b) => a.row - b.row || a.col - b.col);
+    return { cells, columns, totalRows: bottom };
+  }
+
+  /**
+   * The link analysis both layouts share (this one and static/hv_layout.js): processes, branches, the pruning of done
+   * cards, and the components. `trees` have branches, largest first; `strings` are unbranched processes of two or more
+   * cards, longest first; `leftovers` are unlinked cards and branches left with nothing attached, in Z order.
+   * @returns {{cardById: Map<string, {id: string, z: number, area: number, w: number, h: number, done: boolean}>,
+   *            trees: {branches: string[], processes: {index: number, nodes: string[], ends: (string|null)[]}[],
+   *                    bridges: [string, string][]}[],
+   *            strings: object[], leftovers: string[]}}
+   */
+  function analyseLinks(input) {
     const cardById = new Map();
     for (const card of input.cards || []) {
       cardById.set(String(card.id), {
@@ -226,7 +301,6 @@
       componentOf(`b:${pair[0]}`).bridges.push(pair);
     }
 
-    const cells = [];
     const sizeOf = (component) =>
       component.branches.length + component.processes.reduce((sum, p) => sum + p.nodes.length, 0);
     const ordered = [...components.values()].sort((a, b) => sizeOf(b) - sizeOf(a));
@@ -236,72 +310,12 @@
       .sort((a, b) => sizeOf(b) - sizeOf(a));
     const singles = ordered.filter((c) => c.branches.length === 0 && sizeOf(c) === 1).map((c) => c.processes[0].nodes[0]);
     // A done-but-kept branch whose attachments all vanished is a single too (it has no component entry above).
-    let bottom = 0;
-    let columns = 1;
-
-    const place = (list) => {
-      const top = Math.min(...list.map((cell) => cell.row));
-      for (const cell of list) {
-        cell.row += bottom - top;
-        cells.push(cell);
-        columns = Math.max(columns, cell.col + cell.w);
-      }
-      bottom = Math.max(...list.map((cell) => cell.row + cell.h));
-    };
-
-    for (const tree of trees) {
-      place(snakeTails(layoutTree(tree, cardById), aspect));
-    }
-
-    // Unbranched strings: columns, longest first, each running down from its lower-Z end.
-    if (strings.length) {
-      let col = 0;
-      const list = [];
-      for (const component of strings) {
-        const p = component.processes[0];
-        const nodes = p.nodes.slice();
-        if (cardById.get(nodes[0]).z > cardById.get(nodes[nodes.length - 1]).z) {
-          nodes.reverse();
-        }
-        const width = Math.max(...nodes.map((id) => cardById.get(id).w));
-        let row = 0;
-        for (const id of nodes) {
-          const card = cardById.get(id);
-          list.push({ id, row, col, w: card.w, h: card.h, group: p.index, kind: "process" });
-          row += card.h;
-        }
-        col += width;
-      }
-      place(snakeTails(list, aspect));
-    }
-
-    // Unlinked cards, and branches left with nothing attached, in Z order wrapping at maxColumns.
     const placedBranches = new Set(trees.flatMap((c) => c.branches));
     const leftovers = [
       ...singles,
       ...branches.filter((id) => !placedBranches.has(id)),
     ].sort((a, b) => cardById.get(a).z - cardById.get(b).z || byId(a, b));
-    if (leftovers.length) {
-      const list = [];
-      let row = 0;
-      let col = 0;
-      let rowHeight = 1;
-      for (const id of leftovers) {
-        const card = cardById.get(id);
-        if (col > 0 && col + card.w > maxColumns) {
-          row += rowHeight;
-          col = 0;
-          rowHeight = 1;
-        }
-        list.push({ id, row, col, w: card.w, h: card.h, group: -1, kind: "single" });
-        col += card.w;
-        rowHeight = Math.max(rowHeight, card.h);
-      }
-      place(list);
-    }
-
-    cells.sort((a, b) => a.row - b.row || a.col - b.col);
-    return { cells, columns, totalRows: bottom };
+    return { cardById, trees, strings, leftovers };
   }
 
   const SNAKE_HEIGHT = 5;
@@ -615,5 +629,5 @@
     return cells;
   }
 
-  return { layoutProcesses, snakeSpot };
+  return { layoutProcesses, analyseLinks, snakeSpot };
 });

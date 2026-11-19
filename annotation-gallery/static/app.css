@@ -355,6 +355,39 @@ button.reverse.active,
 
 .minimap[hidden] { display: none; }
 
+/* HV layout connector cells (app.js drawPipes): a bar from the centre out of each side the link leaves by, reaching
+   across the grid gap to the neighbouring card or connector. */
+.pipe {
+  --pipe: hsl(var(--link-h) 78% 62%);
+  position: relative;
+  align-self: stretch;
+  pointer-events: none;
+}
+
+.pipe.grey { --pipe: #9aa3af; }
+
+.pipe > span {
+  position: absolute;
+  background: var(--pipe);
+}
+
+.pipe > .arm-n,
+.pipe > .arm-s {
+  left: calc(50% - 2px);
+  width: 4px;
+}
+
+.pipe > .arm-e,
+.pipe > .arm-w {
+  top: calc(50% - 2px);
+  height: 4px;
+}
+
+.pipe > .arm-n { top: calc(-1 * var(--grid-gap)); bottom: calc(50% - 2px); }
+.pipe > .arm-s { top: calc(50% - 2px); bottom: calc(-1 * var(--grid-gap)); }
+.pipe > .arm-e { left: calc(50% - 2px); right: calc(-1 * var(--grid-gap)); }
+.pipe > .arm-w { left: calc(-1 * var(--grid-gap)); right: calc(50% - 2px); }
+
 .grid {
   --ring-width: 2px;
   --grid-gap: 4px;

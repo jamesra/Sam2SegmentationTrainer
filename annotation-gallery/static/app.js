@@ -1493,15 +1493,22 @@
   // The converter's default order: cards laid out by how their locations are linked (static/process_layout.js).
   // It is exclusive: it replaces every other sort, and every other sort replaces it.
   const LAYOUT_SORT = "layout";
+  // The same cards as an HV tree drawing (static/hv_layout.js): Z vertical, subtrees in boxes, connector cells where
+  // linked cards cannot touch. Exclusive like LAYOUT_SORT.
+  const HV_LAYOUT_SORT = "hvlayout";
+
+  function isLayoutSort(key) {
+    return key === LAYOUT_SORT || key === HV_LAYOUT_SORT;
+  }
 
   function layoutActive() {
-    return Boolean(state.converter) && state.sorts.length > 0 && state.sorts[0].key === LAYOUT_SORT;
+    return Boolean(state.converter) && state.sorts.length > 0 && isLayoutSort(state.sorts[0].key);
   }
 
   function sortFields() {
     const fields = SORT_FIELDS.slice();
     if (state.converter) {
-      fields.unshift([LAYOUT_SORT, "Process / branch"]);
+      fields.unshift([LAYOUT_SORT, "Process / branch"], [HV_LAYOUT_SORT, "Process / branch (HV)"]);
       // In the converter the "loss" of a card is how far the proposal moved from the current outline (1 - overlap).
       fields[fields.findIndex(([key]) => key === "loss")] = ["loss", "Change from current outline"];
     }
@@ -1579,12 +1586,12 @@
     const fields = sortFields();
     syncLayoutLock();
     if (layoutActive()) {
-      const options = fields.map(([value, label]) => `<option value="${value}"${value === LAYOUT_SORT ? " selected" : ""}>${label}</option>`).join("");
+      const options = fields.map(([value, label]) => `<option value="${value}"${value === state.sorts[0].key ? " selected" : ""}>${label}</option>`).join("");
       els.sortStack.innerHTML = `<div class="sort-column"><div class="sort-row"><select data-index="0" aria-label="Sort by">${options}</select></div></div>`;
       return;
     }
     const used = new Set(state.sorts.map((item) => item.key));
-    const canAdd = state.sorts.length < fields.filter(([value]) => value !== LAYOUT_SORT).length;
+    const canAdd = state.sorts.length < fields.filter(([value]) => !isLayoutSort(value)).length;
     const columns = [];
     for (let start = 0; start < state.sorts.length; start += SORTS_PER_COLUMN) {
       columns.push(state.sorts.slice(start, start + SORTS_PER_COLUMN));
@@ -1597,7 +1604,7 @@
       const rows = group.map((criterion, offset) => {
         const index = base + offset;
         const options = fields.map(([value, label]) => {
-          const taken = value !== LAYOUT_SORT && used.has(value) && value !== criterion.key;
+          const taken = !isLayoutSort(value) && used.has(value) && value !== criterion.key;
           return `<option value="${value}"${value === criterion.key ? " selected" : ""}${taken ? " disabled" : ""}>${label}</option>`;
         }).join("");
         const remove = state.sorts.length > 1
@@ -2582,7 +2589,7 @@
     const packed = packMemo.packed;
     const from = packMemo.repackFrom;
     if (layoutActive()) {
-      if (!packed || packed.viewColumns !== columns || from != null) {
+      if (!packed || packed.viewColumns !== columns || packed.layoutKey !== state.sorts[0].key || from != null) {
         packMemo.packed = packProcesses(cards, columns);
       }
     } else if (!packed || packed.columns !== columns || from === 0) {
@@ -2623,9 +2630,11 @@
         done: !classes.has(reviewClass(row)),
       };
     });
-    const laid = window.ProcessLayout.layoutProcesses({
-      cards: input, links: state.convLinks, maxColumns: viewColumns, aspect: screenAspectCells(),
-    });
+    const layoutKey = state.sorts[0].key;
+    const layoutInput = { cards: input, links: state.convLinks, maxColumns: viewColumns, aspect: screenAspectCells() };
+    const laid = layoutKey === HV_LAYOUT_SORT
+      ? window.HvLayout.layoutHv(layoutInput)
+      : window.ProcessLayout.layoutProcesses(layoutInput);
     const byId = new Map(cards.map((windows) => [String(windows[0].location_id), windows[0]]));
     const cells = laid.cells.map((cell) => ({
       row: byId.get(cell.id), gr: cell.row, gc: cell.col, group: cell.group, root: Boolean(cell.root),
@@ -2634,14 +2643,28 @@
     const packed = {
       columns: Math.max(laid.columns, viewColumns),
       viewColumns,
+      layoutKey,
       totalRows: Math.max(laid.totalRows, 1),
       cells,
+      pipes: laid.pipes || [],
       starts: [0],
       anchors: [],
       anchorStarts: [0],
     };
     assignLinkHues(packed.cells);
     assignJoins(packed.cells);
+    // A connector takes the hue of the process it leads to (grey for a link between two branches).
+    const tones = new Map();
+    for (const cell of cells) {
+      if (cell.group >= 0 && !tones.has(cell.group)) {
+        tones.set(cell.group, cell);
+      }
+    }
+    for (const pipe of packed.pipes) {
+      const tone = tones.get(pipe.group);
+      pipe.linkH = tone ? tone.linkH : 216;
+      pipe.grey = !tone;
+    }
     return packed;
   }
 
@@ -2691,6 +2714,24 @@
 
   function cardKey(row) {
     return `${row.location_id}|${row.image_key || ""}`;
+  }
+
+  // The HV layout's connector cells in the drawn rows: a bar from the cell's centre out of each side the link leaves
+  // by, in the hue of the process it leads to. Redrawn whole on every render; they hold no state.
+  function drawPipes(pipes, first, last) {
+    els.grid.querySelectorAll(".pipe").forEach((node) => node.remove());
+    const html = [];
+    for (const pipe of pipes) {
+      if (pipe.row < first || pipe.row >= last) {
+        continue;
+      }
+      const arms = ["n", "e", "s", "w"].filter((side) => pipe[side]).map((side) => `<span class="arm-${side}"></span>`);
+      html.push(`<div class="pipe${pipe.grey ? " grey" : ""}" aria-hidden="true" style="--link-h:${pipe.linkH};`
+        + `grid-column:${pipe.col + 1};grid-row:${pipe.row - first + 1}">${arms.join("")}</div>`);
+    }
+    if (html.length) {
+      els.grid.insertAdjacentHTML("beforeend", html.join(""));
+    }
   }
 
   function reconcileGrid(visible, rowOffset) {
@@ -2806,6 +2847,7 @@
       els.grid.innerHTML = visible.map((cell) => cellHtml(cell, first)).join("");
       paintVisible();
     }
+    drawPipes(layout.pipes || [], first, last);
     applyLinkHot(linkHotId);
     const card = els.grid.querySelector(".card");
     if (!card) {
@@ -2850,6 +2892,7 @@
   const MINIMAP_MARGIN = 8;
   const MINIMAP_COLOURS = { unknown: "#4ade80", approved: "#7dd3fc", rejected: "#f87171" };
   const MINIMAP_VIEW = "#ef4444";
+  const MINIMAP_PIPE = "#9aa3af";
 
   /**
    * Size of the map and the screen's box on it, in CSS pixels.
@@ -2963,6 +3006,23 @@
       }
       ctx.fillStyle = MINIMAP_COLOURS[kind] || MINIMAP_COLOURS.unknown;
       ctx.fillRect(cell.gc * geo.pitch, cell.gr * geo.pitch, geo.tile, geo.tile);
+    }
+    if (packed.pipes && packed.pipes.length) {
+      ctx.strokeStyle = MINIMAP_PIPE;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      const half = geo.tile / 2;
+      for (const pipe of packed.pipes) {
+        const x = pipe.col * geo.pitch + half;
+        const y = pipe.row * geo.pitch + half;
+        for (const [side, dx, dy] of [["n", 0, -1], ["e", 1, 0], ["s", 0, 1], ["w", -1, 0]]) {
+          if (pipe[side]) {
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + dx * (geo.pitch / 2 + 0.5), y + dy * (geo.pitch / 2 + 0.5));
+          }
+        }
+      }
+      ctx.stroke();
     }
     const { view } = geo;
     if (view.w > 0 && view.h > 0) {
@@ -4164,7 +4224,7 @@
     const add = event.target.closest("#sort-add");
     if (add) {
       const used = new Set(state.sorts.map((item) => item.key));
-      const next = sortFields().find(([value]) => value !== LAYOUT_SORT && !used.has(value));
+      const next = sortFields().find(([value]) => !isLayoutSort(value) && !used.has(value));
       if (next) {
         state.sorts.push({ key: next[0], desc: CARD_SORT_WORST_DESC.get(next[0]) || false });
         renderSortStack();
@@ -4192,8 +4252,8 @@
     if (!select) {
       return;
     }
-    if (select.value === LAYOUT_SORT) {
-      state.sorts = [{ key: LAYOUT_SORT, desc: false }];
+    if (isLayoutSort(select.value)) {
+      state.sorts = [{ key: select.value, desc: false }];
       state.jumpToRoot = true;
     } else if (layoutActive()) {
       state.sorts = [{ key: select.value, desc: false }];
