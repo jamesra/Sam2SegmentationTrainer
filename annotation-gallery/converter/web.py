@@ -102,16 +102,21 @@ def card_rows(crops: Path) -> List[Dict[str, Any]]:
 
 
 def link_rows(crops: Path) -> List[List[int]]:
-    """The structure's location links as ``[a, b]`` pairs; empty when the build predates link storage."""
+    """The structure's location links as ``[a, b]`` pairs, a merged location's drawn to its survivor
+    (``converter.merge``); empty when the build predates link storage."""
+    from converter import merge
+
     if not catalog.sqlite_path(crops).is_file():
         return []
     connection = catalog.connect(crops)
     try:
         if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'converter_links'").fetchone() is None:
             return []
-        return [[int(row[0]), int(row[1])] for row in connection.execute("SELECT a, b FROM converter_links ORDER BY a, b")]
+        links = [[int(row[0]), int(row[1])] for row in connection.execute("SELECT a, b FROM converter_links ORDER BY a, b")]
     finally:
         connection.close()
+    merged = merge.merged_map(crops)
+    return merge.fold_links(links, merged) if merged else links
 
 
 def failed_rows(crops: Path) -> List[Dict[str, Any]]:
@@ -123,7 +128,15 @@ def approved_batch(crops: Path) -> List[Dict[str, Any]]:
 
     ``source_hash`` identifies the shape the card was built from; a writer compares it with the location's current shape
     and skips (or flags) a location someone edited since. Rejected and pending cards are not in the batch.
+
+    ``merge_location_ids``: the locations folded into this one (``converter.merge``). The writer merges them as Viking
+    does: the row's outline (their union) goes to this location, they are deleted, and this location gains their links.
     """
+    from converter import merge
+
+    merged_by_survivor: Dict[int, List[int]] = {}
+    for victim, survivor in merge.merged_map(crops).items():
+        merged_by_survivor.setdefault(survivor, []).append(victim)
     approved = catalog.load_approved(crops)
     if not approved:
         return []
@@ -158,6 +171,7 @@ def approved_batch(crops: Path) -> List[Dict[str, Any]]:
                 "downsample": row["downsample"],
                 "iou": row["iou"],
                 "built_at": row["built_at"],
+                "merge_location_ids": sorted(merged_by_survivor.get(int(row["location_id"]), [])),
             }
         )
     return batch

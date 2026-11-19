@@ -71,6 +71,7 @@ from cardmask import drop_card_masks, ensure_card_mask
 from negatives_view import negative_bitmask
 import update_all
 from converter import jobs as converter_jobs
+from converter import merge as converter_merge
 from converter import odata as odata_module
 from converter import serverreview
 from converter import web as converter_web
@@ -364,8 +365,13 @@ def catalog_body(crops: Path, volume: str, permission: str, crop_size: int) -> t
             return cached[1], cached[2]
     # ``split``: the training run's validation / training locations (validation_split.json), or None when no run
     # has published one; the page's Split filter uses it.
+    rows = list_catalog_rows(crops)
+    # A converter card folded into another location's (converter.merge) is not listed: one card per object.
+    merged = converter_merge.merged_map(crops) if converter_web.is_converter_crops(crops) else {}
+    if merged:
+        rows = [row for row in rows if int(row["location_id"]) not in merged]
     body = json.dumps(
-        {"volume": volume, "permission": permission, "cropSize": crop_size, "rows": list_catalog_rows(crops),
+        {"volume": volume, "permission": permission, "cropSize": crop_size, "rows": rows,
          "split": read_split_file(crops)}
     ).encode("utf-8")
     packed = gzip.compress(body, compresslevel=5)
@@ -1148,6 +1154,7 @@ class GalleryHandler(BaseHTTPRequestHandler):
           accepted here, approved and marked converted so the batch leaves them out.
         - Annotations the structure no longer has (deleted, usually merged into another's polygon): their cards go.
         - The location links are read again, so a merge's survivor takes the deleted location's place in the layout.
+        - Overlapping proposals on one section fold into one card (converter.merge).
         """
         if not self._review_granted(volume):
             return
@@ -1174,10 +1181,11 @@ class GalleryHandler(BaseHTTPRequestHandler):
         removed = converter_web.remove_gone(crops, live)
         if live:
             converter_web.replace_links(crops, links)
+        merges = converter_merge.merge_build(crops)
         changed = converter_web.mark_converted(crops, polygons)
         if changed:
             review_locations(crops, changed, "approve")
-        self._send_json({"ok": True, "converted": len(changed), "location_ids": changed, "removed": removed})
+        self._send_json({"ok": True, "converted": len(changed), "location_ids": changed, "removed": removed, "merged": merges})
 
     def _handle_converter_edit(self, volume: str) -> None:
         """POST {location_id, image_key, rings}: a retraced outline replaces the card's proposal (the batch, not the database)."""

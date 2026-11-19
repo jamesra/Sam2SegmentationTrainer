@@ -148,6 +148,11 @@ All defined in `docs/depth_relative_trust.md`:
     boxes; the largest process on each free side of a branch hangs straight off it, the rest from a bus of connector
     cells on the branch's row; long processes wind (Chan et al. 2002); the wind height is the one of {4, 6, 8, 12, 16,
     24, none} whose drawing best matches the screen's shape.
+  *Same-section merges* (`converter/merge.py`, 2026-11-18): proposals of one structure on one section that overlap in
+  area (edge contact excluded, chains included) fold into one card, Viking's `SameStructureMerge` rule: the union goes
+  to the survivor (most links, then lowest id), the others leave the page and their links move to the survivor; the
+  batch lists them under `merge_location_ids` for deletion. RC1 5600 had 94 such groups, 8888 had 46: two parallel
+  traces of the same neurites.
   Why connectors: requiring every pair of linked cards to touch is a unit-length grid embedding, NP-complete for trees
   of degree 4 (Bhatt & Cosmadakis 1987) and for binary trees (Gregori 1989), and impossible at a branch with more than
   four links. James chose connector cells over repeated "ghost" branch cards (2026-11-18).

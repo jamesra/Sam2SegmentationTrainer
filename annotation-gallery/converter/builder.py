@@ -467,6 +467,13 @@ class Builder:
                 LOGGER.exception("location %s failed", record.id)
                 self._record_failure(record, f"error: {error}")
                 summary.note_failure("error")
+        # Overlapping proposals on one section fold into one card, as Viking merges them (converter.merge).
+        try:
+            from converter import merge
+
+            merge.merge_build(self.crops)
+        except (OSError, sqlite3.Error, ValueError):
+            LOGGER.exception("same-section merge of %s failed", self.crops)
         # Every card size's thumbnails now, so changing the card size in the gallery finds them ready instead of
         # encoding each from its full crop on first view. Converter builds are outside the registry the startup
         # backfill walks.
