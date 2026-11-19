@@ -102,14 +102,14 @@ ensure_tb_profiler_plugin() {
   return 0
 }
 
-# The unit tests need pytest; an image built before it was added gets it here. Not fatal: training does not need it.
+# The unit tests need pytest and hypothesis; an image built before it was added gets it here. Not fatal: training does not need it.
 ensure_pytest() {
-  if python -c "import pytest" >/dev/null 2>&1; then
+  if python -c "import pytest, hypothesis" >/dev/null 2>&1; then
     return 0
   fi
-  echo "cursor-dev-entry: installing pytest"
-  if ! pip install --no-cache-dir pytest; then
-    echo "cursor-dev-entry: pytest install failed; run tests after installing it by hand" >&2
+  echo "cursor-dev-entry: installing pytest and hypothesis"
+  if ! pip install --no-cache-dir pytest hypothesis; then
+    echo "cursor-dev-entry: pytest/hypothesis install failed; run tests after installing them by hand" >&2
     return 0
   fi
 }

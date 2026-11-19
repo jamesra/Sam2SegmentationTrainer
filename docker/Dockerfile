@@ -62,7 +62,7 @@ RUN git clone https://github.com/facebookresearch/sam2.git /opt/sam2 \
 RUN pip install --no-cache-dir torch-tb-profiler
 
 # Test runner (the unit tests run in the container). Own layer so it does not rebuild SAM2.
-RUN pip install --no-cache-dir pytest
+RUN pip install --no-cache-dir pytest hypothesis
 
 COPY docker/mount-network-shares.sh docker/drop-sys-admin-after-mounts.sh docker/cursor-dev-entry.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/mount-network-shares.sh \
