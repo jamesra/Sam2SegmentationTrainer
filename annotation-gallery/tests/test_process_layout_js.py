@@ -254,10 +254,34 @@ def test_snake_shape_follows_the_aspect() -> None:
 
 
 @needs_node
-def test_a_short_tail_is_left_straight() -> None:
-    cards, links, ids = _long_arm_star(8)  # 8 cards, 3 of them in the rows of the other processes: tail of 5
+def test_a_short_process_is_left_straight() -> None:
+    cards, links, ids = _long_arm_star(6)  # six cards: one layer and its turn would gain nothing
     at = _layout(cards, links)["at"]
     assert {at[i][1] for i in ids} == {at[ids[0]][1]}
+
+
+@needs_node
+def test_a_snake_starts_at_the_first_card_with_an_empty_side() -> None:
+    # A long string beside a short one: nothing is left of the long one, so it snakes left from its first card while
+    # the short one still sits beside its first rows.
+    c1, l1, long_ids = _chain("A", 40, 1)
+    c2, l2, short_ids = _chain("B", 4, 1)
+    out = _layout({**c1, **c2}, l1 + l2, aspect=1.0)
+    at = out["at"]
+    _assert_path_touches(at, long_ids)
+    first_row, first_col = at["A0"]
+    assert [at[f"A{k}"] for k in range(5)] == [(first_row + k, first_col) for k in range(5)]
+    assert at["A5"] == (first_row + 4, first_col - 1)
+    assert at["B0"] == (first_row, first_col + 1)
+
+
+@needs_node
+def test_snakes_close_up_the_rows_they_free() -> None:
+    cards, links, ids = _long_arm_star(120)
+    out = _layout(cards, links, aspect=16 / 9)
+    assert out["totalRows"] < 40
+    used_rows = {row for row, _col in out["at"].values()}
+    assert used_rows == set(range(out["totalRows"]))
 
 
 @needs_node

@@ -15,11 +15,11 @@
  * Locations that are approved or rejected drop out: a process whose cards are all done, and a done branch left with
  * no process other than the one that reaches it.
  *
- * A process that runs on past every other process of its tree (or of the strings) - its tail, the top or bottom rows
- * where it is the only card - snakes instead of hanging as one long column: it runs on SNAKE_HEIGHT cards, steps two
- * columns sideways (one turn card in the empty column between), runs back, and so on. When a band of layers is as
- * wide as the screen's shape asks for, it steps one empty row further out and snakes back. Neighbours along the
- * process stay touching.
+ * Then, outside in, a process with a free end snakes from its first card that has nothing to its left or right: it
+ * runs on SNAKE_HEIGHT cards, steps two columns sideways into the empty side (one turn card in the empty column
+ * between), runs back, and so on; bands of layers, as wide as the screen's shape asks for (narrower where space is
+ * short), are one empty row apart. A snake must land on empty cells touching no other process's card; after each one
+ * the rows left empty are removed, so the block closes up. Neighbours along the process stay touching.
  */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
@@ -59,7 +59,7 @@
     };
 
     for (const tree of trees) {
-      place(snakeTails(layoutTree(tree, cardById), aspect));
+      place(snakeProcesses(layoutTree(tree, cardById), tree.processes, aspect));
     }
 
     // Unbranched strings: columns, longest first, each running down from its lower-Z end.
@@ -81,7 +81,7 @@
         }
         col += width;
       }
-      place(snakeTails(list, aspect));
+      place(snakeProcesses(list, strings.map((component) => component.processes[0]), aspect));
     }
 
     // Unlinked cards, and branches left with nothing attached, in Z order wrapping at maxColumns.
@@ -358,60 +358,148 @@
   }
 
   /**
-   * Snakes the tails of one block (a tree, or the unbranched strings): the rows at its bottom, then at its top, that
-   * each hold a single one-cell card of one process in one column. The tail's first card stays put. The number of
-   * layers per band is picked so the snake's box is closest to `aspect` (columns over rows); it turns toward the side
-   * of the block with more columns. A tail of SNAKE_HEIGHT cards or fewer is left alone. Cells change in place; the
-   * list is shifted right if the snake ran past column 0.
+   * Snakes the outer processes of one block (a tree, or the unbranched strings), outside in. A process qualifies when
+   * one end is free (not a branch) and it is drawn as one straight column of one-cell cards. From its first card
+   * (counting from the branch it hangs from) that has nothing to its left or right, it snakes into that side: it runs
+   * on SNAKE_HEIGHT cards, steps two columns sideways (one turn card in the empty column between), runs back, and so
+   * on, in bands one empty row apart. A snake is accepted only where every card lands on an empty cell that touches no
+   * card of another process; it tries the band width closest to `aspect` (columns over rows) first, then narrower
+   * ones, then a later first card. After each snake, rows left empty are removed, so the block closes up before the
+   * next process is tried. Cells change in place; the list is shifted right if a snake ran past column 0.
+   * @param {object[]} list  the block's cells
+   * @param {{nodes: string[], ends: (string|null)[]}[]} processes  the block's processes
+   * @param {number} aspect
    */
-  function snakeTails(list, aspect) {
-    for (const out of [1, -1]) {
-      const byRow = new Map();
-      for (const cell of list) {
-        for (let r = cell.row; r < cell.row + cell.h; r++) {
-          if (!byRow.has(r)) {
-            byRow.set(r, []);
-          }
-          byRow.get(r).push(cell);
-        }
-      }
-      // Rows from the block's outer edge inward.
-      const rows = [...byRow.keys()].sort((a, b) => (a - b) * -out);
-      const tail = [];
-      for (const r of rows) {
-        const here = byRow.get(r);
-        const cell = here[0];
-        if (here.length !== 1 || cell.kind !== "process" || cell.w !== 1 || cell.h !== 1
-          || (tail.length && (cell.group !== tail[0].group || cell.col !== tail[0].col))) {
-          break;
-        }
-        tail.push(cell);
-      }
-      if (tail.length === rows.length) {
-        tail.pop(); // the whole block is one column: keep its first card as the body
-      }
-      const n = tail.length;
-      if (n <= SNAKE_HEIGHT) {
+  function snakeProcesses(list, processes, aspect) {
+    const cellById = new Map(list.map((cell) => [cell.id, cell]));
+    const rootCell = list.find((cell) => cell.root);
+    const centre = () => (rootCell ? rootCell.row : Math.min(...list.map((cell) => cell.row)));
+
+    // Each candidate's cards from the inner end to the free end.
+    const candidates = [];
+    for (const p of processes) {
+      if (p.ends[0] !== null && p.ends[1] !== null) {
         continue;
       }
-      tail.reverse(); // from the card next to the body outward
-      let best = null;
-      for (let layers = 2; layers <= Math.ceil(n / SNAKE_HEIGHT) + 1; layers++) {
-        const size = snakeSize(n, SNAKE_HEIGHT, layers);
-        const miss = Math.abs(Math.log(size.width / size.height / aspect));
-        if (!best || miss < best.miss - 1e-9) {
-          best = { layers, miss };
+      let nodes = p.nodes.slice();
+      const cells = nodes.map((id) => cellById.get(id));
+      if (cells.some((cell) => !cell || cell.w !== 1 || cell.h !== 1 || cell.col !== cells[0].col)) {
+        continue;
+      }
+      // The free end is the outer end; with both ends free (a string), the end farther from the block's top.
+      const reverse = p.ends[0] === null && p.ends[1] !== null
+        ? true
+        : p.ends[0] === null && p.ends[1] === null && cells[0].row > cells[cells.length - 1].row;
+      if (reverse) {
+        nodes = nodes.reverse();
+      }
+      candidates.push(nodes);
+    }
+    const outerReach = (nodes) => Math.abs(cellById.get(nodes[nodes.length - 1]).row - centre());
+    candidates.sort((a, b) => outerReach(b) - outerReach(a) || b.length - a.length);
+
+    const key = (row, col) => `${row},${col}`;
+    for (const nodes of candidates) {
+      const cells = nodes.map((id) => cellById.get(id));
+      const n = cells.length;
+      if (n <= SNAKE_HEIGHT + 1) {
+        continue;
+      }
+      const out = Math.sign(cells[n - 1].row - cells[0].row);
+      const straight = cells.every((cell, i) => cell.col === cells[0].col && cell.row === cells[0].row + out * i);
+      if (!out || !straight) {
+        continue;
+      }
+      const own = new Set(nodes);
+      const at = new Map();
+      for (const cell of list) {
+        for (let r = cell.row; r < cell.row + cell.h; r++) {
+          for (let c = cell.col; c < cell.col + cell.w; c++) {
+            at.set(key(r, c), cell.id);
+          }
         }
       }
-      const col = tail[0].col;
-      const right = Math.max(...list.map((cell) => cell.col + cell.w)) - 1 - col;
-      const side = right >= col ? 1 : -1;
-      const first = tail[0].row;
-      tail.forEach((cell, i) => {
-        const spot = snakeSpot(i, SNAKE_HEIGHT, best.layers, out, side);
-        cell.row = first + spot.dr;
-        cell.col = col + spot.dc;
-      });
+      const foreign = (row, col) => {
+        const id = at.get(key(row, col));
+        return id !== undefined && !own.has(id);
+      };
+      const col = cells[0].col;
+      let done = false;
+      for (let start = 0; start + SNAKE_HEIGHT < n && !done; start++) {
+        const length = n - start;
+        const row0 = cells[start].row;
+        for (const side of [1, -1]) {
+          if (foreign(row0, col + side)) {
+            continue; // something beside this card on that side
+          }
+          // Band widths: the one closest to the screen's shape first, then narrower ones.
+          const widths = [];
+          // A band that another follows must end on an outward layer, so it has an odd number of layers.
+          const fitsBands = (layers) => layers % 2 === 1 || length <= layers * SNAKE_HEIGHT + (layers - 1) + 1;
+          for (let layers = 2; layers <= Math.ceil(length / SNAKE_HEIGHT) + 1; layers++) {
+            if (!fitsBands(layers)) {
+              continue;
+            }
+            const size = snakeSize(length, SNAKE_HEIGHT, layers);
+            widths.push({ layers, miss: Math.abs(Math.log(size.width / size.height / aspect)) });
+          }
+          widths.sort((x, y) => x.miss - y.miss || x.layers - y.layers);
+          const best = widths.length ? widths[0].layers : 3;
+          const order = [best];
+          for (let layers = best - 1; layers >= 2; layers--) {
+            if (fitsBands(layers)) {
+              order.push(layers);
+            }
+          }
+          for (const layers of order) {
+            const spots = [];
+            let ok = true;
+            for (let i = 0; i < length && ok; i++) {
+              const spot = snakeSpot(i, SNAKE_HEIGHT, layers, out, side);
+              const r = row0 + spot.dr;
+              const c = col + spot.dc;
+              const stays = r === cells[start + i].row && c === cells[start + i].col;
+              if (foreign(r, c)) {
+                ok = false;
+              } else if (!stays && (foreign(r - 1, c) || foreign(r + 1, c) || foreign(r, c - 1) || foreign(r, c + 1))) {
+                ok = false; // it would touch another process's card
+              }
+              spots.push([r, c]);
+            }
+            if (!ok) {
+              continue;
+            }
+            cells.slice(start).forEach((cell, i) => {
+              cell.row = spots[i][0];
+              cell.col = spots[i][1];
+            });
+            done = true;
+            break;
+          }
+          if (done) {
+            break;
+          }
+        }
+      }
+      if (done) {
+        // Close up: drop the rows no card uses any more.
+        const used = new Set();
+        for (const cell of list) {
+          for (let r = cell.row; r < cell.row + cell.h; r++) {
+            used.add(r);
+          }
+        }
+        const rows = [...used].sort((x, y) => x - y);
+        const shift = new Map();
+        let next = rows[0];
+        for (const r of rows) {
+          shift.set(r, next);
+          next += 1;
+        }
+        for (const cell of list) {
+          cell.row = shift.get(cell.row);
+        }
+      }
     }
     const left = Math.min(...list.map((cell) => cell.col));
     if (left < 0) {
