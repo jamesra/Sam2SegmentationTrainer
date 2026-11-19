@@ -2589,7 +2589,8 @@
     const packed = packMemo.packed;
     const from = packMemo.repackFrom;
     if (layoutActive()) {
-      if (!packed || packed.viewColumns !== columns || packed.layoutKey !== state.sorts[0].key || from != null) {
+      if (!packed || packed.viewColumns !== columns || packed.layoutKey !== state.sorts[0].key
+        || packed.screenRows !== screenRowCount() || from != null) {
         packMemo.packed = packProcesses(cards, columns);
       }
     } else if (!packed || packed.columns !== columns || from === 0) {
@@ -2631,7 +2632,10 @@
       };
     });
     const layoutKey = state.sorts[0].key;
-    const layoutInput = { cards: input, links: state.convLinks, maxColumns: viewColumns, aspect: screenAspectCells() };
+    const screenRows = screenRowCount();
+    const layoutInput = {
+      cards: input, links: state.convLinks, maxColumns: viewColumns, aspect: screenAspectCells(), snakeHeight: screenRows,
+    };
     const laid = layoutKey === HV_LAYOUT_SORT
       ? window.HvLayout.layoutHv(layoutInput)
       : window.ProcessLayout.layoutProcesses(layoutInput);
@@ -2644,6 +2648,7 @@
       columns: Math.max(laid.columns, viewColumns),
       viewColumns,
       layoutKey,
+      screenRows,
       totalRows: Math.max(laid.totalRows, 1),
       cells,
       pipes: laid.pipes || [],
@@ -2694,8 +2699,20 @@
   function screenAspectCells() {
     const cardPx = cardPixelSize();
     const across = Math.max(1, els.scroller.clientWidth - 32) / (cardPx + GRID_GAP);
-    const down = Math.max(1, els.scroller.clientHeight) / (rowStride || (cardPx + 20));
+    const down = scrollerHeightSansBar() / (rowStride || (cardPx + 20));
     return across / down;
+  }
+
+  // The scroller's height less room for a horizontal scrollbar, whether or not one shows: the layouts read the screen's
+  // shape from it, and a layout that adds or removes the scrollbar must not change the shape it was made for.
+  function scrollerHeightSansBar() {
+    return Math.max(1, els.scroller.offsetHeight - 24 - 20);
+  }
+
+  // How many card rows fit on the screen: the height of a snake's layers, so a whole band is seen without scrolling.
+  function screenRowCount() {
+    const cardPx = cardPixelSize();
+    return Math.max(1, Math.floor(scrollerHeightSansBar() / (rowStride || (cardPx + 20))));
   }
 
   // How many cards fit across the screen: the scroller's width less the grid's 16px margins. The grid itself can be

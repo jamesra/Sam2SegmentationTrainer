@@ -293,3 +293,35 @@ def test_a_long_unbranched_string_snakes_too() -> None:
     _assert_path_touches(at, long_ids)
     assert len(set(at.values())) == len(at)
     assert out["totalRows"] < 40
+
+
+@needs_node
+def test_snake_layers_are_as_tall_as_the_screen_rows() -> None:
+    cards, links, ids = _long_arm_star(60)
+    for height in (2, 3, 7):
+        at = _layout(cards, links, snakeHeight=height)["at"]
+        _assert_path_touches(at, ids)
+        assert len(set(at.values())) == len(at)
+        # Away from the arm's own column (which keeps its cards up to where the snake starts), no vertical run of the
+        # arm is longer than a layer, except where two bands join: a layer, the turn card in the empty row, a layer.
+        home = at[ids[0]][1]
+        rows_by_col = {}
+        for i in ids:
+            if at[i][1] != home:
+                rows_by_col.setdefault(at[i][1], []).append(at[i][0])
+        assert rows_by_col, height
+        assert any(len(rows) >= height for rows in rows_by_col.values()), height
+        for rows in rows_by_col.values():
+            assert max(len(run) for run in _runs(sorted(rows))) <= 2 * height + 1, (height, sorted(rows))
+
+
+def _runs(values):
+    """Consecutive runs in a sorted list."""
+    run = [values[0]]
+    for v in values[1:]:
+        if v == run[-1] + 1:
+            run.append(v)
+        else:
+            yield run
+            run = [v]
+    yield run

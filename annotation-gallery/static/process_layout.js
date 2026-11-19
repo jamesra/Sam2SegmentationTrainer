@@ -16,7 +16,7 @@
  * no process other than the one that reaches it.
  *
  * Then, outside in, a process with a free end snakes from its first card that has nothing to its left or right: it
- * runs on SNAKE_HEIGHT cards, steps two columns sideways into the empty side (one turn card in the empty column
+ * runs on `snakeHeight` cards (as many rows as fit on the screen), steps two columns sideways into the empty side (one turn card in the empty column
  * between), runs back, and so on; bands of layers, as wide as the screen's shape asks for (narrower where space is
  * short), are one empty row apart. A snake must land on empty cells touching no other process's card; after each one
  * the rows left empty are removed, so the block closes up. Neighbours along the process stay touching.
@@ -35,7 +35,8 @@
    *          links: [string|number, string|number][], maxColumns?: number, aspect?: number}} input
    *   `w` and `h` are the card's size in grid cells (default 1); `done` is true once the card is approved or rejected;
    *   `maxColumns` is how wide unlinked cards may wrap; `aspect` is the screen's width over its height in grid cells
-   *   (default 16/9), the shape a snaking tail aims for.
+   *   (default 16/9), the shape a snake aims for; `snakeHeight` is how many card rows fit on the screen (default 5), the
+   *   height of a snake's layers so a whole band can be seen without scrolling up and down.
    * @returns {{cells: {id: string, row: number, col: number, w: number, h: number, group: number, kind: string}[],
    *            columns: number, totalRows: number}}
    *   `group` is the process number (-1 for a branch or an unlinked card); `cells` are in reading order.
@@ -43,6 +44,7 @@
   function layoutProcesses(input) {
     const maxColumns = Math.max(1, Number(input.maxColumns) || 1);
     const aspect = Number(input.aspect) > 0 ? Number(input.aspect) : 16 / 9;
+    const snakeHeight = Math.max(1, Math.floor(Number(input.snakeHeight)) || SNAKE_HEIGHT);
     const { cardById, trees, strings, leftovers } = analyseLinks(input);
     const cells = [];
     let bottom = 0;
@@ -59,7 +61,7 @@
     };
 
     for (const tree of trees) {
-      place(snakeProcesses(layoutTree(tree, cardById), tree.processes, aspect));
+      place(snakeProcesses(layoutTree(tree, cardById), tree.processes, aspect, snakeHeight));
     }
 
     // Unbranched strings: columns, longest first, each running down from its lower-Z end.
@@ -81,7 +83,7 @@
         }
         col += width;
       }
-      place(snakeProcesses(list, strings.map((component) => component.processes[0]), aspect));
+      place(snakeProcesses(list, strings.map((component) => component.processes[0]), aspect, snakeHeight));
     }
 
     // Unlinked cards, and branches left with nothing attached, in Z order wrapping at maxColumns.
@@ -319,6 +321,8 @@
   }
 
   const SNAKE_HEIGHT = 5;
+  // A process this short or shorter never snakes: one layer and a turn would gain nothing.
+  const MIN_SNAKE = 6;
 
   /**
    * Where the i-th card of a snake goes, relative to its first card: `layers` columns of `height` cards per band, two
@@ -361,7 +365,7 @@
    * Snakes the outer processes of one block (a tree, or the unbranched strings), outside in. A process qualifies when
    * one end is free (not a branch) and it is drawn as one straight column of one-cell cards. From its first card
    * (counting from the branch it hangs from) that has nothing to its left or right, it snakes into that side: it runs
-   * on SNAKE_HEIGHT cards, steps two columns sideways (one turn card in the empty column between), runs back, and so
+   * on `height` cards, steps two columns sideways (one turn card in the empty column between), runs back, and so
    * on, in bands one empty row apart. A snake is accepted only where every card lands on an empty cell that touches no
    * card of another process; it tries the band width closest to `aspect` (columns over rows) first, then narrower
    * ones, then a later first card. After each snake, rows left empty are removed, so the block closes up before the
@@ -369,8 +373,9 @@
    * @param {object[]} list  the block's cells
    * @param {{nodes: string[], ends: (string|null)[]}[]} processes  the block's processes
    * @param {number} aspect
+   * @param {number} height  cards per layer
    */
-  function snakeProcesses(list, processes, aspect) {
+  function snakeProcesses(list, processes, aspect, height) {
     const cellById = new Map(list.map((cell) => [cell.id, cell]));
     const rootCell = list.find((cell) => cell.root);
     const centre = () => (rootCell ? rootCell.row : Math.min(...list.map((cell) => cell.row)));
@@ -402,7 +407,7 @@
     for (const nodes of candidates) {
       const cells = nodes.map((id) => cellById.get(id));
       const n = cells.length;
-      if (n <= SNAKE_HEIGHT + 1) {
+      if (n <= Math.max(height + 1, MIN_SNAKE)) {
         continue;
       }
       const out = Math.sign(cells[n - 1].row - cells[0].row);
@@ -425,7 +430,7 @@
       };
       const col = cells[0].col;
       let done = false;
-      for (let start = 0; start + SNAKE_HEIGHT < n && !done; start++) {
+      for (let start = 0; start + height < n && !done; start++) {
         const length = n - start;
         const row0 = cells[start].row;
         for (const side of [1, -1]) {
@@ -435,12 +440,12 @@
           // Band widths: the one closest to the screen's shape first, then narrower ones.
           const widths = [];
           // A band that another follows must end on an outward layer, so it has an odd number of layers.
-          const fitsBands = (layers) => layers % 2 === 1 || length <= layers * SNAKE_HEIGHT + (layers - 1) + 1;
-          for (let layers = 2; layers <= Math.ceil(length / SNAKE_HEIGHT) + 1; layers++) {
+          const fitsBands = (layers) => layers % 2 === 1 || length <= layers * height + (layers - 1) + 1;
+          for (let layers = 2; layers <= Math.ceil(length / height) + 1; layers++) {
             if (!fitsBands(layers)) {
               continue;
             }
-            const size = snakeSize(length, SNAKE_HEIGHT, layers);
+            const size = snakeSize(length, height, layers);
             widths.push({ layers, miss: Math.abs(Math.log(size.width / size.height / aspect)) });
           }
           widths.sort((x, y) => x.miss - y.miss || x.layers - y.layers);
@@ -455,7 +460,7 @@
             const spots = [];
             let ok = true;
             for (let i = 0; i < length && ok; i++) {
-              const spot = snakeSpot(i, SNAKE_HEIGHT, layers, out, side);
+              const spot = snakeSpot(i, height, layers, out, side);
               const r = row0 + spot.dr;
               const c = col + spot.dc;
               const stays = r === cells[start + i].row && c === cells[start + i].col;
