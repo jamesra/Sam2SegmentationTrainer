@@ -88,6 +88,7 @@
     scroller: document.getElementById("scroller"),
     spacer: document.getElementById("spacer"),
     grid: document.getElementById("grid"),
+    minimap: document.getElementById("minimap"),
     filters: document.getElementById("filters"),
     filtersToggle: document.getElementById("filters-toggle"),
     filterSummary: document.getElementById("filter-summary"),
@@ -2753,6 +2754,7 @@
     }
     const cards = ensureVisibleCards();
     const layout = layoutCards(cards);
+    scheduleMinimap();
     const { cardPx, columns, baseHeight, totalRows, rowOffsets, cells } = layout;
     els.grid.style.setProperty("--grid-gap", `${GRID_GAP}px`);
     els.grid.style.gridTemplateColumns = `repeat(${columns}, ${cardPx}px)`;
@@ -2826,6 +2828,106 @@
     els.scroller.scrollLeft = Math.max(0, left - (viewW - cardPx) / 2);
     els.scroller.scrollTop = Math.max(0, (rowOffsets[root.gr] || 0) - (viewH - baseHeight) / 2);
     return els.scroller.scrollTop;
+  }
+
+  // minimap-begin
+  // The Process / branch layout's mini-map, floating in the scroller's top-right corner. Each card slot is a 4px
+  // square with a 1px gap, coloured by its review state; a card whose Show box is unticked, or that the layout dropped,
+  // has no square. A 1px red box is the part of the grid on screen. The map takes the layout's shape but covers at most
+  // one card's area and half the screen each way; a layout too large for that is drawn with smaller squares.
+  const MINIMAP_PITCH = 5;
+  const MINIMAP_COLOURS = { unknown: "#4ade80", approved: "#7dd3fc", rejected: "#f87171" };
+  const MINIMAP_VIEW = "#ef4444";
+
+  /**
+   * Size of the map and the screen's box on it, in CSS pixels.
+   * @param {{columns: number, rows: number, cardPx: number, colPitch: number, rowPitch: number, viewW: number,
+   *          viewH: number, scrollLeft: number, scrollTop: number, gridLeft: number}} g
+   *   `colPitch`/`rowPitch` are a grid cell's stride on screen; `gridLeft` is the grid's offset inside the scroller.
+   * @returns {{width: number, height: number, pitch: number, tile: number,
+   *            view: {x: number, y: number, w: number, h: number}}}
+   */
+  function minimapGeometry(g) {
+    const naturalW = g.columns * MINIMAP_PITCH - 1;
+    const naturalH = g.rows * MINIMAP_PITCH - 1;
+    const scale = Math.min(
+      1,
+      Math.sqrt((g.cardPx * g.cardPx) / (naturalW * naturalH)),
+      g.viewW / 2 / naturalW,
+      g.viewH / 2 / naturalH,
+    );
+    const pitch = MINIMAP_PITCH * scale;
+    const width = Math.max(1, Math.round(naturalW * scale));
+    const height = Math.max(1, Math.round(naturalH * scale));
+    const clamp = (value, top) => Math.min(top, Math.max(0, value));
+    const x0 = clamp(((g.scrollLeft - g.gridLeft) / g.colPitch) * pitch, width);
+    const x1 = clamp(((g.scrollLeft + g.viewW - g.gridLeft) / g.colPitch) * pitch, width);
+    const y0 = clamp((g.scrollTop / g.rowPitch) * pitch, height);
+    const y1 = clamp(((g.scrollTop + g.viewH) / g.rowPitch) * pitch, height);
+    return { width, height, pitch, tile: pitch - scale, view: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+  }
+  // minimap-end
+
+  let minimapFrame = 0;
+
+  function scheduleMinimap() {
+    if (!minimapFrame) {
+      minimapFrame = requestAnimationFrame(() => {
+        minimapFrame = 0;
+        drawMinimap();
+      });
+    }
+  }
+
+  function drawMinimap() {
+    const canvas = els.minimap;
+    const packed = packMemo.packed;
+    if (!layoutActive() || !packed || !packed.cells.length) {
+      canvas.hidden = true;
+      return;
+    }
+    const cardPx = cardPixelSize();
+    const scroller = els.scroller;
+    const geo = minimapGeometry({
+      columns: packed.columns,
+      rows: packed.totalRows,
+      cardPx,
+      colPitch: cardPx + GRID_GAP,
+      rowPitch: rowStride || (cardPx + 20),
+      viewW: scroller.clientWidth || 1,
+      viewH: scroller.clientHeight || 1,
+      scrollLeft: scroller.scrollLeft,
+      scrollTop: scroller.scrollTop,
+      gridLeft: 16,
+    });
+    const box = scroller.getBoundingClientRect();
+    const scrollbar = scroller.offsetWidth - scroller.clientWidth;
+    canvas.style.top = `${box.top + 8}px`;
+    canvas.style.left = `${box.right - scrollbar - 8 - geo.width}px`;
+    canvas.style.width = `${geo.width}px`;
+    canvas.style.height = `${geo.height}px`;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(geo.width * dpr);
+    canvas.height = Math.round(geo.height * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, geo.width, geo.height);
+    const classes = visibleClasses();
+    for (const cell of packed.cells) {
+      const kind = reviewClass(cell.row);
+      if (!classes.has(kind)) {
+        continue;
+      }
+      ctx.fillStyle = MINIMAP_COLOURS[kind] || MINIMAP_COLOURS.unknown;
+      ctx.fillRect(cell.gc * geo.pitch, cell.gr * geo.pitch, geo.tile, geo.tile);
+    }
+    const { view } = geo;
+    if (view.w > 0 && view.h > 0) {
+      ctx.strokeStyle = MINIMAP_VIEW;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(view.x + 0.5, view.y + 0.5, Math.max(0, view.w - 1), Math.max(0, view.h - 1));
+    }
+    canvas.hidden = false;
   }
 
   function scheduleRender() {
@@ -3023,6 +3125,7 @@
       check.setAttribute("aria-label", label);
       check.setAttribute("aria-pressed", approved ? "true" : "false");
     });
+    scheduleMinimap();
   }
 
   function afterPaint() {
@@ -4327,6 +4430,7 @@
     // Keep the cards that stay in the drawn window: rebuilding them all made cards that never left the screen load again.
     render(false, true);
     scheduleReprioritize();
+    scheduleMinimap();
   });
   window.addEventListener("resize", () => {
     renderSortStack();
