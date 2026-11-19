@@ -139,8 +139,11 @@ All defined in `docs/depth_relative_trust.md`:
 - **2026-11-18 Converter card layouts (gallery, not the model).** The converter's "Process / branch" view places one
   structure's cards on a grid by how their locations are linked. Two layouts:
   - *Process / branch* (`static/process_layout.js`): processes are columns hung from their branch in Z order. A
-    process's tail, past every other process, snakes in 5-card layers two columns apart, one turn card in the empty
-    column; the layers per band are chosen to match the screen's shape.
+    process's free end, once nothing is beside it, snakes in layers as tall as the screen's card rows, two columns
+    apart, one turn card in the empty column; the layers per band are chosen to match the screen's shape. Before that,
+    islands (card groups touching nothing) move into empty space in busy rows, and long straight runs between two
+    branches through rows holding nothing else fold sideways in horizontal layers up to a screen wide, the freed rows
+    removed. On RC1 structure 8888 this took the layout from 145 to 97 rows, on 5600 from 207 to 191 (2026-11-18).
   - *Process / branch (HV)* (`static/hv_layout.js`): an HV-style orthogonal tree drawing with Z vertical. Subtrees are
     boxes; the largest process on each free side of a branch hangs straight off it, the rest from a bus of connector
     cells on the branch's row; long processes wind (Chan et al. 2002); the wind height is the one of {4, 6, 8, 12, 16,

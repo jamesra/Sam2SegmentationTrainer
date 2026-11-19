@@ -325,3 +325,73 @@ def _runs(values):
             yield run
             run = [v]
     yield run
+
+
+# ------------------------------------------------------------------------------------------------- condensing
+
+
+def _between_branches(middle=40):
+    """Root R with two short processes, a long process M from R to a second branch B, and three processes below B."""
+    cards, links = _star(below=True, lengths=(3, 2))
+    c, l, mids = _chain("M", middle, 101)
+    cards.update(c)
+    links += l + [("R", mids[0])]
+    cards["B"] = (101 + middle, 500)
+    links.append((mids[-1], "B"))
+    tails = []
+    for name, length in (("X", 4), ("Y", 3), ("W", 2)):
+        c, l, ids = _chain(name, length, 102 + middle)
+        cards.update(c)
+        links += l + [("B", ids[0])]
+        tails.append(ids)
+    return cards, links, mids, tails
+
+
+@needs_node
+def test_a_long_run_between_two_branches_folds_sideways_and_stays_joined() -> None:
+    cards, links, mids, tails = _between_branches(40)
+    out = _layout(cards, links, maxColumns=6, snakeHeight=50)
+    at = out["at"]
+    assert len(set(at.values())) == len(at), "two cards share a cell"
+    _assert_path_touches(at, [*mids, "B"])  # R has three processes; M need not touch it
+    _assert_path_touches(at, ["B", *tails[0]])  # the largest of B's processes hangs straight off it
+    for ids in tails[1:]:
+        _assert_path_touches(at, ids)
+    # Straight, M alone takes 40 rows; folded in layers up to 6 wide it takes far fewer.
+    assert out["totalRows"] < 30, out["totalRows"]
+    rows = {}
+    for i in mids:
+        rows.setdefault(at[i][0], []).append(i)
+    assert max(len(v) for v in rows.values()) >= 3, "some row holds a horizontal layer"
+
+
+def _condense(cells, max_columns=6):
+    script = (
+        f"const L = require({json.dumps(str(LAYOUT_JS))});"
+        f"const list = {json.dumps(cells)};"
+        f"console.log(JSON.stringify(L.condenseBlock(list, [], {max_columns})));"
+    )
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=60, check=False)
+    assert result.returncode == 0, result.stderr
+    return {c["id"]: (c["row"], c["col"]) for c in json.loads(result.stdout)}
+
+
+def _cell(i, row, col, kind="process", group=0, root=False):
+    return {"id": i, "row": row, "col": col, "w": 1, "h": 1, "kind": kind, "group": group, "root": root}
+
+
+@needs_node
+def test_an_island_beside_a_lone_run_moves_into_a_busy_row() -> None:
+    # A busy block on rows 0-1 (root and two columns), a column running down from it, and a two-card island beside the
+    # column lower down. The island moves up into the busy rows' empty space, touching nothing.
+    cells = [_cell("R", 0, 0, kind="branch", root=True), _cell("a", 0, 1, group=1), _cell("b", 0, 2, group=1),
+             _cell("e", 0, 6, group=4), _cell("c", 1, 0, group=2), _cell("d", 1, 2, group=1), _cell("f", 1, 6, group=4)]
+    cells += [_cell(f"m{k}", 2 + k, 0, group=2) for k in range(6)]
+    cells += [_cell("i0", 5, 3, group=3), _cell("i1", 6, 3, group=3)]
+    at = _condense(cells)
+    assert len(set(at.values())) == len(at)
+    assert at["i0"][0] <= 1 and at["i1"] == (at["i0"][0] + 1, at["i0"][1])
+    occupied = {v for k, v in at.items() if not k.startswith("i")}
+    for k in ("i0", "i1"):
+        r, c = at[k]
+        assert not {(r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)} & occupied, k

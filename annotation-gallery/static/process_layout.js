@@ -19,7 +19,9 @@
  * runs on `snakeHeight` cards (as many rows as fit on the screen), steps two columns sideways into the empty side (one turn card in the empty column
  * between), runs back, and so on; bands of layers, as wide as the screen's shape asks for (narrower where space is
  * short), are one empty row apart. A snake must land on empty cells touching no other process's card; after each one
- * the rows left empty are removed, so the block closes up. Neighbours along the process stay touching.
+ * the rows left empty are removed, so the block closes up. Neighbours along the process stay touching. Before that,
+ * islands (groups touching no other card) move into empty places in busy rows, and long straight runs through rows
+ * holding nothing else fold sideways in horizontal layers (condenseBlock).
  */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
@@ -61,7 +63,7 @@
     };
 
     for (const tree of trees) {
-      place(snakeProcesses(layoutTree(tree, cardById), tree.processes, aspect, snakeHeight));
+      place(snakeProcesses(condenseBlock(layoutTree(tree, cardById), tree.processes, maxColumns), tree.processes, aspect, snakeHeight));
     }
 
     // Unbranched strings: columns, longest first, each running down from its lower-Z end.
@@ -83,7 +85,7 @@
         }
         col += width;
       }
-      place(snakeProcesses(list, strings.map((component) => component.processes[0]), aspect, snakeHeight));
+      place(snakeProcesses(condenseBlock(list, [], maxColumns), strings.map((component) => component.processes[0]), aspect, snakeHeight));
     }
 
     // Unlinked cards, and branches left with nothing attached, in Z order wrapping at maxColumns.
@@ -361,6 +363,278 @@
     return { width: Math.max(1, width), height: bands * (height + 1) - 1 };
   }
 
+  /** Removes the rows no card of the block uses, moving the rows below up. */
+  function closeEmptyRows(list) {
+    const used = new Set();
+    for (const cell of list) {
+      for (let r = cell.row; r < cell.row + cell.h; r++) {
+        used.add(r);
+      }
+    }
+    const rows = [...used].sort((x, y) => x - y);
+    const shift = new Map();
+    let next = rows[0];
+    for (const r of rows) {
+      shift.set(r, next);
+      next += 1;
+    }
+    for (const cell of list) {
+      cell.row = shift.get(cell.row);
+    }
+  }
+
+  /** Cell at each grid position of a block, keyed "row,col". */
+  function occupancy(list) {
+    const at = new Map();
+    for (const cell of list) {
+      for (let r = cell.row; r < cell.row + cell.h; r++) {
+        for (let c = cell.col; c < cell.col + cell.w; c++) {
+          at.set(`${r},${c}`, cell);
+        }
+      }
+    }
+    return at;
+  }
+
+  // An island this size or smaller may be moved (more would move a large part of the structure away from its branch).
+  const ISLAND_MAX = 40;
+  // A run of lone rows shorter than this is not folded.
+  const MIN_FOLD_RUN = 8;
+
+  /**
+   * Makes room in one block before its processes snake. First, islands - groups of cards that touch no other card,
+   * so moving them breaks no link - move out of rows where they keep another column's run from being alone, to the
+   * nearest empty place in rows that are busy anyway, touching nothing. Then long straight runs of a process through
+   * lone rows (rows holding that one card) fold sideways: horizontal layers up to a screen wide, an empty row between
+   * layers with one turn card in it, entering and leaving in the run's column; the rows freed are removed, so what is
+   * below moves up and still touches. Only processes between two branches fold: one with a free end snakes later
+   * (snakeProcesses), which gains more, and a fold first would take the room it needs.
+   */
+  function condenseBlock(list, processes, maxColumns) {
+    moveIslands(list);
+    closeEmptyRows(list);
+    const between = new Set(processes.filter((p) => p.ends[0] !== null && p.ends[1] !== null).map((p) => p.index));
+    foldRuns(list, maxColumns, between);
+    return list;
+  }
+
+  function moveIslands(list) {
+    if (list.length < 3) {
+      return;
+    }
+    const neighbours = (at, cell) => {
+      const out = [];
+      for (let r = cell.row; r < cell.row + cell.h; r++) {
+        for (let c = cell.col; c < cell.col + cell.w; c++) {
+          for (const [dr, dc] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const other = at.get(`${r + dr},${c + dc}`);
+            if (other && other !== cell) {
+              out.push(other);
+            }
+          }
+        }
+      }
+      return out;
+    };
+    const components = () => {
+      const at = occupancy(list);
+      const seen = new Set();
+      const groups = [];
+      for (const cell of list) {
+        if (seen.has(cell)) {
+          continue;
+        }
+        const group = [];
+        const stack = [cell];
+        seen.add(cell);
+        while (stack.length) {
+          const next = stack.pop();
+          group.push(next);
+          for (const other of neighbours(at, next)) {
+            if (!seen.has(other)) {
+              seen.add(other);
+              stack.push(other);
+            }
+          }
+        }
+        groups.push(group);
+      }
+      return groups;
+    };
+    const groups = components();
+    const rootCell = list.find((cell) => cell.root);
+    const main = groups.find((group) => group.includes(rootCell)) || groups.reduce((a, b) => (b.length > a.length ? b : a));
+    const islands = groups.filter((group) => group !== main && group.length <= ISLAND_MAX).sort((a, b) => b.length - a.length);
+    const top = Math.min(...list.map((cell) => cell.row));
+    const bottom = Math.max(...list.map((cell) => cell.row + cell.h - 1));
+    const left = Math.min(...list.map((cell) => cell.col));
+    const right = Math.max(...list.map((cell) => cell.col + cell.w - 1));
+
+    for (const island of islands) {
+      const mine = new Set(island);
+      const at = occupancy(list);
+      const othersInRow = new Map();
+      for (const cell of list) {
+        if (!mine.has(cell)) {
+          for (let r = cell.row; r < cell.row + cell.h; r++) {
+            othersInRow.set(r, (othersInRow.get(r) || 0) + 1);
+          }
+        }
+      }
+      // Worth moving only if it shares a row with at most one other card: there it keeps a run from being alone.
+      const islandRows = new Set();
+      for (const cell of island) {
+        for (let r = cell.row; r < cell.row + cell.h; r++) {
+          islandRows.add(r);
+        }
+      }
+      if (![...islandRows].some((r) => (othersInRow.get(r) || 0) <= 1)) {
+        continue;
+      }
+      const r0 = Math.min(...island.map((cell) => cell.row));
+      const c0 = Math.min(...island.map((cell) => cell.col));
+      const h = Math.max(...island.map((cell) => cell.row + cell.h)) - r0;
+      const w = Math.max(...island.map((cell) => cell.col + cell.w)) - c0;
+      const blocked = (r, c) => {
+        const other = at.get(`${r},${c}`);
+        return other !== undefined && !mine.has(other);
+      };
+      let best = null;
+      for (let r = top; r + h - 1 <= bottom; r++) {
+        let busy = true;
+        for (let k = 0; k < h && busy; k++) {
+          busy = (othersInRow.get(r + k) || 0) >= 2;
+        }
+        if (!busy) {
+          continue;
+        }
+        for (let c = left; c + w - 1 <= right; c++) {
+          const distance = Math.abs(r - r0) + Math.abs(c - c0);
+          if ((r === r0 && c === c0) || (best && distance >= best.distance)) {
+            continue;
+          }
+          let ok = true;
+          for (const cell of island) {
+            const rr = cell.row - r0 + r;
+            const cc = cell.col - c0 + c;
+            for (let y = rr - 1; y <= rr + cell.h && ok; y++) {
+              for (let x = cc - 1; x <= cc + cell.w && ok; x++) {
+                const corner = (y === rr - 1 || y === rr + cell.h) && (x === cc - 1 || x === cc + cell.w);
+                if (!corner && blocked(y, x)) {
+                  ok = false;
+                }
+              }
+            }
+            if (!ok) {
+              break;
+            }
+          }
+          if (ok) {
+            best = { r, c, distance };
+          }
+        }
+      }
+      if (best) {
+        for (const cell of island) {
+          cell.row += best.r - r0;
+          cell.col += best.c - c0;
+        }
+      }
+    }
+  }
+
+  function foldRuns(list, maxColumns, groups) {
+    for (let changed = true; changed; ) {
+      changed = false;
+      const byRow = new Map();
+      for (const cell of list) {
+        for (let r = cell.row; r < cell.row + cell.h; r++) {
+          if (!byRow.has(r)) {
+            byRow.set(r, []);
+          }
+          byRow.get(r).push(cell);
+        }
+      }
+      const rows = [...byRow.keys()].sort((a, b) => a - b);
+      // A run is cards alone in their rows, one under another in one column: processes between two branches, and the
+      // branches between them (a branch alone in its row touches its other processes nowhere, so it can move too).
+      const lone = (r) => {
+        const here = byRow.get(r);
+        if (!here || here.length !== 1 || here[0].w !== 1 || here[0].h !== 1) {
+          return null;
+        }
+        const cell = here[0];
+        return (cell.kind === "process" && groups.has(cell.group)) || cell.kind === "branch" ? cell : null;
+      };
+      const blockLeft = Math.min(...list.map((cell) => cell.col));
+      const blockRight = Math.max(blockLeft + maxColumns - 1, ...list.map((cell) => cell.col + cell.w - 1));
+      for (let i = 0; i < rows.length && !changed; i++) {
+        const first = lone(rows[i]);
+        if (!first) {
+          continue;
+        }
+        const run = [first];
+        for (let j = i + 1; j < rows.length; j++) {
+          const cell = lone(rows[j]);
+          const prev = run[run.length - 1];
+          if (!cell || rows[j] !== prev.row + 1 || cell.col !== first.col) {
+            break;
+          }
+          run.push(cell);
+        }
+        i += run.length - 1;
+        if (run.length < MIN_FOLD_RUN) {
+          continue;
+        }
+        // The first and last cards of the run stay where they are, so nothing in the busy rows beside them is touched.
+        const inner = run.slice(1, -1);
+        const col = first.col;
+        const roomRight = blockRight - col;
+        const roomLeft = col - blockLeft;
+        const side = roomRight >= roomLeft ? 1 : -1;
+        // The layer width that saves the most rows (an even number of layers, so the fold leaves in its column).
+        let width = 0;
+        let layers = 0;
+        let saved = 1;
+        for (let w = 3; w <= Math.min(maxColumns, Math.max(roomRight, roomLeft) + 1); w++) {
+          let k = Math.floor((inner.length + 1) / (w + 1));
+          if (k % 2 === 1) {
+            k -= 1;
+          }
+          const gain = k * w + (k - 1) - (2 * k - 1);
+          if (k >= 2 && gain > saved) {
+            width = w;
+            layers = k;
+            saved = gain;
+          }
+        }
+        if (!width) {
+          continue;
+        }
+        const folded = layers * width + (layers - 1);
+        const row0 = inner[0].row;
+        inner.forEach((cell, k) => {
+          if (k < folded) {
+            const layer = Math.floor(k / (width + 1));
+            const along = k % (width + 1);
+            if (along < width) {
+              cell.row = row0 + 2 * layer;
+              cell.col = col + side * (layer % 2 === 0 ? along : width - 1 - along);
+            } else {
+              cell.row = row0 + 2 * layer + 1;
+              cell.col = col + side * (layer % 2 === 0 ? width - 1 : 0);
+            }
+          } else {
+            cell.row = row0 + 2 * layers - 1 + (k - folded);
+            cell.col = col;
+          }
+        });
+        closeEmptyRows(list);
+        changed = true;
+      }
+    }
+  }
+
   /**
    * Snakes the outer processes of one block (a tree, or the unbranched strings), outside in. A process qualifies when
    * one end is free (not a branch) and it is drawn as one straight column of one-cell cards. From its first card
@@ -429,81 +703,75 @@
         return id !== undefined && !own.has(id);
       };
       const col = cells[0].col;
-      let done = false;
-      for (let start = 0; start + height < n && !done; start++) {
-        const length = n - start;
-        const row0 = cells[start].row;
-        for (const side of [1, -1]) {
-          if (foreign(row0, col + side)) {
-            continue; // something beside this card on that side
-          }
-          // Band widths: the one closest to the screen's shape first, then narrower ones.
-          const widths = [];
-          // A band that another follows must end on an outward layer, so it has an odd number of layers.
-          const fitsBands = (layers) => layers % 2 === 1 || length <= layers * height + (layers - 1) + 1;
-          for (let layers = 2; layers <= Math.ceil(length / height) + 1; layers++) {
-            if (!fitsBands(layers)) {
-              continue;
-            }
-            const size = snakeSize(length, height, layers);
-            widths.push({ layers, miss: Math.abs(Math.log(size.width / size.height / aspect)) });
-          }
-          widths.sort((x, y) => x.miss - y.miss || x.layers - y.layers);
-          const best = widths.length ? widths[0].layers : 3;
-          const order = [best];
-          for (let layers = best - 1; layers >= 2; layers--) {
-            if (fitsBands(layers)) {
-              order.push(layers);
-            }
-          }
-          for (const layers of order) {
-            const spots = [];
-            let ok = true;
-            for (let i = 0; i < length && ok; i++) {
-              const spot = snakeSpot(i, height, layers, out, side);
-              const r = row0 + spot.dr;
-              const c = col + spot.dc;
-              const stays = r === cells[start + i].row && c === cells[start + i].col;
-              if (foreign(r, c)) {
-                ok = false;
-              } else if (!stays && (foreign(r - 1, c) || foreign(r + 1, c) || foreign(r, c - 1) || foreign(r, c + 1))) {
-                ok = false; // it would touch another process's card
-              }
-              spots.push([r, c]);
-            }
-            if (!ok) {
-              continue;
-            }
-            cells.slice(start).forEach((cell, i) => {
-              cell.row = spots[i][0];
-              cell.col = spots[i][1];
-            });
-            done = true;
-            break;
-          }
-          if (done) {
+      const blockLeft = Math.min(...list.map((cell) => cell.col));
+      const blockRight = Math.max(...list.map((cell) => cell.col + cell.w - 1));
+      // Each side's earliest snake that fits; the earlier one wins, a tie goes to the side with more room.
+      const found = [];
+      for (const side of [1, -1]) {
+        for (let start = 0; start + height < n; start++) {
+          const fit = trySnake(start, side);
+          if (fit) {
+            found.push({ ...fit, start, side, room: side > 0 ? blockRight - col : col - blockLeft });
             break;
           }
         }
       }
-      if (done) {
-        // Close up: drop the rows no card uses any more.
-        const used = new Set();
-        for (const cell of list) {
-          for (let r = cell.row; r < cell.row + cell.h; r++) {
-            used.add(r);
+      found.sort((x, y) => x.start - y.start || y.room - x.room || y.side - x.side);
+      if (found.length) {
+        const { start, spots } = found[0];
+        cells.slice(start).forEach((cell, i) => {
+          cell.row = spots[i][0];
+          cell.col = spots[i][1];
+        });
+        closeEmptyRows(list);
+      }
+
+      // The cells the snake from card `start` into `side` takes, or null when nothing fits there.
+      function trySnake(start, side) {
+        const length = n - start;
+        const row0 = cells[start].row;
+        if (foreign(row0, col + side)) {
+          return null; // something beside this card on that side
+        }
+        // Band widths: the one closest to the screen's shape first, then narrower ones.
+        const widths = [];
+        // A band that another follows must end on an outward layer, so it has an odd number of layers.
+        const fitsBands = (layers) => layers % 2 === 1 || length <= layers * height + (layers - 1) + 1;
+        for (let layers = 2; layers <= Math.ceil(length / height) + 1; layers++) {
+          if (!fitsBands(layers)) {
+            continue;
+          }
+          const size = snakeSize(length, height, layers);
+          widths.push({ layers, miss: Math.abs(Math.log(size.width / size.height / aspect)) });
+        }
+        widths.sort((x, y) => x.miss - y.miss || x.layers - y.layers);
+        const best = widths.length ? widths[0].layers : 3;
+        const order = [best];
+        for (let layers = best - 1; layers >= 2; layers--) {
+          if (fitsBands(layers)) {
+            order.push(layers);
           }
         }
-        const rows = [...used].sort((x, y) => x - y);
-        const shift = new Map();
-        let next = rows[0];
-        for (const r of rows) {
-          shift.set(r, next);
-          next += 1;
+        for (const layers of order) {
+          const spots = [];
+          let ok = true;
+          for (let i = 0; i < length && ok; i++) {
+            const spot = snakeSpot(i, height, layers, out, side);
+            const r = row0 + spot.dr;
+            const c = col + spot.dc;
+            const stays = r === cells[start + i].row && c === cells[start + i].col;
+            if (foreign(r, c)) {
+              ok = false;
+            } else if (!stays && (foreign(r - 1, c) || foreign(r + 1, c) || foreign(r, c - 1) || foreign(r, c + 1))) {
+              ok = false; // it would touch another process's card
+            }
+            spots.push([r, c]);
+          }
+          if (ok) {
+            return { spots };
+          }
         }
-        for (const cell of list) {
-          cell.row = shift.get(cell.row);
-        }
+        return null;
       }
     }
     const left = Math.min(...list.map((cell) => cell.col));
@@ -722,5 +990,5 @@
     return cells;
   }
 
-  return { layoutProcesses, analyseLinks, snakeSpot };
+  return { layoutProcesses, analyseLinks, snakeSpot, condenseBlock };
 });
