@@ -10,3 +10,8 @@ docker/.env
 *.md
 .cursor
 .devcontainer
+# .NET build output of the segmentation server's prompt providers (rebuilt inside the image)
+**/bin
+**/obj
+# The submodule's own git data
+gRPC_Protos/.git

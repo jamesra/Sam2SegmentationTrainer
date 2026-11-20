@@ -61,13 +61,13 @@ Native entry points (`check_native.py` shows the calls): `sp_build_start(in, len
 
 ### Builds
 
-- From Viking: `dotnet test Servers/SegmentationServer/prompt_providers/Viking.SegmentationPrompts.Tests`.
-- Native, for Linux: the server's Docker build (`Servers/SegmentationServer/Dockerfile`, stage `prompts`,
+- From Sam2Trainer: `dotnet test SegmentationServer/prompt_providers/Viking.SegmentationPrompts.Tests`.
+- Native, for Linux: the server's Docker build (`SegmentationServer/Dockerfile`, stage `prompts`,
   `mcr.microsoft.com/dotnet/sdk:10.0` plus `clang zlib1g-dev`) runs
   `dotnet publish .../Viking.SegmentationPrompts.Native -c Release -r linux-x64 -o /out`, copies the `.so` to
   `/home/user/native/` (`SEGMENTATION_PROMPT_LIBRARY` overrides the path), and fails the image when
   `check_native.py` does not get the golden request from it.
-- The protos are read from the repository's `gRPC_Protos`, four levels above each project (`-p:ProtosRoot=...`
+- The protos are read from the repository's `gRPC_Protos`, three levels above each project (Sam2Trainer root) (`-p:ProtosRoot=...`
   overrides it).
 - Fixtures: `Fixtures/make_curve_fixtures.py <nornir-buildmanager>` rewrites the curve fixtures from the exporter;
   `SP_WRITE_GOLDEN=1 dotnet test` rewrites `golden_prompt_input.hex` after the golden input changes.

@@ -26,7 +26,7 @@
             "request": "launch",
             "module": "segmentation_server",
             "justMyCode": false,
-            "cwd": "${workspaceFolder}/Servers/SegmentationServer/segmentation_server"
+            "cwd": "${workspaceFolder}/SegmentationServer/segmentation_server"
         }
     ]
 }

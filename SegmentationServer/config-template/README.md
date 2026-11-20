@@ -1,7 +1,7 @@
 # Segmentation server config template
 
 Deployment of the segmentation servers is the `viking-segmentation` stack
-(`Servers/SegmentationServer/docker-compose.yml`, registry `deploy/stacks.psd1`; GPU compute host).
+(`SegmentationServer/docker-compose.yml` in Sam2Trainer, registry `deploy/stacks.psd1`; GPU compute host).
 It replaces the per-service certbot renewer and the generated `docker-compose.models.yml`.
 
 - Run env to fill in: `deploy/examples/example.viking-segmentation.run.env`

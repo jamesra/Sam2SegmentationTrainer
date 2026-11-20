@@ -48,3 +48,7 @@ annotation_crops/*
 
 # Throughput benchmark outputs (sam2-em-train --benchmark ... | tee benchmarks/...)
 benchmarks/
+
+# .NET build output (SegmentationServer/prompt_providers)
+SegmentationServer/prompt_providers/**/bin/
+SegmentationServer/prompt_providers/**/obj/

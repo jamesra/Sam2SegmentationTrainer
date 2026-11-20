@@ -22,7 +22,7 @@ pytest.importorskip("grpc_tools")
 
 _SERVER_ROOT = Path(__file__).resolve().parents[1]
 _SEGMENTATION_ROOT = _SERVER_ROOT.parent
-_REPO_ROOT = _SEGMENTATION_ROOT.parents[1]
+_REPO_ROOT = _SEGMENTATION_ROOT.parent
 _PROTO_ROOT = _REPO_ROOT / "gRPC_Protos"
 _PROTO = _PROTO_ROOT / "Segmentation" / "SAM2" / "segmentation.proto"
 

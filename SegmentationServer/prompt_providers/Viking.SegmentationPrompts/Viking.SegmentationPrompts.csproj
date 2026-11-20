@@ -13,7 +13,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- The generated protocol types are internal and carry no XML docs. -->
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <ProtosRoot Condition="'$(ProtosRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\gRPC_Protos</ProtosRoot>
+    <ProtosRoot Condition="'$(ProtosRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\gRPC_Protos</ProtosRoot>
   </PropertyGroup>
 
   <ItemGroup>
@@ -36,7 +36,7 @@
   </ItemGroup>
 
   <Target Name="CheckProtosRoot" BeforeTargets="BeforeBuild" Condition="!Exists('$(ProtosRoot)\Segmentation\SAM2\prompt_input.proto')">
-    <Error Text="Viking.SegmentationPrompts needs gRPC_Protos (with Segmentation/SAM2/prompt_input.proto) at $(ProtosRoot): the repository's gRPC_Protos, four levels above this project (or pass -p:ProtosRoot=...)." />
+    <Error Text="Viking.SegmentationPrompts needs gRPC_Protos (with Segmentation/SAM2/prompt_input.proto) at $(ProtosRoot): the repository's gRPC_Protos, three levels above this project (or pass -p:ProtosRoot=...)." />
   </Target>
 
 </Project>

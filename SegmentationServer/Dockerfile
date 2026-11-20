@@ -9,8 +9,8 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS prompts
 RUN apt-get update && apt-get install -y --no-install-recommends clang zlib1g-dev && rm -rf /var/lib/apt/lists/*
 COPY gRPC_Protos/Segmentation /src/gRPC_Protos/Segmentation
 COPY gRPC_Protos/Common /src/gRPC_Protos/Common
-COPY Servers/SegmentationServer/prompt_providers /src/Servers/SegmentationServer/prompt_providers
-RUN dotnet publish /src/Servers/SegmentationServer/prompt_providers/Viking.SegmentationPrompts.Native         -c Release -r linux-x64 -o /out
+COPY SegmentationServer/prompt_providers /src/SegmentationServer/prompt_providers
+RUN dotnet publish /src/SegmentationServer/prompt_providers/Viking.SegmentationPrompts.Native         -c Release -r linux-x64 -o /out
 
 FROM nvidia/cuda:13.2.1-devel-ubuntu24.04
 
@@ -89,11 +89,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get install -y --no-install-recommends libcap2-bin \
     && setcap 'cap_net_bind_service=+ep' /usr/bin/python3.13
 
-COPY Servers/SegmentationServer/segmentation_grpc/pyproject.toml \
+COPY SegmentationServer/segmentation_grpc/pyproject.toml \
      /home/user/segmentation_grpc/
-COPY Servers/SegmentationServer/segmentation_server/pyproject.toml \
-     Servers/SegmentationServer/segmentation_server/requirements-docker.txt \
-     Servers/SegmentationServer/segmentation_server/requirements-debug.txt \
+COPY SegmentationServer/segmentation_server/pyproject.toml \
+     SegmentationServer/segmentation_server/requirements-docker.txt \
+     SegmentationServer/segmentation_server/requirements-debug.txt \
      /home/user/segmentation_server/
 
 # Placeholder packages so pip -e succeeds before the full source COPY.
@@ -117,17 +117,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install -r /home/user/segmentation_server/requirements-debug.txt; \
     fi
 
-COPY --chmod=755 Servers/SegmentationServer/start.sh /home/user/start.sh
+COPY --chmod=755 SegmentationServer/start.sh /home/user/start.sh
 
 COPY --chown=user:user gRPC_Protos/Segmentation /home/user/gRPC_Protos/Segmentation
 # segmentation.proto imports Common/geometry.proto; --generate-grpc needs both under the same root.
 COPY --chown=user:user gRPC_Protos/Common /home/user/gRPC_Protos/Common
-COPY --chown=user:user Servers/SegmentationServer/segmentation_grpc /home/user/segmentation_grpc
-COPY --chown=user:user Servers/SegmentationServer/segmentation_server/segmentation_server /home/user/segmentation_server/segmentation_server/
+COPY --chown=user:user SegmentationServer/segmentation_grpc /home/user/segmentation_grpc
+COPY --chown=user:user SegmentationServer/segmentation_server/segmentation_server /home/user/segmentation_server/segmentation_server/
 
 # The image fails to build when the native provider does not give the .NET tests' golden request.
 COPY --from=prompts /out/Viking.SegmentationPrompts.Native.so /home/user/native/
-RUN --mount=type=bind,from=prompts,source=/src/Servers/SegmentationServer/prompt_providers,target=/tmp/prompts     python3 /tmp/prompts/Viking.SegmentationPrompts.Native/check_native.py         /home/user/native/Viking.SegmentationPrompts.Native.so /tmp/prompts/Viking.SegmentationPrompts.Tests
+RUN --mount=type=bind,from=prompts,source=/src/SegmentationServer/prompt_providers,target=/tmp/prompts     python3 /tmp/prompts/Viking.SegmentationPrompts.Native/check_native.py         /home/user/native/Viking.SegmentationPrompts.Native.so /tmp/prompts/Viking.SegmentationPrompts.Tests
 
 EXPOSE 443
 # Debug ports. They accept connections only in an image built with INSTALL_DEBUG_TOOLS=true.

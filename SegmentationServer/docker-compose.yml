@@ -9,7 +9,7 @@
 # (image, GPU, TLS, caches) live in one place.
 #
 #   stack.ps1 viking-segmentation up
-#   docker compose -p viking-segmentation --env-file <host.env> --env-file <run.env> #     -f Servers/SegmentationServer/docker-compose.yml -f <run dir>/compose.generated.yaml up -d --build
+#   docker compose -p viking-segmentation --env-file <host.env> --env-file <run.env> #     -f SegmentationServer/docker-compose.yml -f <run dir>/compose.generated.yaml up -d --build
 #
 # TLS: every container presents fullchain.pem and privkey.pem from one folder mounted at /tls, and only
 # listens with TLS; it waits SEGMENTATION_TLS_WAIT_SECONDS (120) for the files, exits, and
@@ -27,8 +27,8 @@
 #                            network share is not safe.
 
 x-segmentation-build: &segmentation-build
-  context: ../..
-  dockerfile: Servers/SegmentationServer/Dockerfile
+  context: ..
+  dockerfile: SegmentationServer/Dockerfile
   args:
     SOURCE_REVISION: ${STACK_SOURCE_REVISION:-}
 

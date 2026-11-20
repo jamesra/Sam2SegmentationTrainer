@@ -204,7 +204,7 @@ async def test_a_crushed_cell_is_the_clients_capture_of_the_display_gray() -> No
 
 
 def test_the_vendored_crush_display_is_the_trainers_file() -> None:
-    candidates = [os.environ.get("SAM2_TRAINER_REPO"), str(Path(__file__).resolve().parents[4].parent / "Sam2Trainer")]
+    candidates = [os.environ.get("SAM2_TRAINER_REPO"), str(Path(__file__).resolve().parents[3])]
     theirs_path = next(
         (Path(c) / "annotation_crops" / "crush_display.py" for c in candidates if c and (Path(c) / "annotation_crops" / "crush_display.py").is_file()),
         None,

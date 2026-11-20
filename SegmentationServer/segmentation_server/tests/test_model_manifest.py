@@ -192,7 +192,7 @@ def test_a_model_whose_encoding_the_server_does_not_implement_is_refused() -> No
 
 
 def _trainer_repo() -> Path | None:
-    candidates = [os.environ.get("SAM2_TRAINER_REPO"), str(Path(__file__).resolve().parents[4].parent / "Sam2Trainer")]
+    candidates = [os.environ.get("SAM2_TRAINER_REPO"), str(Path(__file__).resolve().parents[3])]
     for candidate in candidates:
         if candidate and (Path(candidate) / "annotation_crops" / "prompt_encoding.py").is_file():
             return Path(candidate)

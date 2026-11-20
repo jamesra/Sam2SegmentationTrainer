@@ -1,4 +1,4 @@
-"""Run the example from Servers/SegmentationServer: python -m Example."""
+"""Run the example from SegmentationServer: python -m Example."""
 
 import asyncio
 
