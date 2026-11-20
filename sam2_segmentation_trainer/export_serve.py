@@ -77,7 +77,7 @@ def serve_metadata(circle_diameter_scale: float | None = None, run_dir: Path | N
 
     The values come from the run's own saved config (``run_dir/config.yaml``). Without one, the library defaults are
     used and a warning is printed. ``circle_diameter_scale`` overrides the run's value. The mask network was trained
-    on ``mask_input`` built by ``annotation_crops/prompt_encoding.py`` with these constants; a server must build it
+    on ``mask_input`` built by ``prompt_encoders/v6.py`` with these constants; a server must build it
     the same way (see the README), and a run whose values differ from the library constants is warned about.
     """
     from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 from urllib.parse import urljoin
 
-from segmentation_server.crush_display import CrushInfo
+from prompt_encoders.crush_display import CrushInfo
 
 DEFAULT_COORD_FORMAT = "03d"
 

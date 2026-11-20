@@ -23,7 +23,7 @@ future papers: citations, formulas, algorithmic decisions and the reasoning behi
 - **Prompt-size against object-size map** (`docs/depth_relative_trust.md`, section 9). The ratio of a prompt's depth to
   the selected object's depth, with a wrong-object rate, measures whether the model matches an object to the prompt's
   size and exposes annotators' oversized circles.
-- **Edge-confidence prompt encoding (v6, served)** (`annotation_crops/prompt_encoding.py`,
+- **Edge-confidence prompt encoding (v6, served)** (`prompt_encoders/v6.py`,
   `docs/mask_refinement_plan.md` section 2): traced masks trusted in the interior and loosely at the edge; circle
   annotations as negatives by radius-relative trust; the max-or-unknown overlap rule.
 

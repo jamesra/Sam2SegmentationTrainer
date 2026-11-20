@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from cell_world import World, ellipse
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.cell_grid import CELL_SIZE, LOGIT_SCALE, LOGIT_WINDOW, Cell, MaskShape
 from segmentation_server.prompt_encodings import EdgeConfidenceEncoder
 from segmentation_server.tile_growth import grow_segmentation

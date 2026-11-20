@@ -8,7 +8,7 @@ Only what the server can draw exactly as the client would is read:
 
 A cell is stitched from the tileset tiles it overlaps, flipped so its first row is its high mosaic Y (the capture's
 orientation), and encoded as the client encodes a capture (:mod:`capture_encoder`). A quantized ("crushed") tileset's
-codes are first mapped to the gray Viking displays (its section's Auto window and gamma, :mod:`crush_display`), because
+codes are first mapped to the gray Viking displays (its section's Auto window and gamma, :mod:`prompt_encoders.crush_display`), because
 the client's capture starts from that display gray; without it the two would differ under one cache key. Tiles outside
 the grid, or missing on storage, are black. Anything else returns None and the stream asks the client, as before.
 """
@@ -30,7 +30,7 @@ from numpy.typing import NDArray
 
 from segmentation_grpc import CoordinateSpace
 from segmentation_server.capture_encoder import encode_capture
-from segmentation_server.crush_display import CrushInfo, display_lut
+from prompt_encoders.crush_display import CrushInfo, display_lut
 from segmentation_server.tile_ref import TileRef
 from segmentation_server.identity_client import IdentityAssignments, IdentityOptions, LocalContext
 from segmentation_server.viking_volume import Tileset, TilesetLevel, VikingVolume, VolumeSection, parse_viking_xml

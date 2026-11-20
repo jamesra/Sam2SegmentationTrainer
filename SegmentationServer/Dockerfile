@@ -124,6 +124,8 @@ COPY --chown=user:user gRPC_Protos/Segmentation /home/user/gRPC_Protos/Segmentat
 COPY --chown=user:user gRPC_Protos/Common /home/user/gRPC_Protos/Common
 COPY --chown=user:user SegmentationServer/segmentation_grpc /home/user/segmentation_grpc
 COPY --chown=user:user SegmentationServer/segmentation_server/segmentation_server /home/user/segmentation_server/segmentation_server/
+# Prompt encodings and the crush display map, shared with the trainer (Sam2Trainer prompt_encoders/).
+COPY --chown=user:user prompt_encoders /home/user/shared/prompt_encoders/
 
 # The image fails to build when the native provider does not give the .NET tests' golden request.
 COPY --from=prompts /out/Viking.SegmentationPrompts.Native.so /home/user/native/
@@ -136,7 +138,7 @@ EXPOSE 12348
 
 USER user
 
-ENV PYTHONPATH=/home/user/segmentation_server:/home/user/segmentation_grpc \
+ENV PYTHONPATH=/home/user/segmentation_server:/home/user/segmentation_grpc:/home/user/shared \
     VS_CODE_DEBUG=false
 
 STOPSIGNAL SIGTERM

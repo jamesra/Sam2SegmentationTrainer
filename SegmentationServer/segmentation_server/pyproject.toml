@@ -17,7 +17,8 @@ dependencies = [
     "grpcio-tools>=1.84.0",
     "protobuf>=7.35.1,<8",
     "numpy",
-    # The trainer's edge-confidence mask-prompt encoding (trainer_prompt_encoding.py) needs its distance transform.
+    # The shared edge-confidence mask-prompt encoding (Sam2Trainer prompt_encoders/v6.py, on PYTHONPATH from the
+    # repository root) needs its distance transform.
     "scipy",
     "pillow",
     "opencv-python",

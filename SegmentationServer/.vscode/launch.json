@@ -26,7 +26,9 @@
             "request": "launch",
             "module": "segmentation_server",
             "justMyCode": false,
-            "cwd": "${workspaceFolder}/SegmentationServer/segmentation_server"
+            "cwd": "${workspaceFolder}/SegmentationServer/segmentation_server",
+            // The repository root, for the shared prompt_encoders package.
+            "env": { "PYTHONPATH": "${workspaceFolder}" }
         }
     ]
 }

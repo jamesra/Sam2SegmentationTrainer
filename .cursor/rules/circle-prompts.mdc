@@ -1,6 +1,6 @@
 ---
 description: Who scales circle radii (the trainer, never the exporter), how annotator circles and seed circles are trusted, and what is decided versus only proposed for circle prompts
-globs: annotation_crops/prompt_encoding.py, annotation_crops/negatives.py, sam2_segmentation_trainer/data/**, sam2_segmentation_trainer/config/em_finetune.yaml, docs/adjacent_circle_seed_plan.md, docs/depth_relative_trust.md, docs/circle_seed_trust_eval.md, docs/circle_annotator_spec.md
+globs: prompt_encoders/**, annotation_crops/prompt_encoding.py, annotation_crops/negatives.py, sam2_segmentation_trainer/data/**, sam2_segmentation_trainer/config/em_finetune.yaml, docs/adjacent_circle_seed_plan.md, docs/depth_relative_trust.md, docs/circle_seed_trust_eval.md, docs/circle_annotator_spec.md
 alwaysApply: false
 ---
 

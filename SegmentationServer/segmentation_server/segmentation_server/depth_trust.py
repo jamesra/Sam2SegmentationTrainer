@@ -5,7 +5,7 @@ Definitions are the trainer's (Sam2Trainer ``docs/depth_relative_trust.md``); se
 * Trust profile (section 2): ``w(rho)`` is 1 for ``rho <= a``, a half cosine down to 0 at ``rho = b``, 0 beyond, with
   ``a = full_frac`` and ``b = zero_frac`` of the model's ``circle_annotation_trust``.
 * A circle uses ``rho = |p - c| / R`` with its TRUE radius (the depth-relative trust of a disc is its radius-relative
-  trust), computed analytically by ``trainer_prompt_encoding.circle_trust``.
+  trust), computed analytically by ``prompt_encoders.v6.circle_trust``.
 * Any other shape uses the local depth coordinate (section 4): ``rho = 1 - d(p) / D_l(p)``, ``d`` the distance from the
   shape's edge and ``D_l`` the local thickness radius, the radius of the largest inscribed disc that contains ``p``
   (Hildebrand and Ruegsegger 1997), found by painting each disc centre's radius into its disc and keeping the maximum.
@@ -26,7 +26,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
 
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.cell_grid import TILE_SIZE
 from segmentation_server.prompt import ForegroundPart, Island, PromptTooLarge, _count_tiles, _part_tiles
 from segmentation_server.shapes import CircleGeometry, rasterize
@@ -50,7 +50,7 @@ def trust_weight(rho: NDArray, trust: enc.CircleAnnotationTrust) -> NDArray[np.f
 def edge_depth(mask: NDArray[np.bool_]) -> NDArray[np.float32]:
     """``d``: distance from each pixel of ``mask`` to its edge (pixel centre to the pixel boundary), 0 outside.
 
-    The same measure as the v6 edge confidence (``trainer_prompt_encoding.edge_distance``), but the array border is an
+    The same measure as the v6 edge confidence (``prompt_encoders.v6.edge_distance``), but the array border is an
     edge: the caller pads the shape's own box, so a shape is never cut by it.
     """
     mask = np.asarray(mask, dtype=bool)

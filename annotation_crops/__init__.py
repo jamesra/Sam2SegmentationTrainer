@@ -3,7 +3,9 @@
 ignore.json, mask filenames, the training-loss table, and COCO RLE live here so
 the gallery can import them without ``nornir_buildmanager``. The same sources are
 vendored under ``nornir-buildmanager/annotation_crops`` so that package can import
-them without a separate install. Keep the two trees identical.
+them without a separate install. Keep the two trees identical, except ``prompt_encoding.py`` and
+``crush_display.py``: since 2026-11-20 those are shims here for the shared ``prompt_encoders`` package, while
+nornir's copy keeps the full module text (equal to ``prompt_encoders/v6.py`` and ``prompt_encoders/crush_display.py``).
 """
 
 from annotation_crops.ignore import load_ignore_ids, save_ignore_ids

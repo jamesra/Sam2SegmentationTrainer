@@ -25,7 +25,7 @@ from protocol import (
     start,
 )
 from segmentation_grpc import Feature
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.cell_grid import LOGIT_SCALE
 from segmentation_server.mask_tiles import TiledMaskShape
 from segmentation_server.result_store import PROMPT_SCHEME, prompt_hash

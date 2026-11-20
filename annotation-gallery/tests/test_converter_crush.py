@@ -11,7 +11,7 @@ from xml.etree import ElementTree
 import numpy as np
 from PIL import Image
 
-from annotation_crops.crush_display import CrushInfo, display_lut
+from prompt_encoders.crush_display import CrushInfo, display_lut
 from converter.tilesource import SectionTiles, TileCache, parse_viking_xml
 
 TILE = 4

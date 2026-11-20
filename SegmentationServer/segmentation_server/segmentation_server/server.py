@@ -86,7 +86,7 @@ from segmentation_server.prompt import (
     foreground_parts,
 )
 from segmentation_server.prompt_encodings import circle_diameter_scale, encoder_for
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.mask_utils import (
     DEFAULT_MASK_THRESHOLD,
     NoMatchingMask,

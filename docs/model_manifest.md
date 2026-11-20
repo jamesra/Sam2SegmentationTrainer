@@ -34,7 +34,7 @@ warning.
 | `code` | `trainer_git_sha`, `prompt_encoding` | What built the export. |
 | `capabilities` | `submission_mode` | `tile_grid` (fixed 1024 px cells, `SegmentTilesStream`) or `full_viewport` (the whole screen, `UploadImage` + `SegmentImage`). |
 | | `resolution_mode` | `single` or `multi` (the client may submit a coarser downsample). Not consulted for `full_viewport`. |
-| `prompt_encoding` | `prompt_encoding`, `EDGE_TAU_PX`, ... | The constants the mask prompt was trained with (`annotation_crops/prompt_encoding.py` `encoding_metadata`). Legacy models: `{"prompt_encoding": "legacy-flat-v1"}`. |
+| `prompt_encoding` | `prompt_encoding`, `EDGE_TAU_PX`, ... | The constants the mask prompt was trained with (`prompt_encoders/v6.py` `encoding_metadata`). Legacy models: `{"prompt_encoding": "legacy-flat-v1"}`. |
 | `client_contract` | `contract_version` | Bump when the client's duties change. |
 | | `mask_format` | `png-l8-binary`: 1-bit or 8-bit greyscale PNG, non-zero is in the mask. |
 | | `window` | Prompt window in pixels (1024). |
@@ -48,7 +48,7 @@ warning.
 ## Encodings the server implements
 
 - `legacy-flat-v1`: +8 inside a binary foreground mask, -8 for a background mask, -2 for a background rectangle.
-- `edge-confidence-v6`: `annotation_crops/prompt_encoding.py` with the manifest's constants.
+- `edge-confidence-v6`: `prompt_encoders/v6.py` with the manifest's constants.
 
 ## Hand-written examples
 

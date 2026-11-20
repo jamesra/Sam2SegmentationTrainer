@@ -108,7 +108,7 @@ differential_lr:
 # config loads). Every family is trained against the true polygon; the full ground-truth mask is never a prompt.
 # Dense mask prompts are scaled by an edge confidence curve c(d) = 1 - exp(-d / tau_eff), so the traced edge
 # is trusted loosely and the interior fully. The server must use the same function and constants
-# (annotation_crops/prompt_encoding.py). Validation always uses fixed prompts so scores stay comparable.
+# (prompt_encoders/v6.py). Validation always uses fixed prompts so scores stay comparable.
 prompt:
   # false: every training sample is the original single centroid point.
   enabled: true

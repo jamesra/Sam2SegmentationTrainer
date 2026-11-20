@@ -11,7 +11,7 @@ import pytest
 
 from protocol import circle, polygon
 from segmentation_grpc import CurveFit, CurveMethod, Ellipse, Line, Shape, Vector2
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.cell_grid import CELL_SIZE, Cell, MaskShape, window_origin
 from segmentation_server.curve_fit import fit_curve
 from segmentation_server.depth_trust import edge_depth, local_thickness, trust_weight

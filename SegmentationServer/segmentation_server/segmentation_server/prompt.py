@@ -30,7 +30,7 @@ from numpy.typing import NDArray
 from segmentation_server.cell_grid import TILE_SIZE, Cell, MaskShape, Point, TileIndex, tiles_for_cell
 from segmentation_server.mask_tiles import TiledMaskShape, TileKey
 from segmentation_server.shapes import CircleGeometry, Geometry, ShapeRegion, scaled_circle
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 
 logger = logging.getLogger(__name__)
 

@@ -407,8 +407,8 @@ At start-up the server reads the manifest and:
 - applies the `client_contract`'s `circle_diameter_scale` to softened circles itself (it is informational to the
   client, which sends true radii);
 - builds the start window's `mask_input` with the encoding the manifest names: `legacy-flat-v1` is the original flat
-  +8/-8 scheme, `edge-confidence-v6` is the trainer's encoding (`trainer_prompt_encoding.py`, a byte-for-byte copy
-  of the trainer's `annotation_crops/prompt_encoding.py`, kept in step by a test), `edge-confidence-v7` adds the
+  +8/-8 scheme, `edge-confidence-v6` is the trainer's encoding (`prompt_encoders/v6.py` at the repository root, the one
+  module both import), `edge-confidence-v7` adds the
   depth-relative trust. Windows the walk grows into are still prompted with their neighbours' fused logits;
 - **refuses to start** if the manifest names an encoding it does not implement, or `capabilities` other than
   `tile_grid` / `single` (every model is fed as a single-resolution tile grid; the section may be left out), since

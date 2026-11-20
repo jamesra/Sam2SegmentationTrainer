@@ -23,6 +23,7 @@ COPY annotation-gallery/converter /app/converter
 COPY annotation-gallery/gold /app/gold
 COPY annotation-gallery/seg_proto /app/seg_proto
 COPY annotation_crops /app/annotation_crops
+COPY prompt_encoders /app/prompt_encoders
 
 RUN pip install --no-cache-dir "numpy>=2.2" pillow scipy grpcio protobuf contourpy \
     && groupadd --gid 10001 gallery \

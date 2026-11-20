@@ -7,7 +7,7 @@ bitmaps into those values:
 * ``legacy-flat-v1`` is the original scheme (``tile_growth.mask_prompt_logits`` and ``_with_background``: a flat +8
   inside the object's mask, -8 inside a background region). It has no encoder object here: a ``None`` encoder keeps
   that code path exactly as it was.
-* ``edge-confidence-v6`` (``trainer_prompt_encoding.PROMPT_ENCODING_VERSION``, :class:`EdgeConfidenceEncoder`): each
+* ``edge-confidence-v6`` (``prompt_encoders.v6.PROMPT_ENCODING_VERSION``, :class:`EdgeConfidenceEncoder`): each
   part of the object is a seed, ``+SEED_LOGIT * c(d)`` with ``c`` the trainer's edge confidence of its own pixels
   (a softened circle is its disc at ``radius * circle_diameter_scale``); several parts of one island are combined by
   the largest value. Background shapes are negatives each by its own geometry: a circle by its radius trust
@@ -28,7 +28,7 @@ from typing import Any, List, Mapping, Optional, Protocol, Sequence, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.cell_grid import CELL_SIZE, Cell, MaskShape, window_origin
 from segmentation_server.depth_trust import DEFAULT_MIN_CORE_PX, build_trust_islands
 from segmentation_server.model_manifest import LEGACY_ENCODING, ManifestError, ModelManifest
@@ -73,7 +73,7 @@ def compose(
 ) -> NDArray[np.float32]:
     """The full-resolution canvas from a positive layer and negative regions, with the trainer's overlap rule.
 
-    The same rule as ``trainer_prompt_encoding.encode_dense_canvas``: a pixel claimed by both sides is 0 (unknown),
+    The same rule as ``prompt_encoders.v6.encode_dense_canvas``: a pixel claimed by both sides is 0 (unknown),
     positives keep their value, and where only negatives overlap the strongest one wins. With one seed it gives exactly
     what ``encode_dense_canvas(seed=...)`` gives.
     """

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from segmentation_grpc import ModelInfo
 
-from segmentation_server import trainer_prompt_encoding as enc
+import prompt_encoders.v6 as enc
 from segmentation_server.model_manifest import (
     LEGACY_ENCODING,
     ManifestError,
@@ -194,7 +194,7 @@ def test_a_model_whose_encoding_the_server_does_not_implement_is_refused() -> No
 def _trainer_repo() -> Path | None:
     candidates = [os.environ.get("SAM2_TRAINER_REPO"), str(Path(__file__).resolve().parents[3])]
     for candidate in candidates:
-        if candidate and (Path(candidate) / "annotation_crops" / "prompt_encoding.py").is_file():
+        if candidate and (Path(candidate) / "prompt_encoders" / "v6.py").is_file():
             return Path(candidate)
     return None
 
@@ -212,13 +212,3 @@ def test_the_hand_written_v3_example_from_the_trainer_repo_loads_and_the_whole_s
 
     assert v3.prompt_encoding == LEGACY_ENCODING
     assert encoder_for(v3) is None  # legacy: the existing prompt path
-
-
-def test_the_vendored_encoding_is_the_trainers_file() -> None:
-    repo = _trainer_repo()
-    if repo is None:
-        pytest.skip("the trainer repository is not next to this one (set SAM2_TRAINER_REPO)")
-    ours = Path(enc.__file__).read_bytes().replace(b"\r\n", b"\n")
-    theirs = (repo / "annotation_crops" / "prompt_encoding.py").read_bytes().replace(b"\r\n", b"\n")
-
-    assert ours == theirs, "trainer_prompt_encoding.py must be a byte-for-byte copy of annotation_crops/prompt_encoding.py"

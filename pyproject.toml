@@ -35,7 +35,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["sam2_segmentation_trainer*", "annotation_crops*"]
+include = ["sam2_segmentation_trainer*", "annotation_crops*", "prompt_encoders*"]
 
 [tool.setuptools.package-data]
 sam2_segmentation_trainer = ["config/*.yaml"]

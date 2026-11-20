@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
@@ -13,9 +11,8 @@ import numpy as np
 import pytest
 
 from segmentation_grpc import CoordinateSpace
-from segmentation_server import crush_display
 from segmentation_server.capture_encoder import encode_capture, stretch_range
-from segmentation_server.crush_display import display_lut
+from prompt_encoders.crush_display import display_lut
 from segmentation_server.identity_client import IdentityAssignments, IdentityOptions
 from segmentation_server.tile_ref import TileRef
 from segmentation_server.tile_source import VikingTilesetSource, is_plain_mosaic_cell
@@ -201,19 +198,6 @@ async def test_a_crushed_cell_is_the_clients_capture_of_the_display_gray() -> No
     expected = cv2.imdecode(np.frombuffer(encode_capture(np.flipud(shown).copy()), np.uint8), cv2.IMREAD_UNCHANGED)
     assert np.array_equal(cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED), expected)
     source.close()
-
-
-def test_the_vendored_crush_display_is_the_trainers_file() -> None:
-    candidates = [os.environ.get("SAM2_TRAINER_REPO"), str(Path(__file__).resolve().parents[3])]
-    theirs_path = next(
-        (Path(c) / "annotation_crops" / "crush_display.py" for c in candidates if c and (Path(c) / "annotation_crops" / "crush_display.py").is_file()),
-        None,
-    )
-    if theirs_path is None:
-        pytest.skip("the trainer repository is not next to this one (set SAM2_TRAINER_REPO)")
-    ours = Path(crush_display.__file__).read_bytes().replace(b"\r\n", b"\n")
-
-    assert ours == theirs_path.read_bytes().replace(b"\r\n", b"\n"), "crush_display.py must be a byte-for-byte copy of annotation_crops/crush_display.py"
 
 
 @pytest.mark.asyncio

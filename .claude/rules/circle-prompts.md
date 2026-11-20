@@ -1,5 +1,6 @@
 ---
 paths:
+  - "prompt_encoders/**"
   - "annotation_crops/prompt_encoding.py"
   - "annotation_crops/negatives.py"
   - "sam2_segmentation_trainer/data/**"

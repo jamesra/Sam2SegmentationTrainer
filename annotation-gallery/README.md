@@ -71,7 +71,7 @@ viewer, approve and reject are the gallery's own.
 
 **Quantized tiles.** When the VikingXML tileset is Nornir's `Quantized` filter (it carries `CrushVersion`, `CrushStep`,
 `CrushBits` and a `CodeHistogram`), the tiles hold codes, not intensities. The converter fetches them as stored and shows
-them through Viking's default (Auto) window and gamma (`annotation_crops/crush_display.py`, shared with the crop export, a port of Viking's `CrushInfo`), so cards and
+them through Viking's default (Auto) window and gamma (`prompt_encoders/crush_display.py`, shared with the crop export and the segmentation server, a port of Viking's `CrushInfo`), so cards and
 segmentation tiles look as they do in Viking. Pick the filter with the build's `filter` field (`Quantized`). Contrast is not
 customisable yet; codes wider than 8 bits are left as stored, as in Viking.
 

@@ -76,7 +76,7 @@ The negative-only prompt is removed (assessment 1.5); this plan assumes it is go
 - **Downsampling.** Downsample to the 256×256 `mask_input` by area averaging, not nearest-neighbor.
 - **Neighbor-merge samples (section 3.3).** Leave out the merged neighbor's negative context; otherwise the error is labelled for the model.
 - **Containment loss.** It applies only where the prompt is a seed, weighted by c(d), so it is effectively the trusted core. It is never applied to masks to correct or near-correct masks.
-- **Production must use the identical function.** The server must build prompts with the same c(d), τ, cap, M_seed and M_corr. The formula and constants live in `annotation_crops/prompt_encoding.py`, to be mirrored in the server.
+- **Production must use the identical function.** The server must build prompts with the same c(d), τ, cap, M_seed and M_corr. The formula and constants live in `prompt_encoders/v6.py`, to be mirrored in the server.
 
 ## 3. Prompt families
 

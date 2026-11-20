@@ -1,6 +1,6 @@
 ---
 description: Prompts at serve time must be built by the trainer's own encoder (annotation_crops.prompt_encoding) with the same constants; any change to how a prompt is encoded bumps PROMPT_ENCODING_VERSION. Lists the known serve-time mismatches.
-globs: annotation_crops/prompt_encoding.py, sam2_segmentation_trainer/data/prompts.py, sam2_segmentation_trainer/data/dataset.py, sam2_segmentation_trainer/data/circle_seed_trust.py, sam2_segmentation_trainer/encoding_record.py, sam2_segmentation_trainer/export_serve.py, docs/*plan*.md, docs/depth_relative_trust.md
+globs: prompt_encoders/**, annotation_crops/prompt_encoding.py, sam2_segmentation_trainer/data/prompts.py, sam2_segmentation_trainer/data/dataset.py, sam2_segmentation_trainer/data/circle_seed_trust.py, sam2_segmentation_trainer/encoding_record.py, sam2_segmentation_trainer/export_serve.py, docs/*plan*.md, docs/depth_relative_trust.md
 alwaysApply: false
 ---
 

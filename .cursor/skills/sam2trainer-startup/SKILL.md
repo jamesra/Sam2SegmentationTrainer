@@ -36,7 +36,7 @@ Update `docs/status.md` when what you find has changed, and give the date.
 | Correction service | `viking-section-correction-service-1`. Its sets are mounted at `/corrections`. |
 | Training data | Local mirror at `/data-local/<set>`; the NAS is at `/storage4`. Sync scripts: `scripts/WSL`, `scripts/NAS`. |
 | Config | `sam2_segmentation_trainer/config/em_finetune.yaml` (Hydra; override with `key=value`) |
-| Prompt encoding (shared with the server) | `annotation_crops/prompt_encoding.py`, `PROMPT_ENCODING_VERSION` |
+| Prompt encoding (shared with the server) | `prompt_encoders/v6.py`, `PROMPT_ENCODING_VERSION` |
 | Frozen validation splits and gold sets | `/storage4/Sam2Trainer/valsets`, `sam2-em-valsets` (`docs/validation_sets.md`) |
 | Training-data exporter | The nornir repo: `.cursor/skills/segmentation-training-export/SKILL.md` |
 | Run metrics (REST) | The `sam2-training-report` and `tensorboard-api` skills |
