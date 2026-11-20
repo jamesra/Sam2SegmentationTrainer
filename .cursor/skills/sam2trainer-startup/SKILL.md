@@ -20,6 +20,9 @@ Select-String -Path D:\Docker\mounted-configs\sam2-trainer\<run>\train.log -Patt
 - `early stopping at epoch N` or `Training complete` means the run has finished.
 - `/outputs` in the container is `D:\Docker\mounted-configs\sam2-trainer` on the host (`-sem` for SEM).
 - Runs and checkpoints are at `/storage4/Sam2Trainer/runs/<run>`.
+- Every launch, a resume included, writes `<run>/code/<UTC time>/` (`code_snapshot.py`): `base` SHA, `patch`,
+  `untracked.tgz`, `config.yaml`, `launch.json`. Runs before 2026-11-20 have none; v5's start snapshot is
+  `/outputs/sam2_em_v5/code_snapshot.*`.
 
 Update `docs/status.md` when what you find has changed, and give the date.
 

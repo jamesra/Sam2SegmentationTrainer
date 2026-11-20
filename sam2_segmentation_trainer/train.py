@@ -63,6 +63,7 @@ from sam2_segmentation_trainer.data.tiles import (
 from sam2_segmentation_trainer.losses import containment_warmup_scale
 from annotation_crops.negatives import DEFAULT_CIRCLE_DIAMETER_SCALE
 from annotation_crops.prompt_encoding import CORRECTION_LOGIT, EDGE_TAU_DEPTH_FRAC, EDGE_TAU_PX, SEED_LOGIT
+from sam2_segmentation_trainer.code_snapshot import write_code_snapshot
 from sam2_segmentation_trainer.data_record import build_data_record, write_data_record
 from sam2_segmentation_trainer.card_scores import (
     TrainPassScores,
@@ -1434,6 +1435,8 @@ def _run_training(cfg: DictConfig, progress: TrainingProgress) -> Path:
         # Before config.yaml is overwritten: a run with another prompt layout is never continued.
         check_resume_layout(run_dir, cfg)
     OmegaConf.save(cfg, run_dir / "config.yaml")
+    # Every launch, a resume included, records the code it runs: a resume runs whatever the working tree holds now.
+    write_code_snapshot(run_dir, OmegaConf.to_yaml(cfg))
     write_record(run_dir / RECORD_NAME, metadata_from_settings(settings_from_cfg(cfg)))
     warn_encoding_differences(cfg)
 
