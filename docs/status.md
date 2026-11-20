@@ -10,11 +10,13 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
   - Best epoch 7 (model v5.7): core recall 0.9732, IoU 0.8943, spill 0.026, merge rate 0.000, fragmentation 0.042.
   - Run directory: `/storage4/Sam2Trainer/runs/sam2_em_v5`; log at `/outputs/sam2_em_v5/train.log`.
 - **Trainer container:** `sam2-trainer-cursor-dev-1` exited (code 255) about 2026-11-02. Nothing is training.
-- **Next run: model v6** (not started as of 2026-11-20). All planned work below is v6 work.
+- **Next run: model v7** (James, 2026-11-20). Not started. There is no model v6: the model number was moved up to
+  match its prompt encoding, `edge-confidence-v7`.
   - Depth-relative seed trust, carried circles and polygons, oversize augmentation, `circle_pull_through` retired.
-  - Plans: `docs/adjacent_circle_seed_plan.md`, `docs/depth_relative_trust.md`. They call the new prompt encoding
-    "v7"; that is the encoding, not the model. The encoding string still has to change from `edge-confidence-v6`
-    when its values change (`serve-train-prompt-parity.mdc`).
+  - Plans: `docs/adjacent_circle_seed_plan.md`, `docs/depth_relative_trust.md`.
+  - Start it with `training.run_name=sam2_em_v7`. `training.run_name=auto` would choose `sam2_em_v6`, the next free
+    number.
+  - Training set v4 (below).
 
 ## Open decisions (James)
 
@@ -22,7 +24,7 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
   `data.train_split` has been 0.9 since the first commit; v5 trained on 234,172 and validated on 27,959 (10.7%), plus
   one guard section on each side of every slab. The 25% -> 10% change was `val.epoch_subset`, a share of the
   validation split scored each epoch, so it never removed training samples. Training data v5 really never used: 75%
-  of full tiles (`full_tile_keep_fraction` 0.25, the `TODO(v6)` in `data/fulltile.py`).
+  of full tiles (`full_tile_keep_fraction` 0.25, the `TODO(v7)` in `data/fulltile.py`).
 - **`circle_pull_through` retirement.** Should retirement wait until export link coverage is measured?
   Coverage looked low:
   - RPC1: 619 of 40,998 locations.

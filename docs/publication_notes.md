@@ -44,6 +44,14 @@ All defined in `docs/depth_relative_trust.md`:
 
 ## Algorithmic decisions
 
+- **2026-11-20 The next model is v7; there is no model v6, and it trains on set v4.**
+  - Why the number: models v4 and v5 were both trained with prompt encoding `edge-confidence-v6`, and the next
+    model brings `edge-confidence-v7`. James moved the model number up to match, so the two read alike from here on.
+  - Why the set: set v4 is a copy-on-write copy of set v3, re-exported. Set v3 stays exactly as model v5 trained on
+    it, and each model's record names the set it trained on.
+  - Set v4 fixes v3's truncated RC1 and RPC1 `shapes.jsonl`. RC1 is exported from RC1_Crush's crushed tiles, through
+    Viking's display window and gamma.
+
 - **2026-11-05 The converter names locations; the segmentation server builds their prompts.** Supersedes the
   2026-11-04 entry below. Why: the shared library only gave identical bytes if every client gathered identical input
   (location, candidate neighbours, structures, LastModified, model, tileset), which the server can read itself; the
