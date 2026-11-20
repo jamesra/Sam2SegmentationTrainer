@@ -10,15 +10,19 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
   - Best epoch 7 (model v5.7): core recall 0.9732, IoU 0.8943, spill 0.026, merge rate 0.000, fragmentation 0.042.
   - Run directory: `/storage4/Sam2Trainer/runs/sam2_em_v5`; log at `/outputs/sam2_em_v5/train.log`.
 - **Trainer container:** `sam2-trainer-cursor-dev-1` exited (code 255) about 2026-11-02. Nothing is training.
-- **Next run: model v7.**
+- **Next run: model v6** (not started as of 2026-11-20). All planned work below is v6 work.
   - Depth-relative seed trust, carried circles and polygons, oversize augmentation, `circle_pull_through` retired.
-  - Plans: `docs/adjacent_circle_seed_plan.md`, `docs/depth_relative_trust.md`.
-  - "v7" is the encoding's name in those plans. Check the model number before starting the run.
+  - Plans: `docs/adjacent_circle_seed_plan.md`, `docs/depth_relative_trust.md`. They call the new prompt encoding
+    "v7"; that is the encoding, not the model. The encoding string still has to change from `edge-confidence-v6`
+    when its values change (`serve-train-prompt-parity.mdc`).
 
 ## Open decisions (James)
 
-- **The 15% held back.** Should the extra 15% of samples still be held back from training, now that 10% is the
-  validation subset? Raised 2026-10-22.
+- **The 15% held back** (James, 2026-10-22). Checked 2026-11-20: nothing beyond validation is held back from training.
+  `data.train_split` has been 0.9 since the first commit; v5 trained on 234,172 and validated on 27,959 (10.7%), plus
+  one guard section on each side of every slab. The 25% -> 10% change was `val.epoch_subset`, a share of the
+  validation split scored each epoch, so it never removed training samples. Training data v5 really never used: 75%
+  of full tiles (`full_tile_keep_fraction` 0.25, the `TODO(v6)` in `data/fulltile.py`).
 - **`circle_pull_through` retirement.** Should retirement wait until export link coverage is measured?
   Coverage looked low:
   - RPC1: 619 of 40,998 locations.
@@ -34,6 +38,20 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
   marked superseded. The Sam2Trainer copy, `annotation-gallery/seg_proto/segmentation.proto`, follows it (updated
   2026-11-16).
 
+## Set v4 (2026-11-20)
+
+- `Y:\SAM2TrainingData\TEM\v4` (`/volume1/Data/SAM2TrainingData/TEM/v4` on Storage6, 192.168.0.199) is a btrfs
+  reflink copy of set v3. Its file counts, sizes and manifests match v3's. The old in-folder `_work/` caches were moved to
+  `v4/_work_cache/<VOL>`, where the current exporter looks for them.
+- Not re-exported yet. Plan: `C:\Users\jande\.claude\plans\when-we-submit-annotations-compiled-rose.md`.
+  - RC2, RPC1, RPC2: `-Update -RefreshOData -SetVersion v4 -ParentSet v3`.
+  - RC1: a full `-Force` export from RC1_Crush's `TEM.Quantized` tileset, because the annotations were remapped to
+    that mosaic.
+- Set v3 stays as model v5 trained on it.
+- Serving mismatch to raise with the server: when the segmentation server reads crushed tiles itself
+  (`tile_source.py`), it stretches the raw codes per cell from the 1st to the 99th percentile. The exporter uses Viking's
+  display window and gamma instead.
+
 ## Data (Nornir notes as of 2026-10-26; recheck)
 
 - **Truncated `shapes.jsonl`.** The TEM v3 RC1 and RPC1 files stop at z 282 and z 742. In all, 2,652 and
@@ -42,9 +60,10 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
   configs never pass `-SetVersion`.
 - **Circle centres.** The exporter takes circle centres from the circumcentre of three ring points instead of `X`, `Y`.
 
-## Discrepancies to resolve
+## Resolved
 
-- **Is the prompt encoder frozen?** The README (lines 216 and 229) says it is frozen except `mask_downscaling`.
-  The config says `freeze_mode: none`, and every v5 resume logged 100% trainable parameters (224.4M). Either the
-  README or the config is out of date.
-
+- **Is the prompt encoder frozen?** Yes, and the README is right (checked 2026-11-20). `freeze_mode: none` trains
+  everything except SAM2's `sam_prompt_encoder`; `unfreeze_mask_cnn: true` then unfreezes its `mask_downscaling`
+  network (4,684 parameters). Frozen: the point, not-a-point and no-mask embeddings (1,536 parameters). The log's
+  "224.4M / 224.4M (100%)" is rounding. `configure_trainable_params` is identical at v5's start (`fd3e381` plus its
+  snapshot patch) and today, and all 18 v5 starts logged `[none]`. Resume refuses a changed freeze setting.
