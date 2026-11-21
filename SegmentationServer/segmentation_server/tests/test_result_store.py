@@ -27,6 +27,11 @@ from segmentation_grpc import (
 from segmentation_server.result_store import ResultStore, StoredTrace, cache_key, location_key
 
 
+def _incompressible(size: int) -> bytes:
+    """Bytes zlib cannot shrink, so a stored row's size is about ``size`` and the size limits act on it."""
+    return np.random.default_rng(size).bytes(size)
+
+
 def _refs(*pairs):
     return [LocationRef(id=location_id, last_modified_ticks=lm) for location_id, lm in pairs]
 
@@ -120,6 +125,55 @@ def test_a_stored_answer_is_found_again(tmp_path: Path) -> None:
     assert store.lookup("RC2", key, 0.0) is None, "volumes do not share rows"
 
 
+def test_a_model_row_is_stored_compressed_and_read_back_whole(tmp_path: Path) -> None:
+    store = ResultStore(tmp_path)
+    key = _key(_request())
+    logits = np.zeros((256, 256), dtype=np.float16).tobytes()
+    store.store("RC1", key, logits, 0.0)
+
+    with sqlite3.connect(tmp_path / "RC1.sqlite") as connection:
+        stored, compressed = connection.execute("SELECT LENGTH(response), compressed FROM segmentation").fetchone()
+    assert compressed == 1 and stored < len(logits) // 10
+    assert store.lookup("RC1", key, 0.0).response == logits
+
+
+def test_a_row_written_before_compression_is_still_read(tmp_path: Path) -> None:
+    store = ResultStore(tmp_path)
+    key = _key(_request())
+    store.store("RC1", key, b"answer", 0.0)
+    with sqlite3.connect(tmp_path / "RC1.sqlite") as connection:
+        connection.execute("UPDATE segmentation SET response=?, compressed=0", (b"old raw answer",))
+
+    assert store.lookup("RC1", key, 0.0).response == b"old raw answer"
+
+
+def test_a_file_from_before_compression_gains_the_column_and_reads_its_rows(tmp_path: Path) -> None:
+    key = _key(_request())
+    ResultStore(tmp_path).store("RC1", key, b"answer", 0.0)
+    with sqlite3.connect(tmp_path / "RC1.sqlite") as connection:
+        connection.execute("UPDATE segmentation SET response=?", (b"old raw answer",))
+        connection.execute("ALTER TABLE segmentation DROP COLUMN compressed")
+
+    assert ResultStore(tmp_path).lookup("RC1", key, 0.0).response == b"old raw answer"
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [({}, 16 * 1024**3), ({"SEGMENTATION_RESULTS_MAX_BYTES": "0"}, 0), ({"SEGMENTATION_RESULTS_MAX_BYTES": "1000"}, 1000)],
+)
+def test_the_result_store_is_capped_at_16_gib_per_volume_unless_the_host_says_otherwise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: dict, expected: int
+) -> None:
+    from segmentation_server.result_store import open_result_store
+
+    monkeypatch.setenv("SEGMENTATION_RESULTS_DIR", str(tmp_path))
+    monkeypatch.delenv("SEGMENTATION_RESULTS_MAX_BYTES", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    assert open_result_store()._max_bytes == expected
+
+
 def test_a_row_answers_its_threshold_and_any_higher_one_only(tmp_path: Path) -> None:
     store = ResultStore(tmp_path)
     key = _key(_request())
@@ -143,9 +197,9 @@ def test_eviction_drops_unlinked_rows_least_recently_hit_first(tmp_path: Path) -
     store = ResultStore(tmp_path, max_bytes=250)
     keys = [_key(_request(locations=_refs((i, 1)))) for i in range(1, 5)]
     job = store.create_job("RC1", "Convert structure 1", "james", "", "convert")
-    store.store("RC1", keys[0], b"x" * 100, 0.0, job_id=job.job_id)
+    store.store("RC1", keys[0], _incompressible(100), 0.0, job_id=job.job_id)
     for key in keys[1:]:
-        store.store("RC1", key, b"x" * 100, 0.0)
+        store.store("RC1", key, _incompressible(100), 0.0)
     store.lookup("RC1", keys[1], 0.0)  # the most recent hit of the unlinked rows
 
     store.evict("RC1")
@@ -160,7 +214,7 @@ def test_deleting_a_job_makes_its_rows_evictable(tmp_path: Path) -> None:
     store = ResultStore(tmp_path, max_bytes=50)
     key = _key(_request())
     job = store.create_job("RC1", "t", "james", "", "convert")
-    store.store("RC1", key, b"x" * 100, 0.0, job_id=job.job_id)
+    store.store("RC1", key, _incompressible(100), 0.0, job_id=job.job_id)
     store.evict("RC1")
     assert store.lookup("RC1", key, 0.0) is not None
     assert [row.linked for row in store.list_jobs("RC1")] == [1]
@@ -175,7 +229,7 @@ def test_a_manual_trace_answers_only_until_the_location_is_edited_and_is_never_e
     store = ResultStore(tmp_path, max_bytes=1, max_age_days=1e-12)
     store.put_traces("RC1", [StoredTrace(7, 100, b"shape", "james", 5)], [])
     model = _key(_request(locations=_refs((8, 100))))
-    store.store("RC1", model, b"x" * 100, 0.0)  # evicts: the store is over both limits
+    store.store("RC1", model, _incompressible(100), 0.0)  # evicts: the store is over both limits
     store.evict("RC1")
     assert store.lookup("RC1", model, 0.0) is None, "the model row goes, the trace stays"
 

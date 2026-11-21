@@ -26,9 +26,8 @@ logger = logging.getLogger(__name__)
 
 # Embedding files are embedding_codec blobs (format 2 onward); the older torch.save ".pt" files are not read.
 EMBEDDING_SUFFIX = ".emb"
-# About 5.8 MiB per 1024 cell (hiera_l, compressed): 32 GiB keeps about 5,600 cells, a tracing working set,
-# not a whole volume.
-DEFAULT_MAX_BYTES = 32 * 1024**3
+# About 5.8 MiB per 1024 cell (hiera_l, compressed). The disk store is off unless a host sets a cap (see
+# open_embedding_store).
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MODE_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 # Current stamps are 32 hex characters. Shorter ones from older releases still match so that
@@ -128,10 +127,42 @@ def checkpoint_stamp(checkpoint_path: str, model_cfg: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def open_embedding_store(checkpoint_path: str, model_cfg: str) -> Optional["EmbeddingStore"]:
-    """Open the store when ``SEGMENTATION_EMBEDDING_CACHE`` is set. Otherwise None.
+def purge_embedding_stamps(root: Path, keep: Optional[str] = None) -> int:
+    """Delete the checkpoint-stamp folders of embedding files under ``root``, except ``keep``. Returns bytes freed.
 
-    ``SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES`` caps the tree. ``0`` means no cap.
+    Only direct children whose names look like a stamp (see ``checkpoint_stamp``) are removed, so the tile store's
+    ``tiles`` folder, and anything else sharing a mounted cache folder, is left alone. This assumes one server owns
+    this cache root: a second server running another checkpoint against the same folder loses its files.
+    """
+    try:
+        children = list(Path(root).iterdir())
+    except OSError:
+        logger.warning("Embedding disk cache could not list %s to purge old stamps", root)
+        return 0
+    total = 0
+    for child in children:
+        if child.name == keep or not _STAMP_RE.match(child.name) or not child.is_dir():
+            continue
+        freed = _directory_bytes(child)
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            logger.warning("Embedding disk cache could not remove stamp folder %s", child, exc_info=True)
+            continue
+        total += freed
+        logger.info("Embedding disk cache removed stamp folder %s (kept %s) freed=%s bytes", child.name, keep, freed)
+    return total
+
+
+def open_embedding_store(checkpoint_path: str, model_cfg: str) -> Optional["EmbeddingStore"]:
+    """Open the store when a host opts in, otherwise None.
+
+    The disk store is off by default (2026-11-20): an embedding is about 5.8 MiB per window, so a cache of them filled
+    hosts' disks (87 GB on one), while the result store keeps the finished answers clients read in a few KB each. A
+    request whose result misses re-encodes its windows on the GPU. A host opts in with both
+    ``SEGMENTATION_EMBEDDING_CACHE`` (the folder) and a positive ``SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES`` (the cap);
+    unset or ``0`` leaves the store off. With the folder set and the store off, the embedding folders left there by
+    earlier releases are deleted at startup and the bytes freed are logged; the tile store's ``tiles`` folder stays.
     An unreadable directory disables the store rather than failing server startup.
     """
     root = os.environ.get("SEGMENTATION_EMBEDDING_CACHE", "").strip()
@@ -139,34 +170,34 @@ def open_embedding_store(checkpoint_path: str, model_cfg: str) -> Optional["Embe
         logger.info("Embedding disk cache disabled (SEGMENTATION_EMBEDDING_CACHE unset)")
         return None
     raw_max = os.environ.get("SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES", "").strip()
-    if raw_max == "":
-        max_bytes: Optional[int] = DEFAULT_MAX_BYTES
-    else:
+    max_bytes = 0
+    if raw_max:
         try:
-            parsed = int(raw_max)
+            max_bytes = int(raw_max)
         except ValueError:
-            logger.warning(
-                "Invalid SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES=%r; using %s",
-                raw_max,
-                DEFAULT_MAX_BYTES,
-            )
-            max_bytes = DEFAULT_MAX_BYTES
-        else:
-            max_bytes = None if parsed <= 0 else parsed
+            logger.warning("Invalid SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES=%r; embedding disk cache off", raw_max)
+    if max_bytes <= 0:
+        freed = purge_embedding_stamps(Path(root)) if Path(root).is_dir() else 0
+        logger.info(
+            "Embedding disk cache off (set SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES to opt in); "
+            "removed old embedding folders under %s, freed=%s bytes",
+            root,
+            freed,
+        )
+        return None
     stamp = checkpoint_stamp(checkpoint_path, model_cfg)
     try:
         store = EmbeddingStore(root, stamp, max_bytes=max_bytes)
     except OSError:
         logger.exception("Embedding disk cache unavailable at %s", root)
         return None
-    cap = "none" if max_bytes is None else f"{max_bytes / (1024**3):.1f} GiB"
     logger.info(
-        "Embedding disk cache root=%s stamp=%s files=%s bytes=%s cap=%s",
+        "Embedding disk cache root=%s stamp=%s files=%s bytes=%s cap=%.1f GiB",
         root,
         stamp,
         len(store._files),
         store.total_bytes,
-        cap,
+        max_bytes / (1024**3),
     )
     return store
 
@@ -313,33 +344,10 @@ class EmbeddingStore:
     def _purge_other_stamps(self) -> None:
         """Delete cache folders left by other checkpoints.
 
-        The stamp is part of every path, so once the weights file is replaced the old stamp's
-        files can never be read again, yet nothing else removes them and they would sit on disk
-        until the byte cap evicted them by age. Only direct children whose names look like a stamp
-        (see ``checkpoint_stamp``) are removed, so anything else sharing a mounted cache folder is
-        left alone. This assumes one server owns this cache root: a second server running another
-        checkpoint against the same folder would have its cache removed at this server's startup.
+        The stamp is part of every path, so once the weights file is replaced the old stamp's files can never be read
+        again, yet nothing else removes them and they would sit on disk until the byte cap evicted them by age.
         """
-        try:
-            children = list(self._root.iterdir())
-        except OSError:
-            logger.warning("Embedding disk cache could not list %s to purge old stamps", self._root)
-            return
-        for child in children:
-            if child.name == self._stamp or not _STAMP_RE.match(child.name) or not child.is_dir():
-                continue
-            freed = _directory_bytes(child)
-            try:
-                shutil.rmtree(child)
-            except OSError:
-                logger.warning("Embedding disk cache could not remove old stamp %s", child, exc_info=True)
-                continue
-            logger.info(
-                "Embedding disk cache removed old stamp %s (current %s) freed=%s bytes",
-                child.name,
-                self._stamp,
-                freed,
-            )
+        purge_embedding_stamps(self._root, keep=self._stamp)
 
     def _index_existing(self) -> None:
         if not self._root.is_dir():

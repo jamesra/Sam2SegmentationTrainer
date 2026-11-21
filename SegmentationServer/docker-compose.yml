@@ -68,14 +68,16 @@ x-segmentation-env: &segmentation-env
   # check expects "localhost" and the container shows unhealthy behind a real certificate.
   SEGMENTATION_HEALTHCHECK_HOST: ${SEGMENTATION_HEALTHCHECK_HOST:-${VIKING_HOSTNAME_SEGMENTATION:-}}
   SEGMENTATION_TLS_WAIT_SECONDS: ${SEGMENTATION_TLS_WAIT_SECONDS:-120}
-  # Tile embeddings (not weights). Survives eviction and container restart.
+  # Tile embeddings (not weights): off unless SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES is a positive cap. Off, the
+  # server deletes the embedding folders older releases left here at startup; tiles/ (below) stays.
   SEGMENTATION_EMBEDDING_CACHE: /var/cache/segmentation-embeddings
   SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES: ${SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES:-}
   # Uploaded tile bytes, so a tile the GPU cache dropped is rebuilt without asking a client. Disk copies go under the embedding cache.
   SEGMENTATION_TILE_RAM_BYTES: ${SEGMENTATION_TILE_RAM_BYTES:-}
   SEGMENTATION_TILE_CACHE_MAX_BYTES: ${SEGMENTATION_TILE_CACHE_MAX_BYTES:-}
-  # Finished segmentations by location (SegmentTilesRequest.locations), manual traces and jobs. Both limits are
-  # optional (empty is none); rows linked to a job and manual traces are never evicted.
+  # Finished segmentations by location (SegmentTilesRequest.locations), manual traces and jobs: the main disk cache.
+  # Responses are stored compressed. Size limit per volume file: empty is 16 GiB, 0 is none; age limit: empty or 0
+  # is none. Rows linked to a job and manual traces are never evicted.
   SEGMENTATION_RESULTS_DIR: /var/cache/segmentation-results
   SEGMENTATION_RESULTS_MAX_BYTES: ${SEGMENTATION_RESULTS_MAX_BYTES:-}
   SEGMENTATION_RESULTS_MAX_AGE_DAYS: ${SEGMENTATION_RESULTS_MAX_AGE_DAYS:-}

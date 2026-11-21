@@ -28,8 +28,12 @@ names the model, so they never read each other's rows. It holds three other thin
   answers for the location until it is edited, whatever the model or threshold, and is never evicted. A row is either
   a person's polygon or the model's logits, never both;
 - jobs: a reason to keep rows. A row whose location key is linked to a job is never evicted;
-- size and age limits, both optional (``SEGMENTATION_RESULTS_MAX_BYTES`` per volume file and
-  ``SEGMENTATION_RESULTS_MAX_AGE_DAYS``): least recently hit rows go first.
+- size and age limits (``SEGMENTATION_RESULTS_MAX_BYTES`` per volume file, default 16 GiB, and
+  ``SEGMENTATION_RESULTS_MAX_AGE_DAYS``, default none): least recently hit rows go first.
+
+Since 2026-11-20 this is the server's main disk cache; the embedding disk store is off by default. A model row's
+response is stored zlib-compressed (``compressed`` = 1); rows written before that are read as they are. The size limit
+counts the stored (compressed) bytes.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ import re
 import sqlite3
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -57,6 +62,11 @@ _TICKS_AT_UNIX_EPOCH = 621_355_968_000_000_000
 _VOLUME_FILE = re.compile(r"[^A-Za-z0-9._-]")
 # Eviction runs at most this often per volume; it is a sweep over the table, not per insert.
 _EVICT_INTERVAL_SECONDS = 60.0
+# The per-volume size limit when SEGMENTATION_RESULTS_MAX_BYTES is unset. It keeps
+# about 150,000 answers per volume (RC1 rows on 10571, 2026-11-20: 343 KB raw, 110 KB compressed on average).
+DEFAULT_MAX_BYTES = 16 * 1024**3
+# zlib level for model responses: float16 logits compress about 3 times; higher levels gain little for the time.
+_ZLIB_LEVEL = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS segmentation (
@@ -76,6 +86,7 @@ CREATE TABLE IF NOT EXISTS segmentation (
     response       BLOB    NOT NULL,
     manual_trace   INTEGER NOT NULL DEFAULT 0,
     tracer         TEXT    NOT NULL DEFAULT '',
+    compressed     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (location_key, location_lm, model_version, server_version, space, transform, channel, downsample,
                  context_hash, prompt_hash)
 );
@@ -352,6 +363,8 @@ class ResultStore:
             connection.execute("ALTER TABLE segmentation ADD COLUMN manual_trace INTEGER NOT NULL DEFAULT 0")
         if "tracer" not in columns:
             connection.execute("ALTER TABLE segmentation ADD COLUMN tracer TEXT NOT NULL DEFAULT ''")
+        if "compressed" not in columns:
+            connection.execute("ALTER TABLE segmentation ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0")
         reviewed = connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='reviewed_outline'"
         ).fetchone()
@@ -383,7 +396,7 @@ class ResultStore:
         path = self._path(volume)
         with self._connect(path) as connection:
             row = connection.execute(
-                "SELECT response, created_ticks, growth_threshold FROM segmentation WHERE location_key=? AND "
+                "SELECT response, created_ticks, growth_threshold, compressed FROM segmentation WHERE location_key=? AND "
                 "location_lm=? AND model_version=? AND server_version=? AND space=? AND transform=? AND channel=? AND "
                 "downsample=? AND context_hash=? AND prompt_hash=?",
                 key.columns(),
@@ -397,7 +410,8 @@ class ResultStore:
                 (now_ticks(), *key.columns()),
             )
             self._link(connection, job_id, key.location_key)
-        return CachedResult(response=bytes(row[0]), created_ticks=int(row[1]), growth_threshold=float(row[2]))
+        response = zlib.decompress(row[0]) if int(row[3]) else bytes(row[0])
+        return CachedResult(response=response, created_ticks=int(row[1]), growth_threshold=float(row[2]))
 
     def store(self, volume: str, key: CacheKey, response: bytes, threshold: float, job_id: int = 0) -> int:
         """Keep ``response``, grown at ``threshold``, under ``key``. It replaces a row grown at a higher threshold and
@@ -409,12 +423,13 @@ class ResultStore:
             connection.execute(
                 "INSERT INTO segmentation (location_key, location_lm, model_version, server_version, space, "
                 "transform, channel, downsample, context_hash, prompt_hash, growth_threshold, created_ticks, "
-                "last_hit_ticks, response) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "last_hit_ticks, response, compressed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
                 "ON CONFLICT (location_key, location_lm, model_version, server_version, space, transform, channel, "
                 "downsample, context_hash, prompt_hash) DO UPDATE SET growth_threshold=excluded.growth_threshold, "
                 "created_ticks=excluded.created_ticks, last_hit_ticks=excluded.last_hit_ticks, "
-                "response=excluded.response WHERE excluded.growth_threshold < segmentation.growth_threshold",
-                (*key.columns(), float(threshold), created, created, sqlite3.Binary(response)),
+                "response=excluded.response, compressed=1 "
+                "WHERE excluded.growth_threshold < segmentation.growth_threshold",
+                (*key.columns(), float(threshold), created, created, sqlite3.Binary(zlib.compress(response, _ZLIB_LEVEL))),
             )
             connection.executemany(
                 "INSERT OR IGNORE INTO segmentation_member (location_key, location_id) VALUES (?, ?)",
@@ -599,24 +614,28 @@ class ResultStore:
 
 
 def open_result_store() -> Optional[ResultStore]:
-    """The store under ``SEGMENTATION_RESULTS_DIR``, or None when it is unset (no result cache)."""
+    """The store under ``SEGMENTATION_RESULTS_DIR``, or None when it is unset (no result cache).
+
+    ``SEGMENTATION_RESULTS_MAX_BYTES`` caps each volume file (default 16 GiB, ``0`` for no cap);
+    ``SEGMENTATION_RESULTS_MAX_AGE_DAYS`` drops rows not hit for that long (default and ``0``: never).
+    """
     root = os.environ.get("SEGMENTATION_RESULTS_DIR", "").strip()
     if not root:
         logger.info("Result cache disabled (SEGMENTATION_RESULTS_DIR unset)")
         return None
 
-    def number(name: str) -> float:
+    def number(name: str, default: float) -> float:
         raw = os.environ.get(name, "").strip()
         if not raw:
-            return 0.0
+            return default
         try:
             return max(0.0, float(raw))
         except ValueError:
-            logger.warning("Invalid %s=%r; no limit", name, raw)
-            return 0.0
+            logger.warning("Invalid %s=%r; using %s", name, raw, default)
+            return default
 
-    max_bytes = int(number("SEGMENTATION_RESULTS_MAX_BYTES"))
-    max_age_days = number("SEGMENTATION_RESULTS_MAX_AGE_DAYS")
+    max_bytes = int(number("SEGMENTATION_RESULTS_MAX_BYTES", DEFAULT_MAX_BYTES))
+    max_age_days = number("SEGMENTATION_RESULTS_MAX_AGE_DAYS", 0.0)
     try:
         store = ResultStore(Path(root), max_bytes=max_bytes, max_age_days=max_age_days)
     except OSError:

@@ -69,3 +69,39 @@ def test_a_second_start_with_the_same_stamp_removes_nothing(tmp_path) -> None:
     second = EmbeddingStore(str(tmp_path), stamp=CURRENT, max_bytes=None)
 
     assert second.try_load(digest, "compiled") == b"persisted"
+
+
+def test_the_disk_store_is_off_unless_a_host_sets_a_cap_and_then_old_folders_are_purged(tmp_path, monkeypatch) -> None:
+    """2026-11-20: embeddings are no longer kept on disk by default; the result store is the cache."""
+    from segmentation_server.embedding_store import open_embedding_store
+
+    old_blob = _write_blob(tmp_path, OLD, "compiled", 1000)
+    tile = tmp_path / "tiles" / CURRENT / "t.png"
+    tile.parent.mkdir(parents=True)
+    tile.write_bytes(b"png")
+    monkeypatch.setenv("SEGMENTATION_EMBEDDING_CACHE", str(tmp_path))
+    monkeypatch.delenv("SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES", raising=False)
+
+    assert open_embedding_store(str(tmp_path / "missing.pt"), "cfg") is None
+    assert not old_blob.exists() and not (tmp_path / OLD).exists()
+    assert tile.read_bytes() == b"png", "the tile store's folder is not an embedding folder"
+
+
+def test_a_cap_of_zero_also_leaves_the_disk_store_off(tmp_path, monkeypatch) -> None:
+    from segmentation_server.embedding_store import open_embedding_store
+
+    monkeypatch.setenv("SEGMENTATION_EMBEDDING_CACHE", str(tmp_path))
+    monkeypatch.setenv("SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES", "0")
+
+    assert open_embedding_store(str(tmp_path / "missing.pt"), "cfg") is None
+
+
+def test_a_host_that_sets_a_cap_keeps_an_embedding_store(tmp_path, monkeypatch) -> None:
+    from segmentation_server.embedding_store import open_embedding_store
+
+    monkeypatch.setenv("SEGMENTATION_EMBEDDING_CACHE", str(tmp_path))
+    monkeypatch.setenv("SEGMENTATION_EMBEDDING_CACHE_MAX_BYTES", "1000000")
+
+    store = open_embedding_store(str(tmp_path / "missing.pt"), "cfg")
+
+    assert store is not None and store._max_bytes == 1_000_000
