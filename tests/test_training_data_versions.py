@@ -86,10 +86,11 @@ class MirrorTaskTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return [line.split("\t")[1] for line in result.stdout.splitlines() if line]
 
-    def test_version_root_cache_and_review_folders_are_not_mirrored(self) -> None:
+    def test_version_root_folders_starting_with_underscore_are_not_mirrored(self) -> None:
         with TemporaryDirectory() as tmp:
             src = Path(tmp) / "src" / "v1"
-            for folder in ("RC1/images", "RC1/_work", "_work_cache/RC1/images", "_review/notes"):
+            for folder in ("RC1/images", "RC1/_work", "_work_cache/RC1/images", "_review/notes",
+                           "_RC1_v3_mosaic/images"):
                 (src / folder).mkdir(parents=True)
             (src / "RC1" / "manifest.jsonl").write_text("{}\n")
             (src / "_work_cache" / "manifest.jsonl").write_text("{}\n")  # looks like a volume, is not one
@@ -98,7 +99,7 @@ class MirrorTaskTests(unittest.TestCase):
 
             self.assertIn("RC1/images", rels)
             self.assertNotIn("RC1/_work", rels)
-            self.assertFalse([r for r in rels if r.startswith(("_work_cache", "_review"))], rels)
+            self.assertFalse([r for r in rels if r.startswith("_")], rels)
 
     def test_a_cache_folder_does_not_fail_the_layout_check(self) -> None:
         with TemporaryDirectory() as tmp:

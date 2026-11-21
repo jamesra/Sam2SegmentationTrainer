@@ -90,16 +90,14 @@ volume_layout() {
 }
 
 # Folders in the root of a version that are not volumes and are never mirrored: _review (review
-# artifacts) and _work_cache (the exporter's cache). Every loop over a version's volumes skips them.
+# artifacts), _work_cache (the exporter's cache), and any other folder whose name starts with "_"
+# (e.g. v4/_RC1_v3_mosaic, a volume set aside). Every loop over a version's volumes skips them.
 SYNC_ROOT_NEVER_COPY=(_review _work_cache)
 
 # True when $1, a folder name in the root of a version, is not a volume.
 is_version_root_extra() {
-  local name="$1" n
-  for n in "${SYNC_ROOT_NEVER_COPY[@]}"; do
-    [[ "$name" == "$n" ]] && return 0
-  done
-  return 1
+  local name="$1"
+  [[ "$name" == _* ]]
 }
 
 # Fail when a volume is flat on one side and nested on the other. rsync --delete
@@ -385,7 +383,7 @@ link_current() {
 #             overlays/cardmask is rebuilt on demand and is not copied.
 # Never copied: _work/ (the exporter's cache), _review/, ignored/ and approved.json / ignore.json
 # (review state kept on this machine), and everything else under overlays/ (full-size renders, viewing only).
-# In the root of a version, _review/ and _work_cache/ are not volumes and are skipped (SYNC_ROOT_NEVER_COPY).
+# In the root of a version, folders starting with "_" (_review/, _work_cache/, ...) are not volumes and are skipped.
 SYNC_NEVER_COPY=(_work _review ignored)
 SYNC_OVERLAY_KEEP=(thumb parts)
 
