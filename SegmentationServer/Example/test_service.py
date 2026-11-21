@@ -5,12 +5,15 @@ Smoke test against a real server process. It:
 1. Writes a self-signed development certificate (the server only speaks TLS)
 2. Starts `python -m segmentation_server` with that certificate
 3. Waits until GetServerStatus answers over TLS
-4. Runs the client example on a sample image, trusting the certificate
+4. Runs the client example on an image (default: the RC1 crop in images/), trusting the certificate
 5. Shuts the server down
+
+Usage: python test_service.py [IMAGE] [--point X Y]
 
 Needs a GPU machine with torch and SAM2 installed, like the server itself.
 """
 
+import argparse
 import asyncio
 import os
 import socket
@@ -52,20 +55,33 @@ async def _wait_until_serving(address: str, ca_cert: str, process: subprocess.Po
     return False
 
 
-def _find_sample_image() -> str:
-    script_dir = Path(__file__).resolve().parent
-    local_image = script_dir / "images" / "RodBC3578GJ_Aii2_Z311_X19750_Y33227_W1531_H1124_DS1.png"
-    if local_image.is_file():
-        return str(local_image)
-    example_folder = Path.home() / "SAM2-Docker" / "examples"
-    for root, _, files in os.walk(example_folder):
-        for file in files:
-            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                return os.path.join(root, file)
-    return input("Image path: ")
+# A 1024 RC1 crop from training set v3 (section 111, location 1528873); the default point is inside that cell.
+DEFAULT_IMAGE = Path(__file__).resolve().parent / "images" / "RC1_111_D1_X72192-73216_Y63488-64512.png"
+DEFAULT_POINT = (603, 564)
 
 
-async def test_service():
+def _parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("image", nargs="?", type=Path, default=DEFAULT_IMAGE,
+                        help=f"Image to segment (default: {DEFAULT_IMAGE.name}).")
+    parser.add_argument("--point", type=int, nargs=2, metavar=("X", "Y"), default=None,
+                        help="Foreground click in pixels, x right and y down "
+                             f"(default: {DEFAULT_POINT} for the default image, else the image centre).")
+    args = parser.parse_args(argv)
+    if not args.image.is_file():
+        parser.error(f"no image at {args.image}")
+    if args.point is None:
+        if args.image.resolve() == DEFAULT_IMAGE:
+            args.point = DEFAULT_POINT
+        else:
+            from PIL import Image
+            with Image.open(args.image) as image:
+                args.point = (image.width // 2, image.height // 2)
+    args.point = tuple(args.point)
+    return args
+
+
+async def test_service(sample_image: Path, point: tuple):
     """Start the service over TLS, segment one image, and shut it down."""
     port = _free_port()
     with tempfile.TemporaryDirectory() as folder:
@@ -93,12 +109,11 @@ async def test_service():
                 print("The service did not start.")
                 return
 
-            sample_image = _find_sample_image()
-            print(f"Running the client example with image: {sample_image}")
+            print(f"Running the client example with image {sample_image}, point {point}")
             image, segments = await segment_image(
                 address,
-                sample_image,
-                [(500, 375)],
+                str(sample_image),
+                [point],
                 [1],
                 ca_cert=str(cert),
             )
@@ -106,7 +121,7 @@ async def test_service():
             if image is not None and segments is not None:
                 print("Segmentation successful!")
                 print(f"Found {len(segments)} segments.")
-                show_segments(image, segments, [(500, 375)], [1])
+                show_segments(image, segments, [point], [1])
             else:
                 print("Segmentation failed.")
         finally:
@@ -125,4 +140,5 @@ async def test_service():
 
 
 if __name__ == '__main__':
-    asyncio.run(test_service())
+    arguments = _parse_args()
+    asyncio.run(test_service(arguments.image, arguments.point))
