@@ -182,7 +182,7 @@ services:
   # host 8442 -> :443 (the reverse proxy's stream passes SNI for all three names here).
   gallery-router:
     container_name: gallery-router
-    image: nginx:1.27-alpine
+    image: nginx:1.30-alpine
     restart: unless-stopped
     depends_on:
       - annotation-gallery-tem
