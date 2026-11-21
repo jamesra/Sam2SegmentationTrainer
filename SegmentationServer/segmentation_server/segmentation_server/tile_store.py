@@ -3,7 +3,7 @@
 The image cache holds a tile only while it holds the tile's GPU embedding, and GPU pressure drops both. The encoded
 bytes are small next to the embedding (a 1024 PNG is one to three MiB; the embedding is about 9 MiB on the GPU and 40
 to 85 MiB on disk), so they are kept here for longer: in host memory, least recently used first, and on disk under the
-embedding cache root when one is configured. A tile found here goes back into the image cache, where the disk
+embedding cache root when one is configured (also when the embedding disk store itself is off). A tile found here goes back into the image cache, where the disk
 embedding store usually skips the encoder as well.
 
 Tiles are keyed by the whole ``TileCacheKey``. Two uploads with one key are taken to be the same picture, so the
@@ -142,9 +142,9 @@ def open_tile_store() -> TileStore:
     """The tile store the environment asks for.
 
     ``SEGMENTATION_TILE_RAM_BYTES`` caps the host memory (default 2 GiB, ``0`` keeps nothing in memory). Tiles also
-    go to disk under ``<SEGMENTATION_EMBEDDING_CACHE>/tiles`` when the embedding disk cache is on, capped by
-    ``SEGMENTATION_TILE_CACHE_MAX_BYTES`` (default 8 GiB, ``0`` for no cap). An unusable directory leaves the store in
-    memory only rather than failing startup.
+    go to disk under ``<SEGMENTATION_EMBEDDING_CACHE>/tiles`` whenever that folder is set, even with the embedding
+    disk cache off (its cap unset or 0), capped by ``SEGMENTATION_TILE_CACHE_MAX_BYTES`` (default 8 GiB, ``0`` for no
+    cap). An unusable directory leaves the store in memory only rather than failing startup.
     """
     ram_bytes = max(0, _read_bytes("SEGMENTATION_TILE_RAM_BYTES", DEFAULT_RAM_BYTES))
     disk: Optional[EmbeddingStore] = None
