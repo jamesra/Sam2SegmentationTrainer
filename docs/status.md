@@ -30,8 +30,8 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
   - RPC1: 619 of 40,998 locations.
   - RPC2: 581 of 13,024 locations.
 
-  The RPC1 figure may be low only because the v3 RPC1 `shapes.jsonl` is truncated (see Data). Measure it again
-  after a re-export.
+  The RPC1 figure may be low only because the v3 RPC1 `shapes.jsonl` is truncated (see Data). Measured again on
+  set v4 (2026-11-21): 96-98% of polygon lines in `shapes.jsonl` have links in every volume (table under Set v4).
 - **Serve-time prompt mismatches.** Should the five mismatches in `serve-train-prompt-parity.mdc` be fixed in the
   server, in the trainer, or both?
 - **Open questions in `docs/mask_refinement_plan.md` §11:** τ, λ_leak, the merge threshold, the prompt mix, M_corr.
@@ -45,10 +45,23 @@ against the logs before acting on it (the `sam2trainer-startup` skill), and upda
 - `Y:\SAM2TrainingData\TEM\v4` (`/volume1/Data/SAM2TrainingData/TEM/v4` on Storage6, 192.168.0.199) is a btrfs
   reflink copy of set v3. Its file counts, sizes and manifests match v3's. The old in-folder `_work/` caches were moved to
   `v4/_work_cache/<VOL>`, where the current exporter looks for them.
-- Not re-exported yet. Plan: `C:\Users\jande\.claude\plans\when-we-submit-annotations-compiled-rose.md`.
+- Re-exported 2026-11-20/21 (plan: `C:\Users\jande\.claude\plans\when-we-submit-annotations-compiled-rose.md`).
   - RC2, RPC1, RPC2: `-Update -RefreshOData -SetVersion v4 -ParentSet v3`.
   - RC1: a full `-Force` export from RC1_Crush's `TEM.Quantized` tileset, because the annotations were remapped to
-    that mosaic.
+    that mosaic. The old RC1 is set aside in `v4/_RC1_v3_mosaic` (the sync skips root folders starting with `_`).
+  - RC1's `creation_rules` say `filters: Quantized`, so its fingerprint differs from the other three volumes'.
+- **Mirrored 2026-11-21** to `/data-local/v4` (`sync_training_data.sh -noselect -clone-from v3 v4`; hardlink clone,
+  54 GB new on the WSL disk). `current` still points at v3. Ready for model v7: `data.root=/data-local/v4`.
+
+  | Volume | Images | Masks | Locations (manifest) | `shapes.jsonl` lines, z range | Polygons with links |
+  |--------|-------:|------:|------:|------|------:|
+  | RC1 | 180,162 | 96,030 | 90,081 | 19,686, z 1-371 | 19,239 / 19,686 |
+  | RC2 | 19,866 | 10,893 | 9,933 | 4,221, z 1-1422 | 3,983 / 4,221 |
+  | RPC1 | 301,785 | 160,037 | 150,888 | 48,924, z 324-1260 | 47,557 / 48,924 |
+  | RPC2 | 104,814 | 52,262 | 52,407 | 13,126, z 205-1136 | 12,826 / 13,126 |
+
+  Mask counts are Y:'s minus the rejected masks kept in `ignored/`. Review lists and `location_scores` carried over
+  from local v3.
 - Set v3 stays as model v5 trained on it.
 - Serving mismatch to raise with the server: when the segmentation server reads crushed tiles itself
   (`tile_source.py`), it stretches the raw codes per cell from the 1st to the 99th percentile. The exporter uses Viking's
